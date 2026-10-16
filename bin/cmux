@@ -4,7 +4,8 @@
 Commands (the secretary calls these; you mostly only run `cmux`):
   cmux [start] [--new] [-d]         open the secretary in its own tmux session "cmux"
                                     (resumes the last secretary; --new starts fresh; -d don't switch)
-  cmux spawn NAME --dir DIR [--model M] < task.txt
+  cmux spawn NAME --dir DIR [--model M] [--discuss] < task.txt
+                                    (--discuss: a discussion window the user is switched into)
   cmux status                       one-screen table of workers
   cmux log NAME [-n N]              last N report entries of a worker
   cmux interrupt NAME               send Escape to a worker's window
@@ -220,7 +221,12 @@ def cmd_spawn(args):
     project = str(Path(args.dir).expanduser().resolve())
     model = args.model or cfg["worker_model"]
 
-    d = prepare_worker(name, cfg, f"秘书派给你的任务（用户原话）：\n\n{task}\n")
+    if args.discuss:
+        initial = (f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
+                   "这是讨论模式：用户现在就在看你这个窗口，直接跟用户对话。规则见系统提示里的「讨论模式」。\n")
+    else:
+        initial = f"秘书派给你的任务（用户原话）：\n\n{task}\n"
+    d = prepare_worker(name, cfg, initial)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project,
@@ -229,13 +235,18 @@ def cmd_spawn(args):
     with registry() as reg:
         reg["workers"][name] = {
             "window": window, "dir": project, "model": model, "task": task,
+            "mode": "discuss" if args.discuss else "task",
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
         }
         reg["focus"] = name
     append_log(name, "task", task)
+    if args.discuss:
+        # The user talks to a discussion worker directly, so take them there now.
+        tmux("select-window", "-t", window, check=False)
     if not stuck_on_dialog(name, window):
-        print(f"spawned {name} ({model}) in window {window}, dir {project}")
+        verb = "discussion window opened and switched to" if args.discuss else "spawned"
+        print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
 def prepare_worker(name, cfg, initial):
@@ -427,6 +438,8 @@ def print_workers(focus, workers):
     rows = [("", "worker", "模型", "状态", "距今", "最近", "等你？")]
     for name, w in workers.items():
         status = w["status"]
+        if w.get("mode") == "discuss" and status not in ("DONE", "FAILED"):
+            status = "讨论中"
         if w.get("window") not in alive and status not in ("DONE", "FAILED"):
             status += "(窗口已关)"
         age = ""
@@ -522,6 +535,7 @@ def cmd_archive(args):
             f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
             f"## 结果\n{final.get('RESULT') or args.summary or '（worker 未给出 RESULT）'}\n\n"
             f"## worker 决策\n{final.get('DECISIONS') or '（worker 未给出）'}\n\n"
+            + (f"## 待办\n{final['TODO']}\n\n" if final.get("TODO") else "") +
             f"## 过程\n```\n{trace}\n```\n"
             f"\n完整 transcript：`claude --resume {w.get('session')}`\n")
         with registry() as reg:
@@ -570,8 +584,12 @@ def hook_worker_report(name):
             w["pending_ask"] = r.get("ASK") if typ == "NEED_DECISION" else None
         if typ in TERMINAL:
             reg["focus"] = name
+        discussion_over = w is not None and w.get("mode") == "discuss" and typ in ("DONE", "FAILED")
     if typ in TERMINAL:
         (worker_dir(name) / "reported").write_text(typ)
+    if discussion_over:
+        # Bring the user back to the secretary, who summarizes and offers to dispatch the to-dos.
+        tmux("select-window", "-t", f"={config()['tmux_session']}:secretary", check=False)
 
 
 def hook_worker_stop(name):
@@ -579,6 +597,8 @@ def hook_worker_stop(name):
     (worker_dir(name) / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
     if data.get("background_tasks"):
         return  # waiting on its own background subagents; it will be woken and report then
+    if read_registry()[1].get(name, {}).get("mode") == "discuss":
+        return  # every turn of a discussion ends waiting for the user, who is in the window
     marker = worker_dir(name) / "reported"
     if marker.exists() or data.get("stop_hook_active"):
         marker.unlink(missing_ok=True)
@@ -653,7 +673,7 @@ def main():
     s.add_argument("-d", "--detach", action="store_true"); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir", required=True)
-    s.add_argument("--model"); s.set_defaults(fn=cmd_spawn)
+    s.add_argument("--model"); s.add_argument("--discuss", action="store_true"); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)
     s.set_defaults(fn=cmd_log)

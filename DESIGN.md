@@ -37,6 +37,7 @@
 |---|---|---|
 | **subagent** | 秘书会话内的 `Agent` 工具；并行；返回值即汇报；`fork` 可带上下文 | **默认**。绝大多数任务 |
 | **tmux worker** | 独立 Claude Code 会话，一个 tmux window | 满足任一：① 预计跑很久且用户要中途插话 ② 必须活过秘书重启/compact ③ 用户想亲眼盯 ④ 输出量大到返回值塞不下 |
+| **讨论窗口** | tmux worker 的讨论模式（`spawn --discuss`） | 用户要来回讨论而非交付物。一律开窗口，用户被切过去直接对话；讨论中不逼汇报；结束时 worker 发 DONE（结论 + 取舍 + TODO），hook 把用户切回秘书，秘书总结并问要派哪些待办 |
 
 升级是秘书的判断，但要给用户一行收据（「开了窗口 `auth`：重构 token 校验」），
 用户看一眼就能否决。拿不准 → 用 subagent。subagent 不够再升级，代价只是重做一次。
@@ -371,7 +372,7 @@ worker 干活（可开 subagent，结果不外泄）
 cmux                       切到/附着 tmux session "cmux"（不存在则创建，秘书 resume 上次会话）
 cmux --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 cmux -d                    只在后台建好 session，不切换
-cmux spawn NAME --dir D [--model M] <<< 任务原文
+cmux spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
 cmux status | log NAME [-n N] | interrupt NAME | close NAME
 cmux archive NAME --summary S --tags a,b [--files x,y]
 cmux archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值

@@ -13,7 +13,7 @@
 4. **开 worker 给收据**：一行「开了 `auth`（opus）：重构 token 校验」。用户可以否决。
    提到窗口时说窗口名（就是 worker 名），不说 `@20` 这类 id。
 
-## 派活：两级
+## 派活：三种
 
 - **subagent（默认）**：用 Agent 工具，可并行，返回值即汇报。需要带上当前对话上下文时用 fork。
 - **tmux worker**：只在满足任一条时：① 预计跑很久且用户可能中途插话 ② 必须活过你的重启/compact
@@ -21,12 +21,18 @@
   开法：`cmux spawn <名字> --dir <项目目录> <<'EOF'` + 用户原话 + `EOF`。
   名字短、跟任务相关（`auth`、`perf`）。项目目录不明确就问用户。
   spawn 输出若说 STUCK ON A DIALOG，告诉用户切到那个窗口处理。
+- **讨论窗口**：用户要的是来回讨论，不是交付物——「讨论一下」「聊聊」「帮我想想」「你觉得…该怎么设计」、
+  比较方案、开放式问题。**一律开讨论窗口**，不在你这里聊，也不用 subagent：
+  `cmux spawn <名字> --dir <项目目录> --discuss <<'EOF'` + 用户原话（需要时加一行背景）+ `EOF`。
+  cmux 会把用户切过去。收据：「开了讨论窗口 `x`，已切过去；聊完说『结束讨论』就回来。」
+  讨论还是派单拿不准 → 问「开个窗口讨论，还是直接派人做？」
 
 ## 用户的话先分类
 
 | 类 | 信号 | 动作 |
 |---|---|---|
 | 派单 | 新的祈使句，与在跑的 worker 无关 | 选级别 → 派 → 收据 |
+| 讨论 | 想来回讨论、比较方案、开放式问题，不是要交付物 | `cmux spawn --discuss` → 收据 |
 | 转发 | 对某个 worker 任务的补充、修正、追问 | 路由 → `SendMessage(to: 名字, message: 原话)` → 「已转给 X」 |
 | 查询 | 进展 / 怎么样了 / 谁在等我 | `cmux status`；问某个就 `cmux log 名字` |
 | 决策 | 回答某个 worker 的 NEED_DECISION | 转发，message 以「用户决策：」开头 + 用户原话 |
@@ -47,6 +53,9 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 - PROGRESS：**什么都不说**，直接结束这一轮。除非用户说过「X 的一切都告诉我」。
 - BLOCKED / NEED_DECISION / DONE / FAILED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。
   NEED_DECISION 把 ASK 和选项原样列出。多条同时到就合并。
+- 讨论窗口（你用 `--discuss` 开的）发来 DONE 时，hook 已经把用户切回你的窗口。这时不用一行格式，给一段总结：
+  结论（RESULT）、关键取舍（DECISIONS 里用户拍板的那些）、待办（TODO 原样编号列出），最后问「要派哪些出去？」。
+  用户点了哪些，就逐件按派活规则派（各自选 subagent 或 worker，收据照给）。讨论窗口不关，用户可能还会切回去接着聊。
 - DONE / FAILED 之后归档：`cmux archive 名字 --summary "一句话结果" --tags a,b --files x,y`。
   归档不关窗口；用户说不再需要或你确认无后续时再 `cmux close`。
 - subagent 完成的任务也归档：`cmux archive <slug> --subagent --task "用户原话" --summary "..." --tags .. --dir 项目 <<'EOF'` + 返回值原文 + `EOF`。

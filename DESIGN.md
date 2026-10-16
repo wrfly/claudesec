@@ -378,13 +378,29 @@ cmux archive NAME --summary S --tags a,b [--files x,y]
 cmux archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
 cmux lesson TYPE 情况 用户原话
 cmux sessions              不归 cmux 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
-cmux adopt SESSION [--as NAME] [--wait]
+cmux adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
 
-接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。在原 pane 设 remain-on-exit →
-SIGTERM 旧进程并等它退出 → `respawn-pane` 运行 `claude --resume <原 session id>` 加 cmux 的 hooks 与
-worker 规则 → 取消 remain-on-exit、窗口改名。拉起后的首条消息让它汇报之前在做什么。
-claude 退出后 pane 回到 shell。
+接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。SESSION 可以是会话名、后台 job id，
+或 session id（至少 8 位前缀）。对话可能在三种地方：
+- 前台会话：对话就是它自己的 sessionId。
+- 后台会话（daemon 的 bg job，sessions/<pid>.json 里 kind=bg）：没有 pane。
+- 挂在后台 job 上的前台客户端（带 parkedJobId）：这个客户端自己的 sessionId 是空的，对话在它挂着的那个 job 里。
+  `cmux sessions` 把它和 job 合成一行显示，接管的是 job 的会话。
+- 已退出的会话：没有活进程，只能按 session id（或 ≥8 位前缀）接管，要求在 projects/*/ 里唯一匹配。
+  有活进程占着它、已经归某个 worker、或 transcript 里最后的 cwd 已经不存在，都拒绝。
+  在 cmux session 新开窗口，在那个 cwd 里 resume；默认 worker 名取目录名。
+
+流程：先确认 projects/*/<sid>.jsonl 存在，不存在就什么都不动直接退出 → 后台 job 用 `claude stop <jobId>` 停
+（直接 kill 会被 daemon 重启），等宿主进程退出 → 有 pane 的设 remain-on-exit 并 SIGTERM 旧前台进程；
+没有 pane 的（后台、已退出）在 cmux session 新开窗口 → 注册 worker → `respawn-pane` 在原 cwd 运行
+`claude --resume <sid>`，带上 cmux 的 hooks 和 worker 规则。命令末尾没有 shell，claude 一退出 pane 就死
+→ 等 worker 的 SessionStart hook 回写的 session id **等于 <sid>** 才报 adopted 并取消 remain-on-exit。
+接着改名：peer 按 sessions/<pid>.json 里的 name 寻址，而 resume 时 transcript 里存的名字（后台 job 的自动名）
+会盖过 `-n`，所以在会话里打 `/rename <worker 名>`，等那个 name 变成 worker 名才打印 adopted；
+改不过来报 adopt INCOMPLETE（worker 已在跑，只是秘书按名字找不到它）。
+claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry 删掉，死 pane 留着显示错误，
+并提示对话完好、可以手动 resume。不 grep 屏幕找错误，因为 resume 会把旧消息原样渲染出来。
 
 已验证：
 - 离线：Stop hook 打回 / 放行 / 防死循环；NEED_DECISION 进状态表「等你」列；
@@ -392,6 +408,11 @@ claude 退出后 pane 回到 shell。
 - 真机：spawn → PROGRESS → DONE 唤醒空闲秘书；worker 内部开 subagent；hook 自动写 registry/log/session id；
   后台 subagent 等待时 Stop hook 放行，唤醒后正常汇报；archive；close。
 - 真机：adopt 一个有历史的临时会话 → 旧进程退出 → 同窗口 resume → 首条汇报准确复述接管前的对话。
+- 真机：adopt 一个 `claude --bg` 临时会话（按 job id）→ `claude stop` → 新窗口 resume 同一 session id → 历史在、
+  SessionStart 回写一致才报 adopted；claude 立即退出时报 FAILED；transcript 不存在（parked 的空 fork）时不动任何进程。
+- 真机：adopt 一个自动命名的 `claude --bg` 临时会话 `--as renamed-test` → sessions 里的 name 从自动名变成
+  renamed-test（nameSource=user），之后的轮次不会被改回去。
+- 真机：adopt 一个已退出的 `claude -p` 临时会话（按 8 位前缀）→ 新窗口 resume 同一 session id → 历史在 → adopted。
 
 - 真机：`cmux -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。

@@ -11,7 +11,8 @@ Commands (the secretary calls these; you mostly only run `cmux`):
   cmux interrupt NAME               send Escape to a worker's window
   cmux close NAME                   kill a worker's window, drop it from the registry
   cmux sessions                     Claude sessions on this machine that cmux does not manage
-  cmux adopt SESSION [--as NAME] [--wait]   take over an idle session in place (keeps its history)
+  cmux adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
+                                            keeps its history); an exited session by its session id
   cmux archive NAME [--summary S] [--tags a,b] [--files x,y]
   cmux archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
   cmux lesson TYPE SITUATION CORRECTION
@@ -321,21 +322,45 @@ def claude_sessions():
 
 
 def external_sessions():
+    """Conversations cmux could adopt. A foreground client parked on a background job (the
+    daemon's `bg` host) is folded into that job: the conversation lives in the job, the
+    client's own sessionId is empty. The job's session is under s["bg"]."""
     cfg = config()
     _, workers = read_registry()
     names = {cfg["secretary_name"], *workers}
     ids = {w.get("session") for w in workers.values()}
-    return sorted((s for s in claude_sessions()
-                   if s.get("kind") == "interactive" and s.get("name") not in names
-                   and s.get("sessionId") not in ids),
-                  key=lambda s: s.get("startedAt", 0))
+    live = claude_sessions()
+    jobs = {s["jobId"]: s for s in live if s.get("kind") == "bg" and s.get("jobId")}
+    out = []
+    for s in live:
+        if s.get("kind") == "interactive" and s.get("parkedJobId") in jobs:
+            s["bg"] = jobs.pop(s["parkedJobId"])
+    for s in live:
+        if s.get("kind") == "bg" and s.get("jobId") not in jobs:
+            continue  # folded into the client parked on it
+        if s.get("kind") not in ("interactive", "bg"):
+            continue
+        conv = s.get("bg") or s
+        if s.get("name") in names or conv.get("sessionId") in ids:
+            continue
+        out.append(s)
+    return sorted(out, key=lambda s: s.get("startedAt", 0))
+
+
+def session_kind(s):
+    if s.get("bg"):
+        return f"前台挂在后台 {s['bg'].get('jobId')}"
+    if s.get("kind") == "bg":
+        return f"后台 {s.get('jobId')}"
+    return "前台"
 
 
 def session_rows(sessions):
-    rows = [("会话", "状态", "tmux", "目录")]
+    rows = [("会话", "类型", "状态", "tmux", "目录")]
     for s in sessions:
-        rows.append((s.get("name", "?"), s.get("status", "?"), s.get("tmux") or "（不在 tmux）",
-                     Path(s.get("cwd", "")).name))
+        conv = s.get("bg") or s
+        rows.append((s.get("name", "?"), session_kind(s), conv.get("status", "?"),
+                     s.get("tmux") or "（不在 tmux）", Path(conv.get("cwd", "")).name))
     return rows
 
 
@@ -353,20 +378,72 @@ def cmd_sessions(args):
     print_rows(session_rows(sessions))
 
 
+def transcript(sid):
+    return next(CLAUDE_DIR.glob(f"projects/*/{sid}.jsonl"), None)
+
+
+def exited_session(key):
+    """A conversation no process holds any more, by session id (prefix of 8+). It is resumed
+    in a new window, in the directory it last ran in."""
+    if len(key) < 8 or not re.match(r"^[0-9a-f-]+$", key):
+        return None
+    hits = {p.stem: p for p in CLAUDE_DIR.glob(f"projects/*/{key}*.jsonl")}
+    if len(hits) > 1:
+        sys.exit(f"{key!r} matches several sessions: {', '.join(sorted(hits))}")
+    if not hits:
+        return None
+    sid, path = hits.popitem()
+    held = next((s for s in claude_sessions() if s.get("sessionId") == sid), None)
+    if held:
+        sys.exit(f"session {sid} is held by live pid {held['pid']} ({held.get('name')}), "
+                 f"which cmux manages or can't take over")
+    if sid in {w.get("session") for w in read_registry()[1].values()}:
+        sys.exit(f"session {sid} already belongs to a cmux worker")
+    cwd = None
+    with open(path) as f:
+        for line in f:
+            if '"cwd"' in line:
+                with contextlib.suppress(ValueError):
+                    cwd = json.loads(line).get("cwd") or cwd
+    if not cwd or not Path(cwd).is_dir():
+        sys.exit(f"session {sid}: its directory {cwd!r} is gone; nothing to resume in")
+    return {"sessionId": sid, "cwd": cwd, "kind": "exited", "status": "idle"}
+
+
+def wait_exit(pid, secs):
+    for _ in range(int(secs * 2)):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def cmd_adopt(args):
     cfg = config()
 
     def find():
-        return next((s for s in external_sessions() if s.get("name") == args.session), None)
+        """By name, background job id, or session id (prefix of 8+)."""
+        key = args.session
+        for s in external_sessions():
+            conv = s.get("bg") or s
+            if key in (s.get("name"), conv.get("name"), conv.get("jobId")) or \
+                    len(key) >= 8 and conv.get("sessionId", "").startswith(key):
+                return s
+        return None
 
-    s = find() or sys.exit(f"no unmanaged live session named {args.session!r}; see `cmux sessions`")
-    if not s.get("tmux"):
+    s = find() or exited_session(args.session) or sys.exit(
+        f"no unmanaged live session or exited session id {args.session!r}; see `cmux sessions`")
+    conv = s.get("bg") or s
+    if not s.get("tmux") and conv.get("kind") not in ("bg", "exited"):
         sys.exit(f"{args.session} is not running in tmux; it can't be taken over in place")
-    if args.wait:
+    if args.wait and conv.get("kind") != "exited":
         idle_since, deadline = None, time.time() + 12 * 3600
         while True:
             s = find() or sys.exit(f"{args.session} exited before it could be adopted")
-            if s.get("status") == "idle":
+            conv = s.get("bg") or s
+            if conv.get("status") == "idle":
                 idle_since = idle_since or time.time()
                 # Idle flickers between turns; only a quiet stretch means it has really stopped.
                 if time.time() - idle_since >= 30:
@@ -376,49 +453,128 @@ def cmd_adopt(args):
             if time.time() > deadline:
                 sys.exit(f"gave up: {args.session} was not idle for 12h")
             time.sleep(5)
-    elif s.get("status") != "idle":
-        sys.exit(f"{args.session} is {s.get('status')}. Only idle sessions are adopted: ask the user "
+    elif conv.get("status") != "idle":
+        sys.exit(f"{args.session} is {conv.get('status')}. Only idle sessions are adopted: ask the user "
                  f"to stop it, or run `cmux adopt {args.session} --wait` in the background")
 
-    name = args.as_name or re.sub(r"-[0-9a-f]{2}$", "", s["name"].lower())
-    name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")[:32]
+    sid, cwd = conv["sessionId"], conv["cwd"]
+    # Nothing is stopped until we know the conversation is on disk: a client attached to a
+    # background job has its own, never-written sessionId.
+    if not transcript(sid):
+        sys.exit(f"{args.session}: no transcript for session {sid} under {CLAUDE_DIR}/projects; "
+                 f"nothing to resume (is it a client attached to a background job?). Nothing was touched.")
+
+    label = s.get("name") or conv.get("jobId") or sid[:8]
+    name = args.as_name or re.sub(r"-[0-9a-f]{2}$", "", (s.get("name") or conv.get("jobId")
+                                                          or Path(cwd).name).lower())
+    name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")[:32].strip("-")
     if not NAME_RE.match(name) or name in read_registry()[1]:
         sys.exit(f"can't use {name!r} as the worker name; pass --as NAME")
     model = args.model or cfg["worker_model"]
     d = prepare_worker(name, cfg, ADOPT_PROMPT)
-    window, pane = re.match(r"^[^:]*:(@\d+)\.(%\d+)$", s["tmux"]).groups()
-    shell = shlex.quote(os.environ.get("SHELL", "/bin/sh"))
-    cmd = worker_command(name, d, cfg, model, "--resume", s["sessionId"]) + f"; exec {shell}"
+    (d / "exit").unlink(missing_ok=True)
+    # No trailing shell: when claude exits the pane dies, and remain-on-exit keeps it (with the
+    # error on screen) until resume is confirmed.
+    cmd = (worker_command(name, d, cfg, model, "--resume", sid)
+           + f"; echo $? > {shlex.quote(str(d / 'exit'))}")
 
-    # Stop the old process first so its transcript is complete before another process resumes it;
-    # remain-on-exit keeps the pane around to be respawned.
-    tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
-    os.kill(s["pid"], signal.SIGTERM)
-    for _ in range(20):
-        time.sleep(0.5)
-        try:
-            os.kill(s["pid"], 0)
-        except OSError:
-            break
-    tmux("respawn-pane", "-k", "-t", pane, "-c", s["cwd"], cmd)
-    tmux("set-option", "-p", "-u", "-t", pane, "remain-on-exit", check=False)
+    # Stop every process holding the conversation before another one resumes it. A background
+    # job is stopped through Claude Code, so its daemon doesn't respawn the host.
+    if conv.get("kind") == "bg":
+        r = subprocess.run(["claude", "stop", conv["jobId"]], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=60)
+        if not wait_exit(conv["pid"], 15):
+            sys.exit(f"`claude stop {conv['jobId']}` did not stop host pid {conv['pid']} "
+                     f"(exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}). Nothing else was touched.")
+    if s.get("tmux"):
+        window, pane = re.match(r"^[^:]*:(@\d+)\.(%\d+)$", s["tmux"]).groups()
+        tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
+        os.kill(s["pid"], signal.SIGTERM)  # the old session, or the client parked on the job
+        wait_exit(s["pid"], 10)
+    else:
+        # A background job or an exited session has no pane: open a placeholder window to respawn into.
+        target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
+        window, pane = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id} #{pane_id}",
+                            "-n", name, "-c", cwd, "sleep 3600").split()
+        tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
+
+    with registry() as reg:
+        reg["workers"][name] = {
+            "window": window, "dir": cwd, "model": model,
+            "task": f"接管的会话 {label}（原任务见其汇报）",
+            "status": "STARTING", "started_at": now(), "last_report_at": None,
+            "last_summary": "", "pending_ask": None, "session": None, "archived": None,
+            "adopted_from": label,
+        }
+    tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, cmd)
     tmux("rename-window", "-t", window, name, check=False)
     if has_session(cfg["tmux_session"]):
         tmux("move-window", "-d", "-s", window, "-t", f"={cfg['tmux_session']}:", check=False)
 
-    with registry() as reg:
-        reg["workers"][name] = {
-            "window": window, "dir": s["cwd"], "model": model,
-            "task": f"接管的会话 {s['name']}（原任务见其汇报）",
-            "status": "STARTING", "started_at": now(), "last_report_at": None,
-            "last_summary": "", "pending_ask": None, "session": s["sessionId"], "archived": None,
-            "adopted_from": s["name"],
-        }
-        reg["focus"] = name
-    append_log(name, "task", f"adopted {s['name']} (session {s['sessionId']}, {s['cwd']})")
-    if not stuck_on_dialog(name, pane):
-        print(f"adopted {s['name']} as {name} ({model}) in window {window}; "
+    verdict, screen = confirm_resume(name, pane, d, sid)
+    tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
+    if verdict == "ok":
+        tmux("set-option", "-p", "-u", "-t", pane, "remain-on-exit", check=False)
+        with registry() as reg:
+            reg["focus"] = name
+        append_log(name, "task", f"adopted {label} (session {sid}, {cwd})")
+        shown = ensure_name(name, pane, sid)
+        if shown != name:
+            sys.exit(f"adopt INCOMPLETE: {label} resumed as worker {name} in window {window} (session {sid}), "
+                     f"but other sessions still address it as {shown!r}, so SendMessage(to: {name!r}) "
+                     f"won't reach it. Run `/rename {name}` in that window.")
+        print(f"adopted {label} as {name} ({model}) in window {window}, session {sid}; "
               f"it will report what it was doing")
+        return
+    if verdict == "dialog":
+        append_log(name, "task", f"adopted {label} (session {sid}, {cwd})")
+        print(f"{name} is resuming in {window}, but it is STUCK ON A DIALOG — tell the user to "
+              f"switch to window '{name}' and answer it:\n{tail}")
+        return
+    with registry() as reg:
+        reg["workers"].pop(name, None)
+    sys.exit(f"adopt FAILED ({verdict}): {name} did not resume session {sid}. Window {window} is "
+             f"left as it is (a dead pane keeps claude's output). The conversation is intact: run "
+             f"`claude --resume {sid}` in {cwd}.\n{tail}")
+
+
+def confirm_resume(name, pane, d, sid):
+    """Adopted only once the worker's SessionStart hook reports the very session we resumed.
+    The screen is not grepped for errors: a resumed conversation renders its old messages."""
+    screen, dialog = "", 0
+    for _ in range(60):
+        time.sleep(1)
+        screen = tmux("capture-pane", "-p", "-t", pane, check=False)
+        got = read_registry()[1].get(name, {}).get("session")
+        if got == sid:
+            return "ok", screen
+        if got:
+            return f"resumed as a different session {got}", screen
+        if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
+            return "claude exited", screen
+        # A dialog blocks before SessionStart; only one that stays up counts.
+        dialog = dialog + 1 if re.search(r"trust this folder|Do you trust|Enter to confirm", screen) else 0
+        if dialog >= 5:
+            return "dialog", screen
+    return "no SessionStart within 60s", screen
+
+
+def ensure_name(name, pane, sid):
+    """Peers address a session by the name in its sessions/<pid>.json. On resume a name stored in
+    the transcript (a background job's auto name) beats `-n`, so rename it in the session itself
+    and wait until Claude Code reports the new name. Returns the name it ends up with."""
+    shown = None
+    for attempt in range(2):
+        tmux("send-keys", "-t", pane, "-l", f"/rename {name}")
+        time.sleep(1)  # Enter apart from the text, as when typed by hand
+        tmux("send-keys", "-t", pane, "Enter")
+        for _ in range(10):
+            time.sleep(1)
+            s = next((s for s in claude_sessions() if s.get("sessionId") == sid), {})
+            shown = s.get("name")
+            if shown == name:
+                return name
+    return shown
 
 
 def cmd_status(args):

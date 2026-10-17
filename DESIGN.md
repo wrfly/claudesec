@@ -188,8 +188,14 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | worker | Stop | 有后台任务 → 放行；有标记 → 清标记放行；`stop_hook_active` → 放行；否则 block 要求汇报 |
 | 秘书 | SessionStart（含 compact/resume） | 记 session id；注入状态表 + INDEX 最近 20 行 + 待复盘教训数 |
 | 秘书 | PostToolUse(SendMessage) | 发给 worker 的消息 → 追加到该 worker 的 log、更新 focus |
+| worker | PermissionRequest / Notification(permission_prompt 等) | 写「等待确认」标记；4 秒后仍未处理（排除自动放行的调用）→ 状态 WAITING_PERMISSION、记 log、写告警到 `~/.cmux/alerts/`（讨论窗口不告警，用户就在窗口里） |
+| worker | PostToolUse / PostToolUseFailure / PermissionDenied（全部工具）、Stop、汇报 | 有标记才进 python：清标记，状态恢复 |
+| 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
 
 结果：秘书**不记账**。日志、注册表、焦点都由 hook 确定性维护，秘书只负责判断和措辞。
+
+worker 卡在确认框上时自己发不了 `SendMessage`，hook 是 shell 也发不了，Claude Code 又没有发跨会话消息的 CLI，
+所以告警走「文件 + 秘书侧 asyncRewake watcher」。已实测：空闲的秘书会被叫醒并收到告警。
 
 ### 3.3 注册表（秘书的外脑）
 

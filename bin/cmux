@@ -2,8 +2,9 @@
 """cmux — a Claude secretary in tmux. See DESIGN.md.
 
 Commands (the secretary calls these; you mostly only run `cmux`):
-  cmux [start] [--new] [-d]         open the secretary in its own tmux session "cmux"
-                                    (resumes the last secretary; --new starts fresh; -d don't switch)
+  cmux [start] [--new|--restart] [-d]   open the secretary in its own tmux session "cmux"
+                                    (resumes the last secretary; --new starts fresh; --restart reloads
+                                    prompt and hooks keeping the conversation; -d don't switch)
   cmux spawn NAME --dir DIR [--model M] [--discuss] < task.txt
                                     (--discuss: a discussion window the user is switched into)
   cmux status                       one-screen table of workers
@@ -13,6 +14,8 @@ Commands (the secretary calls these; you mostly only run `cmux`):
   cmux sessions                     Claude sessions on this machine that cmux does not manage
   cmux adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
                                             keeps its history); an exited session by its session id
+  cmux shelve NAME [--note N] [--force]   stop a worker or outside session, keep only its record
+  cmux wake NAME [--model M] [< instruction]   resume a shelved one in a new window (history kept)
   cmux archive NAME [--summary S] [--tags a,b] [--files x,y]
   cmux archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
   cmux lesson TYPE SITUATION CORRECTION
@@ -47,7 +50,7 @@ DEFAULT_CONFIG = {
     "tmux_session": "cmux",           # the secretary and all workers live in this tmux session
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
-WAITING = {"BLOCKED", "NEED_DECISION"}
+WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -171,7 +174,10 @@ def cmd_start(args):
     run = f"CMUX_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))} run" + (" --new" if args.new else "")
     if not has_session(sess):
         tmux("new-session", "-d", "-s", sess, "-n", "secretary", "-c", str(HOME), run)
-    elif args.new:
+    elif "secretary" not in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}").split():
+        tmux("new-window", "-t", f"={sess}:", "-n", "secretary", "-c", str(HOME), run)
+    elif args.new or args.restart:
+        # --restart: same conversation, freshly loaded prompt and hooks.
         tmux("respawn-pane", "-k", "-t", f"={sess}:secretary", "-c", str(HOME), run)
     if args.detach:
         print(f"secretary is in tmux session '{sess}'")
@@ -187,8 +193,13 @@ def cmd_run(args):
     HOME.mkdir(parents=True, exist_ok=True)
     settings = HOME / "secretary-settings.json"
     cmd = hook_cmd()
+    # A worker stuck on a dialog can't SendMessage, so alerts reach the secretary through a
+    # background watcher whose exit code 2 wakes it (asyncRewake); every turn end re-arms it.
+    watch = {"type": "command", "command": f"{cmd} hook secretary-watch", "asyncRewake": True}
     settings.write_text(json.dumps({"hooks": {
-        "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]}],
+        "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
+                         {"hooks": [watch]}],
+        "Stop": [{"hooks": [watch]}],
         "PostToolUse": [{"matcher": "SendMessage",
                          "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
     }}, indent=2) + "\n")
@@ -214,6 +225,8 @@ def cmd_spawn(args):
         sys.exit(f"bad worker name {name!r}: use lowercase letters, digits, dashes")
     _, workers = read_registry()
     old = workers.get(name)
+    if old and old["status"] == "SHELVED":
+        sys.exit(f"{name} is a shelved worker: `cmux wake {name}` it, or `cmux close {name}` to forget it")
     if old and old.get("window") in alive_windows():
         sys.exit(f"worker {name} is already running in window {old['window']}")
     task = sys.stdin.read().strip()
@@ -250,10 +263,10 @@ def cmd_spawn(args):
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial):
+def prepare_worker(name, cfg, initial, fresh_log=True):
     """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir."""
     # A reused name starts a fresh log; the old one stays next to it.
-    if log_path(name).exists():
+    if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
     (d / "reported").unlink(missing_ok=True)
@@ -261,12 +274,22 @@ def prepare_worker(name, cfg, initial):
     prompt = prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
     (d / "prompt.md").write_text(prompt)
     (d / "initial.md").write_text(initial)
+    (d / "waiting-permission").unlink(missing_ok=True)
     cmd = hook_cmd()
     q = shlex.quote(name)
+    asking = {"type": "command", "command": f"{cmd} hook worker-permission {q}"}
+    # Any tool event after a prompt means it was answered; the test keeps the common case cheap.
+    answered = [{"matcher": "*", "hooks": [{"type": "command", "command":
+                 f"[ ! -e {shlex.quote(str(d / 'waiting-permission'))} ] || {cmd} hook worker-permission-done {q}"}]}]
     (d / "settings.json").write_text(json.dumps({"hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-session-start {q}"}]}],
+        "PermissionRequest": [{"matcher": "*", "hooks": [asking]}],
+        "Notification": [{"matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
+                          "hooks": [asking]}],
         "PostToolUse": [{"matcher": "SendMessage",
-                         "hooks": [{"type": "command", "command": f"{cmd} hook worker-report {q}"}]}],
+                         "hooks": [{"type": "command", "command": f"{cmd} hook worker-report {q}"}]}, *answered],
+        "PostToolUseFailure": answered,
+        "PermissionDenied": answered,
         "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-stop {q}"}]}],
     }}, indent=2) + "\n")
     return d
@@ -420,18 +443,44 @@ def wait_exit(pid, secs):
     return False
 
 
+def find_external(key):
+    """An unmanaged live session by name, background job id, or session id (prefix of 8+)."""
+    for s in external_sessions():
+        conv = s.get("bg") or s
+        if key in (s.get("name"), conv.get("name"), conv.get("jobId")) or \
+                len(key) >= 8 and conv.get("sessionId", "").startswith(key):
+            return s
+    return None
+
+
+def worker_name_for(s, conv, as_name):
+    name = as_name or re.sub(r"-[0-9a-f]{2}$", "", (s.get("name") or conv.get("jobId")
+                                                    or Path(conv["cwd"]).name).lower())
+    name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")[:32].strip("-")
+    if not NAME_RE.match(name) or name in read_registry()[1]:
+        sys.exit(f"can't use {name!r} as the worker name; pass --as NAME")
+    return name
+
+
+def stop_bg_job(conv):
+    """Stopped through Claude Code, so its daemon doesn't respawn the host."""
+    r = subprocess.run(["claude", "stop", conv["jobId"]], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=60)
+    if not wait_exit(conv["pid"], 15):
+        sys.exit(f"`claude stop {conv['jobId']}` did not stop host pid {conv['pid']} "
+                 f"(exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}). Nothing else was touched.")
+
+
+def stop_foreground(s):
+    os.kill(s["pid"], signal.SIGTERM)  # an interactive session, or the client parked on a job
+    wait_exit(s["pid"], 10)
+
+
 def cmd_adopt(args):
     cfg = config()
 
     def find():
-        """By name, background job id, or session id (prefix of 8+)."""
-        key = args.session
-        for s in external_sessions():
-            conv = s.get("bg") or s
-            if key in (s.get("name"), conv.get("name"), conv.get("jobId")) or \
-                    len(key) >= 8 and conv.get("sessionId", "").startswith(key):
-                return s
-        return None
+        return find_external(args.session)
 
     s = find() or exited_session(args.session) or sys.exit(
         f"no unmanaged live session or exited session id {args.session!r}; see `cmux sessions`")
@@ -465,11 +514,7 @@ def cmd_adopt(args):
                  f"nothing to resume (is it a client attached to a background job?). Nothing was touched.")
 
     label = s.get("name") or conv.get("jobId") or sid[:8]
-    name = args.as_name or re.sub(r"-[0-9a-f]{2}$", "", (s.get("name") or conv.get("jobId")
-                                                          or Path(cwd).name).lower())
-    name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")[:32].strip("-")
-    if not NAME_RE.match(name) or name in read_registry()[1]:
-        sys.exit(f"can't use {name!r} as the worker name; pass --as NAME")
+    name = worker_name_for(s, conv, args.as_name)
     model = args.model or cfg["worker_model"]
     d = prepare_worker(name, cfg, ADOPT_PROMPT)
     (d / "exit").unlink(missing_ok=True)
@@ -481,16 +526,11 @@ def cmd_adopt(args):
     # Stop every process holding the conversation before another one resumes it. A background
     # job is stopped through Claude Code, so its daemon doesn't respawn the host.
     if conv.get("kind") == "bg":
-        r = subprocess.run(["claude", "stop", conv["jobId"]], capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, timeout=60)
-        if not wait_exit(conv["pid"], 15):
-            sys.exit(f"`claude stop {conv['jobId']}` did not stop host pid {conv['pid']} "
-                     f"(exit {r.returncode}: {(r.stderr or r.stdout).strip()[-400:]}). Nothing else was touched.")
+        stop_bg_job(conv)
     if s.get("tmux"):
         window, pane = re.match(r"^[^:]*:(@\d+)\.(%\d+)$", s["tmux"]).groups()
         tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
-        os.kill(s["pid"], signal.SIGTERM)  # the old session, or the client parked on the job
-        wait_exit(s["pid"], 10)
+        stop_foreground(s)
     else:
         # A background job or an exited session has no pane: open a placeholder window to respawn into.
         target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
@@ -538,6 +578,147 @@ def cmd_adopt(args):
              f"`claude --resume {sid}` in {cwd}.\n{tail}")
 
 
+# ---------- shelved: registered, but no process running ----------
+
+WAKE_PROMPT = "你刚被 cmux 秘书从搁置中唤醒：会话历史都在，继续按系统提示里的 worker 规则工作。\n"
+WAKE_REPORT = """先用 SendMessage 给秘书发一条汇报：DID 写你之前在做什么、做到了哪里；
+TYPE: BLOCKED，ISSUE 写「等秘书给下一步」。发完就停，不要自己开始新的工作。
+"""
+
+
+def last_turn(sid):
+    """The last user prompt and assistant reply in a transcript, for a record that runs no model."""
+    user = reply = ""
+    path = transcript(sid)
+    for line in open(path) if path else []:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        content = (e.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content
+        else:
+            text = " ".join(b.get("text", "") for b in content or []
+                            if isinstance(b, dict) and b.get("type") == "text")
+        text = " ".join(text.split())
+        if not text:
+            continue
+        if e.get("type") == "user" and not e.get("isMeta"):
+            user = text
+        elif e.get("type") == "assistant":
+            reply = text
+    return f"最后：{user[:80]} → {reply[:120]}" if user or reply else ""
+
+
+def live_holder(sid):
+    return next((s for s in claude_sessions() if sid and s.get("sessionId") == sid), None)
+
+
+def cmd_shelve(args):
+    workers = read_registry()[1]
+    if args.name in workers:
+        name, w = args.name, workers[args.name]
+        if w["status"] == "SHELVED":
+            sys.exit(f"{name} is already shelved")
+        sid, cwd, label = w.get("session"), w["dir"], name
+        if not sid or not transcript(sid):
+            sys.exit(f"{name}: no transcript recorded for it, so it could not be woken later. Not shelved.")
+        holder = live_holder(sid)
+        if holder and holder.get("status") == "busy" and not args.force:
+            sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+        if holder:
+            stop_foreground(holder)
+        if w.get("window"):
+            tmux("kill-window", "-t", w["window"], check=False)
+        entry = dict(w)
+    else:
+        s = find_external(args.name) or exited_session(args.name) or sys.exit(
+            f"no worker, unmanaged live session or exited session id {args.name!r}; see `cmux status`")
+        conv = s.get("bg") or s
+        if conv.get("status") == "busy" and not args.force:
+            sys.exit(f"{args.name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+        sid, cwd = conv["sessionId"], conv["cwd"]
+        if not transcript(sid):
+            sys.exit(f"{args.name}: no transcript for session {sid}; nothing could be woken later. Nothing was touched.")
+        label = s.get("name") or conv.get("jobId") or sid[:8]
+        name = worker_name_for(s, conv, args.as_name)
+        if conv.get("kind") == "bg":
+            stop_bg_job(conv)
+        if s.get("kind") == "interactive":
+            stop_foreground(s)
+        entry = {"dir": cwd, "model": config()["worker_model"], "task": f"搁置的会话 {label}",
+                 "started_at": now(), "archived": None, "adopted_from": label}
+    summary = args.note or last_turn(sid) or "（无记录）"
+    with registry() as reg:
+        reg["workers"][name] = {**entry, "status": "SHELVED", "window": None, "session": sid,
+                                "dir": cwd, "shelved_at": now(), "note": args.note or "",
+                                "last_summary": summary, "pending_ask": None, "last_report_at": now()}
+        if reg["focus"] == name:
+            reg["focus"] = None
+    (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
+    append_log(name, "shelved", f"session {sid}, {cwd}\n{summary}")
+    print(f"shelved {label} as {name}: nothing is running for it now. Session {sid} in {cwd}. "
+          f"`cmux wake {name}` resumes it.")
+
+
+def cmd_wake(args):
+    cfg = config()
+    name = args.name
+    w = read_registry()[1].get(name) or sys.exit(f"no worker {name}")
+    if w["status"] != "SHELVED":
+        sys.exit(f"{name} is not shelved (status {w['status']})")
+    sid, cwd = w["session"], w["dir"]
+    if not transcript(sid):
+        sys.exit(f"{name}: transcript of session {sid} is gone; it can't be resumed")
+    if not Path(cwd).is_dir():
+        sys.exit(f"{name}: its directory {cwd} is gone; nothing to resume in")
+    holder = live_holder(sid)
+    if holder:
+        sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
+                 f"someone resumed it outside cmux")
+    instruction = "" if sys.stdin.isatty() else sys.stdin.read().strip()
+    initial = WAKE_PROMPT + (f"\n秘书转来用户的新指令（原话），照做并按规则汇报：\n\n{instruction}\n"
+                             if instruction else "\n" + WAKE_REPORT)
+    model = args.model or w.get("model") or cfg["worker_model"]
+    d = prepare_worker(name, cfg, initial, fresh_log=False)
+    (d / "exit").unlink(missing_ok=True)
+    cmd = (worker_command(name, d, cfg, model, "--resume", sid)
+           + f"; echo $? > {shlex.quote(str(d / 'exit'))}")
+    target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
+    window, pane = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id} #{pane_id}",
+                        "-n", name, "-c", cwd, "sleep 3600").split()
+    tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
+    with registry() as reg:
+        reg["workers"][name].update(window=window, model=model, status="STARTING", session=None)
+    tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, cmd)
+    if instruction:
+        append_log(name, "secretary→worker", instruction)
+
+    verdict, screen = confirm_resume(name, pane, d, sid)
+    tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
+    if verdict == "ok":
+        tmux("set-option", "-p", "-u", "-t", pane, "remain-on-exit", check=False)
+        with registry() as reg:
+            reg["focus"] = name
+        append_log(name, "task", f"woken (session {sid}, {cwd})")
+        shown = ensure_name(name, pane, sid)
+        if shown != name:
+            sys.exit(f"wake INCOMPLETE: {name} resumed in window {window}, but other sessions address it as "
+                     f"{shown!r}, so SendMessage(to: {name!r}) won't reach it. Run `/rename {name}` in that window.")
+        print(f"woke {name} ({model}) in window {window}; it will report"
+              + (" on the new instruction" if instruction else " what it was doing"))
+        return
+    if verdict == "dialog":
+        print(f"{name} is resuming in {window}, but it is STUCK ON A DIALOG — tell the user to "
+              f"switch to window '{name}' and answer it:\n{tail}")
+        return
+    with registry() as reg:
+        reg["workers"][name].update(status="SHELVED", window=None, session=sid)
+    sys.exit(f"wake FAILED ({verdict}): {name} stays shelved. Window {window} is left as it is. "
+             f"The conversation is intact: `claude --resume {sid}` in {cwd}.\n{tail}")
+
+
 def confirm_resume(name, pane, d, sid):
     """Adopted only once the worker's SessionStart hook reports the very session we resumed.
     The screen is not grepped for errors: a resumed conversation renders its old messages."""
@@ -579,10 +760,19 @@ def ensure_name(name, pane, sid):
 
 def cmd_status(args):
     focus, workers = read_registry()
-    if workers:
-        print_workers(focus, workers)
+    active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
+    shelved = {n: w for n, w in workers.items() if w["status"] == "SHELVED"}
+    if active:
+        print_workers(focus, active)
     else:
         print("没有 worker。")
+    if shelved:
+        print("\n搁置（没有进程在跑；cmux wake 唤醒）：")
+        rows = [("名字", "目录", "搁置于", "备注 / 最后一轮")]
+        for n, w in shelved.items():
+            rows.append((n, Path(w["dir"]).name, (w.get("shelved_at") or "")[:16].replace("T", " "),
+                         (w.get("last_summary") or "").replace("\n", " ")[:60]))
+        print_rows(rows)
     sessions = external_sessions()
     if sessions:
         print(f"\n不归 cmux 管的 Claude 会话（空闲的可以 cmux adopt 接管）：")
@@ -594,7 +784,9 @@ def print_workers(focus, workers):
     rows = [("", "worker", "模型", "状态", "距今", "最近", "等你？")]
     for name, w in workers.items():
         status = w["status"]
-        if w.get("mode") == "discuss" and status not in ("DONE", "FAILED"):
+        if status == "WAITING_PERMISSION":
+            status = "等你批权限"
+        elif w.get("mode") == "discuss" and status not in ("DONE", "FAILED"):
             status = "讨论中"
         if w.get("window") not in alive and status not in ("DONE", "FAILED"):
             status += "(窗口已关)"
@@ -602,7 +794,8 @@ def print_workers(focus, workers):
         if w.get("last_report_at"):
             secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
             age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.1f}h"
-        summary = (w.get("last_summary") or w["task"]).replace("\n", " ")
+        summary = (w.get("pending_ask") if w["status"] == "WAITING_PERMISSION" else
+                   w.get("last_summary") or w["task"]).replace("\n", " ")
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
                      status, age, summary[:48], "← 是" if w["status"] in WAITING else ""))
     print_rows(rows)
@@ -616,6 +809,8 @@ def cmd_log(args):
 def cmd_interrupt(args):
     _, workers = read_registry()
     w = workers.get(args.name) or sys.exit(f"no worker {args.name}")
+    if not w.get("window"):
+        sys.exit(f"{args.name} has no window (status {w['status']})")
     tmux("send-keys", "-t", w["window"], "Escape")
     print(f"sent Escape to {args.name}")
 
@@ -625,7 +820,8 @@ def cmd_close(args):
         w = reg["workers"].pop(args.name, None) or sys.exit(f"no worker {args.name}")
         if reg["focus"] == args.name:
             reg["focus"] = None
-    tmux("kill-window", "-t", w["window"], check=False)
+    if w.get("window"):
+        tmux("kill-window", "-t", w["window"], check=False)
     note = "" if w.get("archived") else "（注意：未归档）"
     print(f"closed {args.name}{note}")
 
@@ -741,6 +937,7 @@ def hook_worker_report(name):
         if typ in TERMINAL:
             reg["focus"] = name
         discussion_over = w is not None and w.get("mode") == "discuss" and typ in ("DONE", "FAILED")
+    (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
     if typ in TERMINAL:
         (worker_dir(name) / "reported").write_text(typ)
     if discussion_over:
@@ -751,6 +948,7 @@ def hook_worker_report(name):
 def hook_worker_stop(name):
     data = hook_input()
     (worker_dir(name) / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    permission_answered(name)
     if data.get("background_tasks"):
         return  # waiting on its own background subagents; it will be woken and report then
     if read_registry()[1].get(name, {}).get("mode") == "discuss":
@@ -804,8 +1002,119 @@ def hook_secretary_send():
     append_log(to, "secretary→worker", str(inp.get("message", "")))
 
 
+# ---------- dialogs: a worker waiting on the user ----------
+
+def describe_request(tool, inp):
+    what = (inp.get("command") or inp.get("file_path") or inp.get("notebook_path") or inp.get("url")
+            or inp.get("path") or json.dumps(inp, ensure_ascii=False))
+    return f"{tool}: {what}".replace("\n", " ")[:300]
+
+
+def raise_alert(text):
+    d = HOME / "alerts"
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{time.time_ns()}"
+    tmp.write_text(text + "\n")
+    tmp.rename(d / f"{time.time_ns()}.txt")
+
+
+def hook_worker_permission(name):
+    """A worker hit a permission dialog. PermissionRequest fires at once, also for calls that
+    end up auto-approved, so only a prompt still open a few seconds later is announced."""
+    data = hook_input()
+    marker = worker_dir(name) / "waiting-permission"
+    if data.get("hook_event_name") == "Notification":
+        if marker.exists():
+            return  # the same prompt, already being handled
+        detail = data.get("message") or data.get("title") or "需要用户确认"
+        delay = 0  # Claude Code only notifies after the prompt has waited ~6s
+    else:
+        detail = describe_request(data.get("tool_name", "?"), data.get("tool_input") or {})
+        delay = 4
+    token = str(time.time_ns())
+    marker.write_text(json.dumps({"token": token, "detail": detail}, ensure_ascii=False))
+    subprocess.Popen([str(SELF), "hook", "worker-permission-alert", name],
+                     env={**os.environ, "CMUX_HOME": str(HOME), "CMUX_TOKEN": token, "CMUX_DELAY": str(delay)},
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def hook_worker_permission_alert(name):
+    time.sleep(float(os.environ.get("CMUX_DELAY", "0")))
+    marker = worker_dir(name) / "waiting-permission"
+    try:
+        m = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return  # answered meanwhile
+    if m.get("token") != os.environ.get("CMUX_TOKEN"):
+        return
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is None:
+            return
+        if w["status"] != "WAITING_PERMISSION":
+            w["status_before"] = w["status"]
+        w["status"] = "WAITING_PERMISSION"
+        w["pending_ask"] = m["detail"]
+        w["last_report_at"] = now()
+        discuss = w.get("mode") == "discuss"
+    append_log(name, "permission", m["detail"])
+    if not discuss:  # in a discussion the user is already looking at the window
+        raise_alert(f"worker {name} 卡在一个确认对话框上，等用户在窗口 {name} 里处理：{m['detail']}")
+
+
+def permission_answered(name):
+    marker = worker_dir(name) / "waiting-permission"
+    if not marker.exists():
+        return
+    marker.unlink(missing_ok=True)
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is not None and w["status"] == "WAITING_PERMISSION":
+            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["pending_ask"] = None
+            append_log(name, "permission", "answered")
+
+
+def hook_worker_permission_done(name):
+    hook_input()
+    permission_answered(name)
+
+
+def hook_secretary_watch():
+    """Armed in the background at session start and every turn end; one instance at a time.
+    Exits 2 with the pending alerts, which wakes the secretary (asyncRewake)."""
+    data = hook_input()
+    lock = open(HOME / "watch.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # already armed
+    owner = next((s["pid"] for s in claude_sessions() if s.get("sessionId") == data.get("session_id")),
+                 os.getppid())
+    alerts, done = HOME / "alerts", HOME / "alerts" / "delivered"
+    done.mkdir(parents=True, exist_ok=True)
+    while True:
+        files = sorted(alerts.glob("*.txt"))
+        if files:
+            msgs = [f.read_text().strip() for f in files]
+            for f in files:
+                f.rename(done / f.name)
+            print("[cmux 告警]\n" + "\n".join(msgs), file=sys.stderr)
+            sys.exit(2)
+        try:
+            os.kill(owner, 0)
+        except OSError:
+            return  # the secretary is gone
+        time.sleep(1)
+
+
 HOOKS = {
     "worker-session-start": hook_worker_session_start,
+    "worker-permission": hook_worker_permission,
+    "worker-permission-alert": hook_worker_permission_alert,
+    "worker-permission-done": hook_worker_permission_done,
+    "secretary-watch": hook_secretary_watch,
     "worker-report": hook_worker_report,
     "worker-stop": hook_worker_stop,
     "secretary-session-start": hook_secretary_session_start,
@@ -826,6 +1135,7 @@ def main():
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("start"); s.add_argument("--new", action="store_true")
+    s.add_argument("--restart", action="store_true")
     s.add_argument("-d", "--detach", action="store_true"); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir", required=True)
@@ -838,6 +1148,10 @@ def main():
     s = sub.add_parser("sessions"); s.set_defaults(fn=cmd_sessions)
     s = sub.add_parser("adopt"); s.add_argument("session"); s.add_argument("--as", dest="as_name")
     s.add_argument("--model"); s.add_argument("--wait", action="store_true"); s.set_defaults(fn=cmd_adopt)
+    s = sub.add_parser("shelve"); s.add_argument("name"); s.add_argument("--note")
+    s.add_argument("--as", dest="as_name"); s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_shelve)
+    s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
     s = sub.add_parser("archive"); s.add_argument("name"); s.add_argument("--summary")
     s.add_argument("--tags"); s.add_argument("--files"); s.add_argument("--subagent", action="store_true")
     s.add_argument("--task"); s.add_argument("--dir"); s.set_defaults(fn=cmd_archive)

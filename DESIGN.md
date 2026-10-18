@@ -176,7 +176,7 @@ tmux pane id，`SendMessage` 可互发。
   history/                   3.5
   lessons.md                 3.6
   secretary.session          秘书 session id，`cmux` 据此 --resume
-  secretary-settings.json    秘书的 hooks
+  secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）
 ```
 
 hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 settings.json**：

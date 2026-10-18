@@ -229,13 +229,17 @@ def cmd_run(args):
     # A worker stuck on a dialog can't SendMessage, so alerts reach the secretary through a
     # background watcher whose exit code 2 wakes it (asyncRewake); every turn end re-arms it.
     watch = {"type": "command", "command": f"{cmd} hook secretary-watch", "asyncRewake": True}
-    settings.write_text(json.dumps({"hooks": {
-        "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
-                         {"hooks": [watch]}],
-        "Stop": [{"hooks": [watch]}],
-        "PostToolUse": [{"matcher": "SendMessage",
-                         "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
-    }}, indent=2) + "\n")
+    settings.write_text(json.dumps({
+        # The user talks to the secretary in their own words; no Tab-completion guesses.
+        "promptSuggestionEnabled": False,
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
+                             {"hooks": [watch]}],
+            "Stop": [{"hooks": [watch]}],
+            "PostToolUse": [{"matcher": "SendMessage",
+                             "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
+        },
+    }, indent=2) + "\n")
     argv = ["claude", "-n", cfg["secretary_name"],
             "--settings", str(settings),
             "--append-system-prompt-file", str(PROMPTS / "secretary.md"),

@@ -199,6 +199,9 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 - 退出时（`/exit`、窗口被关、tmux session 被杀，包装进程都忽略 SIGHUP 并继续收尾）：后台 `cmux lifecycle shelve-all`
   收起所有 worker；忙着的等它做完这一轮；秘书在此期间回来了就停手。
 - `cmux --restart` / `--new` 先写 `restarting` 标记，退出的包装进程看到标记就不收尾，worker 照常跑。
+- wake-all 和 shelve-all 靠 `lifecycle.lock` 串行。秘书可能启动几秒就退出（比如开机时被 tmux-resurrect 顶掉），
+  这时先把 worker 唤醒完，再收起来。正在唤醒的 worker 在注册表里没有 session，两边同时动手会互相踩。
+  `run.pid` 记着当前的 `cmux run`：旧秘书的 shelve-all 看到有新的就停手；wake-all 发现启动它的秘书已经不在，就什么也不唤醒。
 - 这些都是 cmux 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
 - 秘书不在时，worker 的 Stop hook 不再逼汇报；SendMessage 失败的汇报也照样记进 log 和 registry（PostToolUseFailure）。
 - `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 cmux 进程看不到。hook 运行在 claude 之下，

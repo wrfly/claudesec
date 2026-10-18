@@ -252,6 +252,7 @@ def cmd_run(args):
     # Fixed cwd: the secretary is cross-project, and Claude Code's auto memory is keyed by cwd,
     # so a fixed cwd gives it one stable memory directory.
     os.chdir(HOME)
+    (HOME / "run.pid").write_text(str(os.getpid()))  # a newer one tells an older shelve-all to stop
     detach("wake-all")
     # Not exec: the workers are put away after the secretary exits. That is done here, by cmux,
     # so the user has no chores and no tool call of the secretary's can be refused.
@@ -276,7 +277,7 @@ def cmd_run(args):
 def detach(job):
     """Run `cmux lifecycle JOB` on its own, outliving this window; output goes to a log."""
     log = open(HOME / "lifecycle.log", "a")
-    subprocess.Popen([str(SELF), "lifecycle", job], env={**os.environ, "CMUX_HOME": str(HOME)},
+    subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "CMUX_HOME": str(HOME)},
                      stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
@@ -286,52 +287,91 @@ def secretary_alive():
 
 
 def quietly(fn, **kw):
-    """Run a cmd_* function as a library call; its sys.exit becomes a returned message."""
+    """Run a cmd_* function as a library call; its sys.exit, or a crash (a window closed under
+    it), becomes a returned message."""
     try:
         fn(argparse.Namespace(**kw))
         return None
     except SystemExit as e:
         return str(e.code)
+    except Exception as e:
+        return f"crashed: {e!r}"
 
 
 def cmd_lifecycle(args):
-    print(f"=== {now()} {args.job}", flush=True)
+    print(f"=== {now()} {args.job} (cmux run {args.run_pid})", flush=True)
     if args.job == "shelve-all":
-        shelve_all()
+        shelve_all(args.run_pid)
     else:
-        wake_all()
+        wake_all(args.run_pid)
+    print(f"=== {now()} {args.job} done", flush=True)
 
 
-def shelve_all():
+@contextlib.contextmanager
+def lifecycle_lock():
+    """wake-all and shelve-all never overlap. A secretary can die seconds after it started,
+    while its workers are still being woken (each mid-wake has no session in the registry)."""
+    with open(HOME / "lifecycle.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def current_run():
+    """pid of the live `cmux run` the secretary is in, from run.pid, or None."""
+    try:
+        pid = int((HOME / "run.pid").read_text())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return None
+    try:  # after a reboot the pid may belong to something else
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return pid  # no /proc: trust the pid
+    return pid if b"run" in argv and any(a.endswith(b"cmux") for a in argv) else None
+
+
+def shelve_all(run_pid):
     """The secretary is gone: put every worker away, keeping its session to resume later.
     A busy one is left to finish its turn first; if the secretary is back by then, it stays."""
-    pending = {n for n, w in read_registry()[1].items() if w["status"] != "SHELVED"}
+    pending = None
     deadline = time.time() + 6 * 3600
-    while pending and time.time() < deadline:
-        if secretary_alive():
-            print("secretary is back; leaving the rest running:", sorted(pending), flush=True)
-            return
-        for name in sorted(pending):
-            w = read_registry()[1].get(name)
-            if not w or w["status"] == "SHELVED":
+    while time.time() < deadline:
+        with lifecycle_lock():
+            newer = current_run()
+            if (newer and newer != run_pid) or secretary_alive():
+                print("secretary is back; leaving the rest running:", sorted(pending or ()), flush=True)
+                return
+            if pending is None:  # under the lock, so workers a wake-all just brought back are included
+                pending = {n for n, w in read_registry()[1].items() if w["status"] != "SHELVED"}
+            for name in sorted(pending):
+                w = read_registry()[1].get(name)
+                if not w or w["status"] == "SHELVED":
+                    pending.discard(name)
+                    continue
+                holder = live_holder(w.get("session"))
+                if holder and holder.get("status") == "busy":
+                    continue
+                err = quietly(cmd_shelve, name=name, note=None, as_name=None, force=False, by="exit")
+                print(f"{name}: {err or 'shelved'}", flush=True)
                 pending.discard(name)
-                continue
-            holder = live_holder(w.get("session"))
-            if holder and holder.get("status") == "busy":
-                continue
-            err = quietly(cmd_shelve, name=name, note=None, as_name=None, force=False, by="exit")
-            print(f"{name}: {err or 'shelved'}", flush=True)
-            pending.discard(name)
-        if pending:
-            time.sleep(10)
-    if pending:
-        print("gave up waiting for:", sorted(pending), flush=True)
+        if not pending:
+            return
+        time.sleep(10)
+    print("gave up waiting for:", sorted(pending), flush=True)
 
 
-def wake_all():
+def wake_all(run_pid):
     """The secretary started: bring back what its exit put away, plus workers whose process
     died some other way (window or tmux session killed). What the user shelved stays shelved."""
     time.sleep(3)  # let the secretary's window come up first
+    with lifecycle_lock():
+        if run_pid and current_run() != run_pid:
+            print("the secretary that started this is already gone; waking nothing", flush=True)
+            return
+        wake_orphans()
+
+
+def wake_orphans():
     names = []
     with registry() as reg:
         for name, w in reg["workers"].items():
@@ -1308,7 +1348,7 @@ def main():
     s.set_defaults(fn=cmd_shelve)
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
     s = sub.add_parser("lifecycle"); s.add_argument("job", choices=["shelve-all", "wake-all"])
-    s.set_defaults(fn=cmd_lifecycle)
+    s.add_argument("run_pid", type=int, nargs="?"); s.set_defaults(fn=cmd_lifecycle)
     s = sub.add_parser("archive"); s.add_argument("name"); s.add_argument("--summary")
     s.add_argument("--tags"); s.add_argument("--files"); s.add_argument("--subagent", action="store_true")
     s.add_argument("--task"); s.add_argument("--dir"); s.set_defaults(fn=cmd_archive)

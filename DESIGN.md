@@ -192,6 +192,18 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | worker | PostToolUse / PostToolUseFailure / PermissionDenied（全部工具）、Stop、汇报 | 有标记才进 python：清标记，状态恢复 |
 | 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
 
+**生命周期**：秘书窗口里跑的是 `cmux run`，它不 exec claude，而是把它当子进程包一层。
+- 启动时：后台 `cmux lifecycle wake-all`。被秘书退出收起的 worker（`shelved_by: exit`），以及进程已经没了的
+  worker（窗口或整个 tmux session 被杀），都用 `--resume` **静默**恢复：不带首条 prompt，不跑模型，状态还原。
+  用户手动搁置的不动。恢复失败的写告警，叫醒秘书。
+- 退出时（`/exit`、窗口被关、tmux session 被杀，包装进程都忽略 SIGHUP 并继续收尾）：后台 `cmux lifecycle shelve-all`
+  收起所有 worker；忙着的等它做完这一轮；秘书在此期间回来了就停手。
+- `cmux --restart` / `--new` 先写 `restarting` 标记，退出的包装进程看到标记就不收尾，worker 照常跑。
+- 这些都是 cmux 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
+- 秘书不在时，worker 的 Stop hook 不再逼汇报；SendMessage 失败的汇报也照样记进 log 和 registry（PostToolUseFailure）。
+- `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 cmux 进程看不到。hook 运行在 claude 之下，
+  会把它记进 `config.json` 的 `claude_config_dir`，其他 cmux 进程从这里读。
+
 结果：秘书**不记账**。日志、注册表、焦点都由 hook 确定性维护，秘书只负责判断和措辞。
 
 worker 卡在确认框上时自己发不了 `SendMessage`，hook 是 shell 也发不了，Claude Code 又没有发跨会话消息的 CLI，
@@ -384,6 +396,9 @@ cmux archive NAME --summary S --tags a,b [--files x,y]
 cmux archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
 cmux lesson TYPE 情况 用户原话
 cmux sessions              不归 cmux 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
+cmux shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）
+cmux wake NAME [--model M] [<<< 新指令]     --resume 拉起，历史保留
+cmux --restart                             重载秘书的 prompt 和 hook，对话保留，worker 不动
 cmux adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
 

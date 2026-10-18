@@ -198,6 +198,18 @@ def has_session(name):
     return subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0
 
 
+def secretary_runs_cmux(sess):
+    """Is the secretary window running `cmux run` (directly, or under the shell tmux started)?"""
+    out = tmux("display-message", "-p", "-t", f"={sess}:secretary", "#{pane_dead} #{pane_pid}", check=False).split()
+    if len(out) != 2 or out[0] != "0":
+        return False
+    try:
+        kids = Path(f"/proc/{out[1]}/task/{out[1]}/children").read_text().split()
+    except OSError:
+        kids = []
+    return any(is_cmux_run(pid) for pid in [out[1], *kids])
+
+
 def cmd_start(args):
     """Put the secretary in its own tmux session, then switch or attach to it."""
     sess = config()["tmux_session"]
@@ -207,11 +219,18 @@ def cmd_start(args):
         tmux("new-session", "-d", "-s", sess, "-n", "secretary", "-c", str(HOME), run)
     elif "secretary" not in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}").split():
         tmux("new-window", "-t", f"={sess}:", "-n", "secretary", "-c", str(HOME), run)
-    elif args.new or args.restart:
-        # --restart: same conversation, freshly loaded prompt and hooks. Either way the workers
-        # keep running: the exiting secretary sees this marker and doesn't shelve them.
-        (HOME / "restarting").write_text(str(time.time()))
-        tmux("respawn-pane", "-k", "-t", f"={sess}:secretary", "-c", str(HOME), run)
+    else:
+        wrapped = secretary_runs_cmux(sess)
+        if args.new or args.restart or not wrapped:
+            # --restart: same conversation, freshly loaded prompt and hooks. Not wrapped: a restored
+            # tmux layout left a shell or a bare `claude --resume` in the window; take it over.
+            if wrapped:  # the exiting `cmux run` sees this and leaves the workers running
+                (HOME / "restarting").write_text(str(time.time()))
+            tmux("respawn-pane", "-k", "-t", f"={sess}:secretary", "-c", str(HOME), run)
+    # Keep this session out of tmux-resurrect's saved layouts (a post-save hook that honours
+    # @resurrect-skip drops it): restored, its panes would be bare `claude --resume`s without
+    # cmux's prompts and hooks. `cmux` starts the secretary itself; its wake-all brings the workers.
+    tmux("set-option", "-t", f"={sess}:", "@resurrect-skip", "on", check=False)
     if args.detach:
         print(f"secretary is in tmux session '{sess}'")
     elif os.environ.get("TMUX"):
@@ -326,11 +345,16 @@ def current_run():
         os.kill(pid, 0)
     except (OSError, ValueError):
         return None
-    try:  # after a reboot the pid may belong to something else
+    return pid if is_cmux_run(pid) else None  # after a reboot the pid may be someone else's
+
+
+def is_cmux_run(pid):
+    """Is pid a `cmux run`? Without /proc there is no telling; assume it is."""
+    try:
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
-        return pid  # no /proc: trust the pid
-    return pid if b"run" in argv and any(a.endswith(b"cmux") for a in argv) else None
+        return not Path("/proc/self").exists()
+    return b"run" in argv and any(a.endswith(b"cmux") for a in argv)
 
 
 def shelve_all(run_pid):

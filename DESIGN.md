@@ -202,6 +202,12 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 - wake-all 和 shelve-all 靠 `lifecycle.lock` 串行。秘书可能启动几秒就退出（比如开机时被 tmux-resurrect 顶掉），
   这时先把 worker 唤醒完，再收起来。正在唤醒的 worker 在注册表里没有 session，两边同时动手会互相踩。
   `run.pid` 记着当前的 `cmux run`：旧秘书的 shelve-all 看到有新的就停手；wake-all 发现启动它的秘书已经不在，就什么也不唤醒。
+- 开机：cmux 的 tmux session **不让 tmux-resurrect 保存**。cmux 给它设了 `@resurrect-skip on`，resurrect 的
+  post-save-layout 钩子要把带这个选项的 session 从存档里去掉。否则恢复出来的 pane 是裸的 `claude --resume`，
+  没有 cmux 的 prompt、hook 和包装层；而且如果 tmux 服务器是 `cmux` 自己拉起的，continuum 一恢复就会把秘书的
+  pane 当作「从零恢复」顶掉。去掉之后，开机后跑 `cmux`：秘书由 cmux 拉起，worker 由 wake-all 恢复。
+- `cmux` 发现 secretary 窗口里跑的不是 `cmux run`（一个 shell，或者恢复出来的裸 `claude --resume`），就接管：
+  用 `cmux run` 重开这个 pane，对话照样 `--resume`。
 - 这些都是 cmux 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
 - 秘书不在时，worker 的 Stop hook 不再逼汇报；SendMessage 失败的汇报也照样记进 log 和 registry（PostToolUseFailure）。
 - `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 cmux 进程看不到。hook 运行在 claude 之下，

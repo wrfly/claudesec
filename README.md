@@ -24,6 +24,9 @@ tmux 里的 Claude 秘书。你只跟主窗口说话；它把活派给 subagent 
 退出秘书（`/exit`，或者直接关窗口）时，cmux 会自动收起所有 worker，不留进程；下次 `cmux` 会把它们恢复回来，
 历史都在。想暂时不管某件事，跟秘书说「先放一边」，它会搁置起来；「接着弄 X」再唤醒。
 改了秘书的 prompt 后用 `cmux --restart` 重新加载，对话和 worker 都不受影响。
+重启电脑后跑一次 `cmux` 就行，秘书和 worker 都会回来。用 tmux-resurrect / continuum 的话，要让保存时跳过 cmux 的
+session：cmux 给它设了 `@resurrect-skip on`，在 `@resurrect-hook-post-save-layout` 里去掉带这个选项的 session
+的 pane、window 行即可。不跳过的话，resurrect 会把它恢复成一堆裸的 `claude --resume`。
 
 已经在跑的 Claude 会话也能交给秘书：跟它说「接管 xixitv」或「等 61av 停了接管它」。
 接管会在原窗口重启那个会话，对话历史保留。

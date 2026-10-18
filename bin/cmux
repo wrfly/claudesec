@@ -277,8 +277,11 @@ def cmd_run(args):
 def detach(job):
     """Run `cmux lifecycle JOB` on its own, outliving this window; output goes to a log."""
     log = open(HOME / "lifecycle.log", "a")
-    subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "CMUX_HOME": str(HOME)},
-                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    p = subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "CMUX_HOME": str(HOME)},
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    # Reap it when it's done, or wake-all lingers as a zombie for as long as the secretary runs.
+    # If this process exits first (shelve-all), the job is reparented and reaped by init.
+    threading.Thread(target=p.wait, daemon=True).start()
 
 
 def secretary_alive():

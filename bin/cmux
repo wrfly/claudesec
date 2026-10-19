@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
+LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -499,6 +500,7 @@ def prepare_worker(name, cfg, initial, fresh_log=True):
                                 "hooks": [{"type": "command", "command": f"{cmd} hook worker-report {q}"}]}, *answered],
         "PermissionDenied": answered,
         "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-stop {q}"}]}],
+        "StopFailure": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-stop-failure {q}"}]}],
     }}, indent=2) + "\n")
     return d
 
@@ -1004,8 +1006,8 @@ def print_workers(focus, workers):
     rows = [("", "worker", "模型", "状态", "距今", "最近", "等你？")]
     for name, w in workers.items():
         status = w["status"]
-        if status == "WAITING_PERMISSION":
-            status = "等你批权限"
+        if status in LABELS:
+            status = LABELS[status]
         elif w.get("mode") == "discuss" and status not in ("DONE", "FAILED"):
             status = "讨论中"
         if w.get("window") not in alive and status not in ("DONE", "FAILED"):
@@ -1014,7 +1016,7 @@ def print_workers(focus, workers):
         if w.get("last_report_at"):
             secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
             age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.1f}h"
-        summary = (w.get("pending_ask") if w["status"] == "WAITING_PERMISSION" else
+        summary = (w.get("pending_ask") if w["status"] in LABELS else
                    w.get("last_summary") or w["task"]).replace("\n", " ")
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
                      status, age, summary[:48], "← 是" if w["status"] in WAITING else ""))
@@ -1169,6 +1171,11 @@ def hook_worker_stop(name):
     data = hook_input()
     (worker_dir(name) / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
     permission_answered(name)
+    with registry() as reg:  # a turn that ends normally is past any API error
+        w = reg["workers"].get(name)
+        if w is not None and w["status"] == "API_ERROR":
+            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["pending_ask"] = None
     if data.get("background_tasks"):
         return  # waiting on its own background subagents; it will be woken and report then
     if read_registry()[1].get(name, {}).get("mode") == "discuss":
@@ -1285,6 +1292,27 @@ def hook_worker_permission_alert(name):
         raise_alert(f"worker {name} 卡在一个确认对话框上，等用户在窗口 {name} 里处理：{m['detail']}")
 
 
+def hook_worker_stop_failure(name):
+    """The turn died on an API error (a proxy's 524, an overload). The worker now idles at its
+    prompt and will never report, so wake the secretary, who tells it to carry on."""
+    data = hook_input()
+    err = " ".join(str(data.get(k) or "") for k in ("error", "error_details")).strip() or "unknown error"
+    err = err.replace("\n", " ")[:300]
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is None:
+            return
+        if w["status"] not in ("API_ERROR", "WAITING_PERMISSION"):
+            w["status_before"] = w["status"]
+        w["status"] = "API_ERROR"
+        w["pending_ask"] = err
+        w["last_report_at"] = now()
+        discuss = w.get("mode") == "discuss"
+    append_log(name, "api-error", err)
+    if not discuss:  # in a discussion the user is in the window and sees it
+        raise_alert(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}")
+
+
 def permission_answered(name):
     marker = worker_dir(name) / "waiting-permission"
     if not marker.exists():
@@ -1339,6 +1367,7 @@ HOOKS = {
     "secretary-watch": hook_secretary_watch,
     "worker-report": hook_worker_report,
     "worker-stop": hook_worker_stop,
+    "worker-stop-failure": hook_worker_stop_failure,
     "secretary-session-start": hook_secretary_session_start,
     "secretary-send": hook_secretary_send,
 }

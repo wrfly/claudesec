@@ -190,6 +190,7 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | 秘书 | PostToolUse(SendMessage) | 发给 worker 的消息 → 追加到该 worker 的 log、更新 focus |
 | worker | PermissionRequest / Notification(permission_prompt 等) | 写「等待确认」标记；4 秒后仍未处理（排除自动放行的调用）→ 状态 WAITING_PERMISSION、记 log、写告警到 `~/.cmux/alerts/`（讨论窗口不告警，用户就在窗口里） |
 | worker | PostToolUse / PostToolUseFailure / PermissionDenied（全部工具）、Stop、汇报 | 有标记才进 python：清标记，状态恢复 |
+| worker | StopFailure（这一轮死在 API 错误上，如代理的 524） | 状态 API_ERROR（显示「API 出错」）、记 log、写告警叫醒秘书，秘书让它从中断处继续；下一轮正常结束时状态恢复（讨论窗口不告警） |
 | 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
 
 **生命周期**：秘书窗口里跑的是 `cmux run`，它不 exec claude，而是把它当子进程包一层。
@@ -357,6 +358,7 @@ worker 干活（可开 subagent，结果不外泄）
 | 秘书上下文爆 | registry + log 落盘；PROGRESS 不进上下文 |
 | 过度升级成 worker（窗口泛滥） | 门槛（1.2）；拿不准用 subagent；收据让用户否决 |
 | worker 悄悄结束不汇报 | hook 兜底；秘书 `notify_when_idle` 第二保险 |
+| worker 停在 API 错误上不汇报 | StopFailure hook 告警，秘书叫它继续 |
 | 两 worker 改同一文件 | `owns_files`；需要时 worktree |
 | 路由错 | 一句话可撤；focus 显式可见 |
 | 秘书 resume/compact 后状态丢 | registry 是唯一真相；对不上的 window 标 `orphan` 让用户决定 |

@@ -1148,12 +1148,15 @@ def cmd_archive(args):
     print(f"archived → {path}")
 
 
+LESSONS = "# 秘书的教训（用户说「复盘」时交给 cmux worker 归类，处理过的移到「已处理」）\n\n"
+
+
 def cmd_lesson(args):
     path = HOME / "lessons.md"
-    if not path.exists():
-        path.write_text("# 秘书的教训（复盘时归类计数；同类 ≥3 条才提 diff）\n\n")
-    with open(path, "a") as f:
-        f.write(f"- {dt.date.today().isoformat()} · {args.type} · {args.situation} · 「{args.correction}」\n")
+    text = path.read_text() if path.exists() else LESSONS
+    entry = f"- {dt.date.today().isoformat()} · {args.type} · {args.situation} · 「{args.correction}」\n"
+    pending, mark, done = text.partition("\n## 已处理")  # new ones go above the reviewed ones
+    path.write_text(pending.rstrip("\n") + "\n" + entry + (mark and "\n" + mark.lstrip("\n") + done))
     print("noted")
 
 

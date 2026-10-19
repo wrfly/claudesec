@@ -175,6 +175,7 @@ tmux pane id，`SendMessage` 可互发。
   workers/<name>/            每个 worker 的 prompt.md、task.md、settings.json（hooks）
   history/                   3.5
   lessons.md                 3.6
+  queue.md                   决策队列：要用户定的事按重要程度排队，秘书一次只问一件（首次启动时建）
   secretary.session          秘书 session id，`cmux` 据此 --resume
   secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）
 ```
@@ -318,7 +319,7 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 | 层 | 内容 | 机制 | 审批 |
 |---|---|---|---|
 | **经验** | 事实、偏好、别名（「用户说 perf 指性能那个 worker」） | Claude Code 自带 memory：纠错即写一条 feedback memory，下次会话自动加载 | 不需要 |
-| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.cmux/lessons.md` 攒教训；**同类错误 ≥3 次**才提一个 diff 给用户；点头后秘书自己改文件，下次启动生效 | 用户看一眼 |
+| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.cmux/lessons.md` 攒教训，不自己改宪法；用户说「复盘」时交给 `cmux` worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
 | **铁律** | 2.5 节四条 | 永不自改 | — |
 
 为什么宪法层要门槛和审批：
@@ -403,6 +404,7 @@ cmux --new                 秘书开新会话（session 已存在则原地重启
 cmux -d                    只在后台建好 session，不切换
 cmux spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
 cmux status | log NAME [-n N] | interrupt NAME | close NAME
+cmux peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）
 cmux archive NAME --summary S --tags a,b [--files x,y]
 cmux archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
 cmux lesson TYPE 情况 用户原话

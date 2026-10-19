@@ -11,6 +11,7 @@ Commands (the secretary calls these; you mostly only run `cmux`):
   cmux log NAME [-n N]              last N report entries of a worker
   cmux interrupt NAME               send Escape to a worker's window
   cmux close NAME                   kill a worker's window, drop it from the registry
+  cmux peek NAME [-n N]             last lines of a worker's window and whether it is busy
   cmux sessions                     Claude sessions on this machine that cmux does not manage
   cmux adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
                                             keeps its history); an exited session by its session id
@@ -240,10 +241,25 @@ def cmd_start(args):
         os.execvp("tmux", ["tmux", "attach-session", "-t", f"={sess}"])
 
 
+QUEUE = """# 决策队列
+
+秘书维护。worker 的 NEED_DECISION、要用户定的 TODO 先进这里，按重要程度排序，一次只问用户一件。
+问了还没回答的放「已问未答」；秘书自己能处理的直接处理，移到「已处理」。
+
+## 待问（按优先级）
+
+## 已问未答
+
+## 已处理
+"""
+
+
 def cmd_run(args):
     """Runs inside the secretary's tmux window: the secretary's Claude Code process itself."""
     cfg = config()
     HOME.mkdir(parents=True, exist_ok=True)
+    if not (HOME / "queue.md").exists():
+        (HOME / "queue.md").write_text(QUEUE)
     settings = HOME / "secretary-settings.json"
     cmd = hook_cmd()
     # A worker stuck on a dialog can't SendMessage, so alerts reach the secretary through a
@@ -1037,6 +1053,17 @@ def cmd_interrupt(args):
     print(f"sent Escape to {args.name}")
 
 
+def cmd_peek(args):
+    """The last lines of a worker's window, and whether its Claude is busy: look before you close."""
+    w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
+    if w.get("window") not in alive_windows():
+        sys.exit(f"{args.name} has no window (status {w['status']})")
+    holder = live_holder(w.get("session"))
+    print(f"{args.name}: {holder.get('status', '?') if holder else 'no live claude'}")
+    lines = [l for l in tmux("capture-pane", "-p", "-t", w["window"]).splitlines() if l.strip()]
+    print("\n".join(lines[-args.n:]))
+
+
 def cmd_close(args):
     with registry() as reg:
         w = reg["workers"].pop(args.name, None) or sys.exit(f"no worker {args.name}")
@@ -1214,10 +1241,20 @@ def hook_secretary_session_start():
             out += ["", f"历史索引最近 {min(20, len(lines))} 条（全部见 {index}）：", *lines[-20:]]
     lessons = HOME / "lessons.md"
     if lessons.exists():
-        n = sum(1 for l in lessons.read_text().splitlines() if l.startswith("- "))
+        n = sum(1 for l in open_part(lessons).splitlines() if l.startswith("- "))
         if n:
             out += ["", f"lessons.md 里有 {n} 条教训待复盘。"]
+    queue = HOME / "queue.md"
+    if queue.exists():
+        todo = [l for l in open_part(queue).splitlines() if re.match(r"(\d+\.|-) ", l)]
+        if todo:
+            out += ["", f"决策队列 {queue} 里还有 {len(todo)} 件没定（一次只问用户一件）：", *todo]
     print("\n".join(out)[:9500])
+
+
+def open_part(path):
+    """A lessons or queue file up to its 「已处理」 section."""
+    return path.read_text().split("\n## 已处理")[0]
 
 
 def hook_secretary_send():
@@ -1396,6 +1433,8 @@ def main():
     s.set_defaults(fn=cmd_log)
     s = sub.add_parser("interrupt"); s.add_argument("name"); s.set_defaults(fn=cmd_interrupt)
     s = sub.add_parser("close"); s.add_argument("name"); s.set_defaults(fn=cmd_close)
+    s = sub.add_parser("peek"); s.add_argument("name"); s.add_argument("-n", type=int, default=15)
+    s.set_defaults(fn=cmd_peek)
     s = sub.add_parser("sessions"); s.set_defaults(fn=cmd_sessions)
     s = sub.add_parser("adopt"); s.add_argument("session"); s.add_argument("--as", dest="as_name")
     s.add_argument("--model"); s.add_argument("--wait", action="store_true"); s.set_defaults(fn=cmd_adopt)

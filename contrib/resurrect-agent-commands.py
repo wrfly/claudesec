@@ -6,7 +6,7 @@ or "agent" starts a brand new chat. This rewrites each saved pane command so
 restore runs the resume command for the chat that pane had open.
 
 A session with the @resurrect-skip option set is left out of the save
-altogether: whoever set it (cmux, for one) brings that session back itself.
+altogether: whoever set it (aidecamp, for one) brings that session back itself.
 """
 
 import json

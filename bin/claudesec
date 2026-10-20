@@ -5,8 +5,11 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec [start] [--new|--restart] [-d]   open the secretary in its own tmux session "claudesec"
                                     (resumes the last secretary; --new starts fresh; --restart reloads
                                     prompt and hooks keeping the conversation; -d don't switch)
-  claudesec spawn NAME --dir DIR [--model M] [--discuss] < task.txt
-                                    (--discuss: a discussion window the user is switched into)
+  claudesec spawn NAME --dir DIR [--model M] [--discuss] [--agent claude|cursor] < task.txt
+                                    (--discuss: a discussion window the user is switched into;
+                                    --agent cursor: Cursor's `agent` CLI instead of Claude Code)
+  claudesec report NAME < report.txt     a Cursor worker's report to the secretary
+  claudesec send NAME < message.txt      the secretary's message to a Cursor worker
   claudesec status                       one-screen table of workers
   claudesec log NAME [-n N]              last N report entries of a worker
   claudesec interrupt NAME               send Escape to a worker's window
@@ -62,9 +65,11 @@ DEFAULT_CONFIG = {
     "secretary_model": None,          # None = whatever claude defaults to
     "worker_model": "claude-opus-5-5",
     "worker_permission_mode": "auto",
+    "cursor_worker_model": "gemini-4-argon-high",  # Grok 4.7 / Auto turns end in "Server error" here
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
+CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
 LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -442,8 +447,7 @@ def shelve_all(run_pid):
                 if not w or w["status"] == "SHELVED":
                     pending.discard(name)
                     continue
-                holder = live_holder(w.get("session"))
-                if holder and session_status(holder)[0] in ("busy", "background"):
+                if worker_busy(name, w):
                     continue
                 err = quietly(cmd_shelve, name=name, note=None, as_name=None, force=False, by="exit")
                 print(f"{name}: {err or 'shelved'}", flush=True)
@@ -473,7 +477,8 @@ def wake_orphans():
                 if w.get("shelved_by") == "exit":
                     names.append(name)
                 continue
-            if w.get("session") and not live_holder(w["session"]) and transcript(w["session"]):
+            running = cursor_running(w) if is_cursor(w) else live_holder(w.get("session"))
+            if not running and conversation_exists(w):
                 w.update(status_before=w["status"], status="SHELVED", window=None, shelved_by="exit")
                 names.append(name)
     threads, failed = [], {}
@@ -507,22 +512,23 @@ def cmd_spawn(args):
     if not task:
         sys.exit("empty task: pass the user's words on stdin")
     project = str(Path(args.dir).expanduser().resolve())
-    model = args.model or cfg["worker_model"]
+    cursor = args.agent == "cursor"
+    model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
 
     if args.discuss:
         initial = (f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
                    "这是讨论模式：用户现在就在看你这个窗口，直接跟用户对话。规则见系统提示里的「讨论模式」。\n")
     else:
         initial = f"秘书派给你的任务（用户原话）：\n\n{task}\n"
-    d = prepare_worker(name, cfg, initial)
+    d = prepare_worker(name, cfg, initial, agent=args.agent)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project,
-                  worker_command(name, d, cfg, model)).strip()
+                  cursor_command(name, model, d=d) if cursor else worker_command(name, d, cfg, model)).strip()
 
     with registry() as reg:
         reg["workers"][name] = {
-            "window": window, "dir": project, "model": model, "task": task,
+            "window": window, "dir": project, "model": model, "task": task, "agent": args.agent,
             "mode": "discuss" if args.discuss else "task",
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
@@ -537,18 +543,24 @@ def cmd_spawn(args):
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial, fresh_log=True):
-    """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir."""
+def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
+    """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir.
+    A Cursor worker's hooks are global, in ~/.cursor/hooks.json (see install_cursor_hooks)."""
     # A reused name starts a fresh log; the old one stays next to it.
     if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
     (d / "reported").unlink(missing_ok=True)
-    prompt = (PROMPTS / "worker.md").read_text()
-    prompt = prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
+    prompt = (PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text()
+    prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
+              .replace("{{CLAUDESEC}}", str(SELF)))
     (d / "prompt.md").write_text(prompt)
     (d / "initial.md").write_text(initial)
     (d / "waiting-permission").unlink(missing_ok=True)
+    (d / "busy").unlink(missing_ok=True)
+    if agent == "cursor":
+        install_cursor_hooks()
+        return d
     cmd = hook_cmd()
     q = shlex.quote(name)
     asking = {"type": "command", "command": f"{cmd} hook worker-permission {q}"}
@@ -592,6 +604,87 @@ def worker_command(name, d, cfg, model, *extra, prompt=True):
         "--settings", str(d / "settings.json"),
         "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(), *extra,
     ]) + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if prompt else "")
+
+
+# ---------- Cursor workers: the `agent` CLI in a window ----------
+# No per-session hooks, no SendMessage, no sessions/<pid>.json. Its hooks are global, so each one
+# first checks CLAUDESEC_WORKER, which only a claudesec worker's command sets; it reports by
+# running `claudesec report`, which reaches the secretary through the alert channel; the
+# secretary talks to it with `claudesec send`, a paste into its window.
+
+CURSOR_HOOKS = {"sessionStart": "cursor-session-start", "beforeSubmitPrompt": "cursor-prompt",
+                "stop": "cursor-stop"}
+CURSOR_NAGS = 3  # follow-ups asking for a report before the stop hook gives up and alerts
+
+
+def install_cursor_hooks():
+    """Put claudesec's entries into ~/.cursor/hooks.json, keeping everything else; a backup is
+    written first whenever the file changes. Each entry does nothing outside a claudesec worker."""
+    path = Path.home() / ".cursor" / "hooks.json"
+    old = path.read_text() if path.exists() else ""
+    conf = json.loads(old) if old.strip() else {"version": 1, "hooks": {}}
+    hooks = conf.setdefault("hooks", {})
+    for event, hook in CURSOR_HOOKS.items():
+        entries = [e for e in hooks.get(event, []) if "CLAUDESEC_WORKER" not in e.get("command", "")]
+        entries.append({"type": "command", "command":
+                        f'[ -z "${{CLAUDESEC_WORKER:-}}" ] || {shlex.quote(str(SELF))} hook {hook}'})
+        hooks[event] = entries
+    new = json.dumps(conf, indent=2, ensure_ascii=False) + "\n"
+    if new == old:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if old:
+        (path.parent / f"hooks.json.bak-claudesec-{int(time.time())}").write_text(old)
+    tmp = path.with_suffix(".claudesec-tmp")
+    tmp.write_text(new)
+    tmp.replace(path)
+
+
+def cursor_command(name, model, *extra, d=None):
+    """The worker's agent command; with d, its first message comes from d/initial.md."""
+    env = f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))}"
+    return (env + " " + " ".join(shlex.quote(a) for a in ["agent", "--model", model, "--trust", *extra])
+            + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if d else ""))
+
+
+def is_cursor(w):
+    return (w or {}).get("agent") == "cursor"
+
+
+def cursor_chat_exists(chat):
+    return bool(chat) and any((Path.home() / ".cursor" / "chats").glob(f"*/{chat}"))
+
+
+def conversation_exists(w):
+    return cursor_chat_exists(w.get("session")) if is_cursor(w) else bool(w.get("session") and transcript(w["session"]))
+
+
+def cursor_running(w):
+    if w.get("window") not in alive_windows():
+        return False  # no -t "" below: that would ask about the caller's own pane
+    return tmux("display", "-p", "-t", w["window"], "#{pane_dead}", check=False).strip() == "0"
+
+
+def worker_busy(name, w):
+    """Mid-turn, or (Claude Code) waiting on background tasks: not to be stopped."""
+    if is_cursor(w):
+        return cursor_running(w) and (HOME / "workers" / name / "busy").exists()
+    holder = live_holder(w.get("session"))
+    return bool(holder) and session_status(holder)[0] in ("busy", "background")
+
+
+def confirm_cursor_start(pane, d):
+    """A resumed Cursor chat fires no sessionStart, so there is no session id to wait for:
+    the agent drawing its screen and staying up is as good as it gets."""
+    screen = ""
+    for i in range(20):
+        time.sleep(1)
+        screen = pane_text(pane, suggestion="drop")
+        if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
+            return "agent exited", screen
+        if i >= 4 and re.search(r"Cursor Agent|Add a follow-up|ctrl\+c to stop", screen):
+            return "ok", screen
+    return "agent did not come up within 20s", screen
 
 
 def stuck_on_dialog(name, target):
@@ -1003,9 +1096,11 @@ def cmd_shelve(args):
         if w["status"] == "SHELVED":
             sys.exit(f"{name} is already shelved")
         sid, cwd, label = w.get("session"), w["dir"], name
-        if not sid or not transcript(sid):
-            sys.exit(f"{name}: no transcript recorded for it, so it could not be woken later. Not shelved.")
-        holder = live_holder(sid)
+        if not conversation_exists(w):
+            sys.exit(f"{name}: no conversation recorded for it, so it could not be woken later. Not shelved.")
+        if is_cursor(w) and worker_busy(name, w) and not args.force:
+            sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+        holder = None if is_cursor(w) else live_holder(sid)
         if holder and not args.force:
             refuse_if_working(name, holder)
         if holder:
@@ -1054,11 +1149,12 @@ def cmd_wake(args):
     if w["status"] != "SHELVED":
         sys.exit(f"{name} is not shelved (status {w['status']})")
     sid, cwd = w["session"], w["dir"]
-    if not transcript(sid):
-        sys.exit(f"{name}: transcript of session {sid} is gone; it can't be resumed")
+    cursor = is_cursor(w)
+    if not conversation_exists(w):
+        sys.exit(f"{name}: conversation {sid} is gone; it can't be resumed")
     if not Path(cwd).is_dir():
         sys.exit(f"{name}: its directory {cwd} is gone; nothing to resume in")
-    holder = live_holder(sid)
+    holder = None if cursor else live_holder(sid)
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
                  f"someone resumed it outside claudesec")
@@ -1066,23 +1162,24 @@ def cmd_wake(args):
     instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
     initial = WAKE_PROMPT + (f"\n秘书转来用户的新指令（原话），照做并按规则汇报：\n\n{instruction}\n"
                              if instruction else "\n" + WAKE_REPORT)
-    model = args.model or w.get("model") or cfg["worker_model"]
-    d = prepare_worker(name, cfg, initial, fresh_log=False)
+    model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
+    d = prepare_worker(name, cfg, initial, fresh_log=False, agent=w.get("agent", "claude"))
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
-    cmd = (worker_command(name, d, cfg, model, "--resume", sid, prompt=not quiet)
+    cmd = ((cursor_command(name, model, "--resume", sid, d=None if quiet else d) if cursor else
+            worker_command(name, d, cfg, model, "--resume", sid, prompt=not quiet))
            + f"; echo $? > {shlex.quote(str(d / 'exit'))}")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     window, pane = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id} #{pane_id}",
                         "-n", name, "-c", cwd, "sleep 3600").split()
     tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
-    with registry() as reg:
-        reg["workers"][name].update(window=window, model=model, status="STARTING", session=None)
+    with registry() as reg:  # a resumed Cursor chat reports no session id; it keeps its own
+        reg["workers"][name].update(window=window, model=model, status="STARTING", session=sid if cursor else None)
     tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, cmd)
     if instruction:
         append_log(name, "secretary→worker", instruction)
 
-    verdict, screen = confirm_resume(name, pane, d, sid)
+    verdict, screen = confirm_cursor_start(pane, d) if cursor else confirm_resume(name, pane, d, sid)
     tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
     if verdict == "ok":
         tmux("set-option", "-p", "-u", "-t", pane, "remain-on-exit", check=False)
@@ -1094,7 +1191,7 @@ def cmd_wake(args):
                 reg["focus"] = name
             w.pop("shelved_by", None)
         append_log(name, "task", f"woken{' quietly' if quiet else ''} (session {sid}, {cwd})")
-        shown = ensure_name(name, pane, sid)
+        shown = name if cursor else ensure_name(name, pane, sid)
         if shown != name:
             sys.exit(f"wake INCOMPLETE: {name} resumed in window {window}, but other sessions address it as "
                      f"{shown!r}, so SendMessage(to: {name!r}) won't reach it. Run `/rename {name}` in that window.")
@@ -1109,7 +1206,7 @@ def cmd_wake(args):
     with registry() as reg:
         reg["workers"][name].update(status="SHELVED", window=None, session=sid)
     sys.exit(f"wake FAILED ({verdict}): {name} stays shelved. Window {window} is left as it is. "
-             f"The conversation is intact: `claude --resume {sid}` in {cwd}.\n{tail}")
+             f"The conversation is intact: `{'agent' if cursor else 'claude'} --resume {sid}` in {cwd}.\n{tail}")
 
 
 def confirm_resume(name, pane, d, sid):
@@ -1204,8 +1301,11 @@ def cmd_interrupt(args):
     w = workers.get(args.name) or sys.exit(f"no worker {args.name}")
     if not w.get("window"):
         sys.exit(f"{args.name} has no window (status {w['status']})")
-    tmux("send-keys", "-t", w["window"], "Escape")
-    print(f"sent Escape to {args.name}")
+    key = "C-c" if is_cursor(w) else "Escape"  # Cursor's Escape only drops a queued message
+    if is_cursor(w):  # its stop hook then sees status "error", same as a failed turn
+        (worker_dir(args.name) / "interrupted").write_text(now())
+    tmux("send-keys", "-t", w["window"], key)
+    print(f"sent {key} to {args.name}")
 
 
 def cmd_peek(args):
@@ -1213,8 +1313,12 @@ def cmd_peek(args):
     w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
     if w.get("window") not in alive_windows():
         sys.exit(f"{args.name} has no window (status {w['status']})")
-    holder = live_holder(w.get("session"))
-    print(f"{args.name}: {status_label(holder) if holder else 'no live claude'}")
+    if is_cursor(w):
+        state = ("busy" if worker_busy(args.name, w) else "idle") if cursor_running(w) else "no live agent"
+    else:
+        holder = live_holder(w.get("session"))
+        state = status_label(holder) if holder else "no live claude"
+    print(f"{args.name}: {state}")
     lines = [l for l in pane_text(w["window"]).splitlines() if l.strip()]
     print("\n".join(lines[-args.n:]))
 
@@ -1330,7 +1434,11 @@ def hook_worker_report(name):
     inp = data.get("tool_input") or {}
     if not str(inp.get("to", "")).startswith(sec):
         return
-    text = str(inp.get("message", ""))
+    record_report(name, str(inp.get("message", "")))
+
+
+def record_report(name, text):
+    """A worker's report: log, registry status and summary, focus, the 'reported' marker."""
     append_log(name, "worker→secretary", text)
     r = parse_report(text)
     typ = r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
@@ -1350,6 +1458,119 @@ def hook_worker_report(name):
     if discussion_over:
         # Bring the user back to the secretary, who summarizes and offers to dispatch the to-dos.
         tmux("select-window", "-t", f"={config()['tmux_session']}:secretary", check=False)
+
+
+def cmd_report(args):
+    """A Cursor worker's report (it has no SendMessage): recorded like a Claude Code worker's,
+    then delivered to the secretary through the alert channel, which wakes it."""
+    if args.name not in read_registry()[1]:
+        sys.exit(f"no worker {args.name}")
+    text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
+    record_report(args.name, text)
+    if secretary_alive():
+        raise_alert(f"{CURSOR_REPORT}「{args.name}」：\n{text}")
+        print(f"reported to {config()['secretary_name']}")
+    else:
+        print("recorded; the secretary is not running and will see it in `claudesec log`")
+
+
+def cmd_send(args):
+    """Secretary → Cursor worker: pasted into its window as one message. Sent while it works,
+    the message waits in Cursor's queue and runs when the turn ends."""
+    w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
+    if not is_cursor(w):
+        sys.exit(f"{args.name} is a Claude Code worker: use SendMessage(to: {args.name!r})")
+    if not cursor_running(w):
+        sys.exit(f"{args.name} has no running agent (status {w['status']}); `claudesec wake {args.name}` it first")
+    text = sys.stdin.read().strip() or sys.exit("empty message: pass it on stdin")
+    subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=text, text=True, check=True)
+    tmux("paste-buffer", "-p", "-d", "-b", "claudesec-send", "-t", w["window"])
+    time.sleep(0.5)  # Enter apart from the paste, as when typed by hand
+    tmux("send-keys", "-t", w["window"], "Enter")
+    with registry() as reg:
+        reg["focus"] = args.name
+    append_log(args.name, "secretary→worker", text)
+    print(f"sent to {args.name}" + (" (it is busy: queued until its turn ends)" if worker_busy(args.name, w) else ""))
+
+
+def cursor_worker():
+    """The worker a Cursor hook runs for. The hooks are global; the shell guard in
+    hooks.json already skips sessions without CLAUDESEC_WORKER."""
+    name = os.environ.get("CLAUDESEC_WORKER", "")
+    return name if name in read_registry()[1] else None
+
+
+def hook_cursor_session_start():
+    """A new chat: record its id, and hand Cursor the worker rules as context (it has no
+    --append-system-prompt). A resumed chat fires no sessionStart; it keeps the rules it got."""
+    data = hook_input()
+    name = cursor_worker()
+    if not name:
+        return
+    with registry() as reg:
+        reg["workers"][name]["session"] = data.get("session_id") or data.get("conversation_id")
+    print(json.dumps({"additional_context": (worker_dir(name) / "prompt.md").read_text()}, ensure_ascii=False))
+
+
+def hook_cursor_prompt():
+    hook_input()
+    name = cursor_worker()
+    if name:
+        (worker_dir(name) / "busy").write_text(now())
+
+
+def hook_cursor_stop():
+    """Cursor's Stop: a follow-up message asks for the report, as Claude Code's block does."""
+    data = hook_input()
+    name = cursor_worker()
+    if not name:
+        return
+    d = worker_dir(name)
+    (d / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    w = read_registry()[1][name]
+
+    def idle():
+        (d / "busy").unlink(missing_ok=True)
+
+    # `claudesec interrupt` stopped it on purpose. One Ctrl+C can end in more than one stop,
+    # so the mark holds for a while; and one that lands while a shell command runs can leave
+    # the turn going on to complete, which then is an ordinary end.
+    interrupted = d / "interrupted"
+    if interrupted.exists():
+        if data.get("status") != "completed" and time.time() - interrupted.stat().st_mtime < 30:
+            idle()
+            return
+        interrupted.unlink(missing_ok=True)
+    if data.get("status") == "error":
+        idle()
+        with registry() as reg:
+            w = reg["workers"][name]
+            if w["status"] not in ("API_ERROR", "WAITING_PERMISSION"):
+                w["status_before"] = w["status"]
+            w.update(status="API_ERROR", pending_ask="Cursor: turn ended with status error", last_report_at=now())
+        append_log(name, "api-error", "Cursor: turn ended with status error")
+        if w.get("mode") != "discuss":
+            raise_alert(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报。"
+                        f"用 `claudesec send {name}` 让它从中断处继续。")
+        return
+    if w["status"] == "API_ERROR":
+        with registry() as reg:
+            w = reg["workers"][name]
+            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["pending_ask"] = None
+    marker = d / "reported"
+    if data.get("status") != "completed" or w.get("mode") == "discuss" or not secretary_alive() or marker.exists():
+        marker.unlink(missing_ok=True)  # aborted by the user, a discussion turn, nobody to tell, or reported
+        idle()
+        return
+    if data.get("loop_count", 0) >= CURSOR_NAGS:
+        idle()
+        raise_alert(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。")
+        return
+    print(json.dumps({"followup_message":
+        f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
+        "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
+        "若用户刚在你的窗口直接跟你说过话，汇报里注明。"}, ensure_ascii=False))
 
 
 def hook_worker_stop(name):
@@ -1565,6 +1786,9 @@ HOOKS = {
     "worker-stop-failure": hook_worker_stop_failure,
     "secretary-session-start": hook_secretary_session_start,
     "secretary-send": hook_secretary_send,
+    "cursor-session-start": hook_cursor_session_start,
+    "cursor-prompt": hook_cursor_prompt,
+    "cursor-stop": hook_cursor_stop,
 }
 
 
@@ -1585,7 +1809,8 @@ def main():
     s.add_argument("-d", "--detach", action="store_true"); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir", required=True)
-    s.add_argument("--model"); s.add_argument("--discuss", action="store_true"); s.set_defaults(fn=cmd_spawn)
+    s.add_argument("--model"); s.add_argument("--discuss", action="store_true")
+    s.add_argument("--agent", choices=["claude", "cursor"], default="claude"); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)
     s.set_defaults(fn=cmd_log)
@@ -1600,6 +1825,8 @@ def main():
     s.add_argument("--as", dest="as_name"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_shelve)
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
+    s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
+    s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
     s = sub.add_parser("lifecycle"); s.add_argument("job", choices=["shelve-all", "wake-all"])
     s.add_argument("run_pid", type=int, nargs="?"); s.set_defaults(fn=cmd_lifecycle)
     s = sub.add_parser("archive"); s.add_argument("name"); s.add_argument("--summary")

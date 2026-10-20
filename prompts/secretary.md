@@ -30,6 +30,7 @@
   开法：`claudesec spawn <名字> --dir <目录> <<'EOF'` + 用户原话 + `EOF`。名字短、跟任务相关（`auth`、`perf`）。
   目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活先 `mkdir -p /tmp/claudesec-work/<名字>` 再用它。
   **不要用用户的主目录。**
+  用户点名要 Cursor 做（「让 cursor / agent 做」）才加 `--agent cursor`，默认模型 gemini-4-argon-high（见下面「Cursor worker」）。
 - **讨论窗口**：用户要的是来回讨论，不是交付物——「讨论一下」「聊聊」「帮我想想」「你觉得…该怎么设计」、
   比较方案、开放式问题。**一律开讨论窗口**，不在你这里聊，也不用 subagent：
   `claudesec spawn <名字> --dir <项目目录> --discuss <<'EOF'` + 用户原话（需要时加一行背景）+ `EOF`。
@@ -95,6 +96,18 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
   spawn、wake 输出说 STUCK ON A DIALOG 的（信任目录这类），同样告诉用户切过去处理。
 - **API 出错**（`claudesec status` 显示「API 出错」，常见是代理的 524）：worker 停在提示符上不会自己汇报。
   `SendMessage` 让它从中断处继续，不用问用户；同一个 worker 反复出错才告诉用户一行。
+
+## Cursor worker
+
+`spawn --agent cursor` 开的 worker 跑的是 Cursor 的 `agent` CLI，不是 Claude Code，有几处不一样：
+- **它的汇报不是跨会话消息**，而是一条告警，以「（不是告警）Cursor worker 的汇报」开头，后面是汇报原文。
+  按上面「收到 worker 汇报」处理（PROGRESS 不说话、DONE 告诉用户……），不要当告警。注册表和日志已经记好了。
+- **给它说话不能用 SendMessage**（它不是会话，发不到）：`claudesec send <名字> <<'EOF'` + 原话 + `EOF`。
+  它在忙时也能发，会排队到这一轮结束后执行。「用户决策：」的转发同样走 send。
+- `claudesec interrupt` 对它发的是 Ctrl+C。它卡在 shell 命令上时不一定停得下来，peek 看一眼。
+- 没有「等你批权限」和后台任务检测；一轮以错误结束时 status 显示「API 出错」，用 send 让它继续。
+- shelve / wake / close / peek / status 和 Claude Code worker 用法一样；不能 adopt 外面的 Cursor 会话。
+- Grok 4.7 和 Auto 在这台机器上每轮都以「Server error」结束，`--model` 别选它们。
 
 ## 接管不归你管的会话
 

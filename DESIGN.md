@@ -402,7 +402,9 @@ worker 干活（可开 subagent，结果不外泄）
 claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
-claudesec spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
+claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] <<< 任务原文
+claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
+claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
 claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
                                 Claude Code 的建议或占位，标成「【CC 建议，不是用户输入】」，和用户没发出的草稿区分开
@@ -459,6 +461,33 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 - 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
+
+### Cursor worker（`spawn --agent cursor`）
+
+跑的是 Cursor 的 `agent` CLI。Claude Code 那一套它都没有：没有按会话装的 hook（`--settings`）、没有
+`--append-system-prompt`、没有 SendMessage、没有 sessions/<pid>.json。对应的做法：
+- hook 只能装在全局 `~/.cursor/hooks.json`。spawn / wake 时 claudesec 把自己的三条（sessionStart、
+  beforeSubmitPrompt、stop）写进去，其他条目不动，文件有变化就先备份成 `hooks.json.bak-claudesec-<时间>`。
+  每条都是 `[ -z "$CLAUDESEC_WORKER" ] || claudesec hook cursor-…`：只有 worker 命令设了这个变量
+  （hook 进程会继承 agent 的环境，已验证），用户别的 Cursor 会话里什么都不做。
+- 规则：sessionStart 返回 `additional_context`（prompts/worker-cursor.md）。只在新会话触发；`--resume` 不触发，
+  但第一次注入的内容留在会话里。会话 id 也由 sessionStart 回写。
+- 汇报：worker 用 shell 跑 `claudesec report NAME`，记日志、注册表后经告警通道（alerts/ + 秘书的 watcher）叫醒秘书，
+  正文以「（不是告警）Cursor worker 的汇报」开头。
+- 秘书 → worker：`claudesec send`，tmux 粘贴（bracketed paste，多行算一条）+ 回车。它在忙时消息进 Cursor 的队列，
+  这一轮结束后执行。
+- 忙/闲：beforeSubmitPrompt 写 busy 标记，stop 清掉。没汇报就停下：stop 返回 `followup_message` 让它补发，
+  最多 3 次，再不发就告警。stop 的 status 为 error 时记「API 出错」并告警；但 `claudesec interrupt`（Ctrl+C）
+  打断的那一轮也报 error，所以 interrupt 先写标记，30 秒内的非 completed 结束都当作打断。
+- shelve / wake：会话在 `~/.cursor/chats/*/<chatId>` 就算还在；wake 用 `agent --resume <chatId>`，
+  因为不触发 sessionStart，确认方式是 agent 画出界面并且活过 5 秒。没有 adopt。
+- 本机 Grok 4.7 / Auto（MAX）每轮都以「Server error」结束，stop 拿到 status=error；
+  默认模型因此是 `cursor_worker_model: "gemini-4-argon-high"`。
+
+已验证（真机，Cursor agent 2026.10.19-6bbf2c4，临时 CLAUDESEC_HOME）：spawn → PROGRESS、DONE 经告警送达、注册表更新；
+send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，闲时 shelve → wake 带指令 → 同一个会话 id
+接着回复并汇报；窗口被杀后 `lifecycle wake-all` 静默恢复；interrupt 打断 shell 命令后状态不变、不告警；
+没有 CLAUDESEC_WORKER 的普通 Cursor 会话照常跑完，hook 无输出、注册表不变。
 
 未验证（需要用户真用时观察）：
 - 秘书 `/compact` 后靠注入的状态接上在跑的 worker

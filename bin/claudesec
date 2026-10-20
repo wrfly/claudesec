@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""aidecamp — a Claude secretary in tmux. See DESIGN.md.
+"""claudesec — a Claude secretary in tmux. See DESIGN.md.
 
-Commands (the secretary calls these; you mostly only run `aidecamp`):
-  aidecamp [start] [--new|--restart] [-d]   open the secretary in its own tmux session "aidecamp"
+Commands (the secretary calls these; you mostly only run `claudesec`):
+  claudesec [start] [--new|--restart] [-d]   open the secretary in its own tmux session "claudesec"
                                     (resumes the last secretary; --new starts fresh; --restart reloads
                                     prompt and hooks keeping the conversation; -d don't switch)
-  aidecamp spawn NAME --dir DIR [--model M] [--discuss] < task.txt
+  claudesec spawn NAME --dir DIR [--model M] [--discuss] < task.txt
                                     (--discuss: a discussion window the user is switched into)
-  aidecamp status                       one-screen table of workers
-  aidecamp log NAME [-n N]              last N report entries of a worker
-  aidecamp interrupt NAME               send Escape to a worker's window
-  aidecamp close NAME                   kill a worker's window, drop it from the registry
-  aidecamp peek NAME [-n N]             last lines of a worker's window and whether it is busy
-  aidecamp sessions                     Claude sessions on this machine that aidecamp does not manage
-  aidecamp adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
+  claudesec status                       one-screen table of workers
+  claudesec log NAME [-n N]              last N report entries of a worker
+  claudesec interrupt NAME               send Escape to a worker's window
+  claudesec close NAME                   kill a worker's window, drop it from the registry
+  claudesec peek NAME [-n N]             last lines of a worker's window and whether it is busy
+  claudesec sessions                     Claude sessions on this machine that claudesec does not manage
+  claudesec adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
                                             keeps its history); an exited session by its session id
-  aidecamp shelve NAME [--note N] [--force]   stop a worker or outside session, keep only its record
-  aidecamp wake NAME [--model M] [< instruction]   resume a shelved one in a new window (history kept)
-  aidecamp archive NAME [--summary S] [--tags a,b] [--files x,y]
-  aidecamp archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
-  aidecamp lesson TYPE SITUATION CORRECTION
-  aidecamp hook EVENT [NAME]            internal; called by Claude Code hooks
+  claudesec shelve NAME [--note N] [--force]   stop a worker or outside session, keep only its record
+  claudesec wake NAME [--model M] [< instruction]   resume a shelved one in a new window (history kept)
+  claudesec archive NAME [--summary S] [--tags a,b] [--files x,y]
+  claudesec archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
+  claudesec lesson TYPE SITUATION CORRECTION
+  claudesec hook EVENT [NAME]            internal; called by Claude Code hooks
 """
 import argparse
 import contextlib
@@ -38,7 +38,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-HOME = Path(os.environ.get("AIDECAMP_HOME", Path.home() / ".aidecamp"))
+HOME = Path(os.environ.get("CLAUDESEC_HOME", Path.home() / ".claudesec"))
 SELF = Path(__file__).resolve()
 REPO = SELF.parent.parent
 PROMPTS = REPO / "prompts"
@@ -46,7 +46,7 @@ PROMPTS = REPO / "prompts"
 
 def claude_dir():
     """Claude Code's config dir. A launcher may set CLAUDE_CONFIG_DIR only for claude itself, so
-    aidecamp processes started by tmux don't see it; hooks run under claude and record it."""
+    claudesec processes started by tmux don't see it; hooks run under claude and record it."""
     env = os.environ.get("CLAUDE_CONFIG_DIR")
     if env:
         return Path(env)
@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "secretary_model": None,          # None = whatever claude defaults to
     "worker_model": "claude-opus-5-5",
     "worker_permission_mode": "auto",
-    "tmux_session": "aidecamp",           # the secretary and all workers live in this tmux session
+    "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
@@ -167,7 +167,7 @@ def alive_windows():
 
 
 def hook_cmd():
-    return f"AIDECAMP_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))}"
+    return f"CLAUDESEC_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))}"
 
 
 def hook_input():
@@ -200,8 +200,8 @@ def has_session(name):
     return subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0
 
 
-def secretary_runs_aidecamp(sess):
-    """Is the secretary window running `aidecamp run` (directly, or under the shell tmux started)?"""
+def secretary_runs_claudesec(sess):
+    """Is the secretary window running `claudesec run` (directly, or under the shell tmux started)?"""
     out = tmux("display-message", "-p", "-t", f"={sess}:secretary", "#{pane_dead} #{pane_pid}", check=False).split()
     if len(out) != 2 or out[0] != "0":
         return False
@@ -209,29 +209,29 @@ def secretary_runs_aidecamp(sess):
         kids = Path(f"/proc/{out[1]}/task/{out[1]}/children").read_text().split()
     except OSError:
         kids = []
-    return any(is_aidecamp_run(pid) for pid in [out[1], *kids])
+    return any(is_claudesec_run(pid) for pid in [out[1], *kids])
 
 
 def cmd_start(args):
     """Put the secretary in its own tmux session, then switch or attach to it."""
     sess = config()["tmux_session"]
     remember_claude_dir()
-    run = f"AIDECAMP_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))} run" + (" --new" if args.new else "")
+    run = f"CLAUDESEC_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))} run" + (" --new" if args.new else "")
     if not has_session(sess):
         tmux("new-session", "-d", "-s", sess, "-n", "secretary", "-c", str(HOME), run)
     elif "secretary" not in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}").split():
         tmux("new-window", "-t", f"={sess}:", "-n", "secretary", "-c", str(HOME), run)
     else:
-        wrapped = secretary_runs_aidecamp(sess)
+        wrapped = secretary_runs_claudesec(sess)
         if args.new or args.restart or not wrapped:
             # --restart: same conversation, freshly loaded prompt and hooks. Not wrapped: a restored
             # tmux layout left a shell or a bare `claude --resume` in the window; take it over.
-            if wrapped:  # the exiting `aidecamp run` sees this and leaves the workers running
+            if wrapped:  # the exiting `claudesec run` sees this and leaves the workers running
                 (HOME / "restarting").write_text(str(time.time()))
             tmux("respawn-pane", "-k", "-t", f"={sess}:secretary", "-c", str(HOME), run)
     # Keep this session out of tmux-resurrect's saved layouts (a post-save hook that honours
     # @resurrect-skip drops it): restored, its panes would be bare `claude --resume`s without
-    # aidecamp's prompts and hooks. `aidecamp` starts the secretary itself; its wake-all brings the workers.
+    # claudesec's prompts and hooks. `claudesec` starts the secretary itself; its wake-all brings the workers.
     tmux("set-option", "-t", f"={sess}:", "@resurrect-skip", "on", check=False)
     if args.detach:
         print(f"secretary is in tmux session '{sess}'")
@@ -279,7 +279,7 @@ def cmd_run(args):
     argv = ["claude", "-n", cfg["secretary_name"],
             "--settings", str(settings),
             "--append-system-prompt-file", str(PROMPTS / "secretary.md"),
-            "--allowedTools", "Bash(aidecamp *)"]
+            "--allowedTools", "Bash(claudesec *)"]
     if cfg["secretary_model"]:
         argv += ["--model", cfg["secretary_model"]]
     session = HOME / "secretary.session"
@@ -290,7 +290,7 @@ def cmd_run(args):
     os.chdir(HOME)
     (HOME / "run.pid").write_text(str(os.getpid()))  # a newer one tells an older shelve-all to stop
     detach("wake-all")
-    # Not exec: the workers are put away after the secretary exits. That is done here, by aidecamp,
+    # Not exec: the workers are put away after the secretary exits. That is done here, by claudesec,
     # so the user has no chores and no tool call of the secretary's can be refused.
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C belongs to claude
     signal.signal(signal.SIGHUP, signal.SIG_IGN)   # window killed: claude exits, we still clean up
@@ -311,9 +311,9 @@ def cmd_run(args):
 
 
 def detach(job):
-    """Run `aidecamp lifecycle JOB` on its own, outliving this window; output goes to a log."""
+    """Run `claudesec lifecycle JOB` on its own, outliving this window; output goes to a log."""
     log = open(HOME / "lifecycle.log", "a")
-    p = subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "AIDECAMP_HOME": str(HOME)},
+    p = subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     # Reap it when it's done, or wake-all lingers as a zombie for as long as the secretary runs.
     # If this process exits first (shelve-all), the job is reparented and reaped by init.
@@ -338,7 +338,7 @@ def quietly(fn, **kw):
 
 
 def cmd_lifecycle(args):
-    print(f"=== {now()} {args.job} (aidecamp run {args.run_pid})", flush=True)
+    print(f"=== {now()} {args.job} (claudesec run {args.run_pid})", flush=True)
     if args.job == "shelve-all":
         shelve_all(args.run_pid)
     else:
@@ -356,22 +356,22 @@ def lifecycle_lock():
 
 
 def current_run():
-    """pid of the live `aidecamp run` the secretary is in, from run.pid, or None."""
+    """pid of the live `claudesec run` the secretary is in, from run.pid, or None."""
     try:
         pid = int((HOME / "run.pid").read_text())
         os.kill(pid, 0)
     except (OSError, ValueError):
         return None
-    return pid if is_aidecamp_run(pid) else None  # after a reboot the pid may be someone else's
+    return pid if is_claudesec_run(pid) else None  # after a reboot the pid may be someone else's
 
 
-def is_aidecamp_run(pid):
-    """Is pid a `aidecamp run`? Without /proc there is no telling; assume it is."""
+def is_claudesec_run(pid):
+    """Is pid a `claudesec run`? Without /proc there is no telling; assume it is."""
     try:
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return not Path("/proc/self").exists()
-    return b"run" in argv and any(a.endswith(b"aidecamp") for a in argv)
+    return b"run" in argv and any(a.endswith(b"claudesec") for a in argv)
 
 
 def shelve_all(run_pid):
@@ -438,7 +438,7 @@ def wake_orphans():
     for t in threads:
         t.join()
     if failed:
-        raise_alert("秘书启动时这些 worker 没能自动恢复（仍是搁置状态，可以再试 aidecamp wake）：\n"
+        raise_alert("秘书启动时这些 worker 没能自动恢复（仍是搁置状态，可以再试 claudesec wake）：\n"
                     + "\n".join(f"- {n}: {e.splitlines()[0][:200]}" for n, e in failed.items()))
 
 
@@ -450,7 +450,7 @@ def cmd_spawn(args):
     _, workers = read_registry()
     old = workers.get(name)
     if old and old["status"] == "SHELVED":
-        sys.exit(f"{name} is a shelved worker: `aidecamp wake {name}` it, or `aidecamp close {name}` to forget it")
+        sys.exit(f"{name} is a shelved worker: `claudesec wake {name}` it, or `claudesec close {name}` to forget it")
     if old and old.get("window") in alive_windows():
         sys.exit(f"worker {name} is already running in window {old['window']}")
     task = sys.stdin.read().strip()
@@ -545,9 +545,9 @@ def stuck_on_dialog(name, target):
     return False
 
 
-# ---------- sessions aidecamp did not start ----------
+# ---------- sessions claudesec did not start ----------
 
-ADOPT_PROMPT = """你刚被 aidecamp 秘书接管：会话历史都在，从现在起按系统提示里的 worker 规则工作。
+ADOPT_PROMPT = """你刚被 claudesec 秘书接管：会话历史都在，从现在起按系统提示里的 worker 规则工作。
 先用 SendMessage 给秘书发第一条汇报，让秘书知道你的情况：
 - DID 写你之前在做什么、做到了哪里。
 - 上一轮的事已经做完 → TYPE: DONE，按格式给出 RESULT 和 DECISIONS。
@@ -571,7 +571,7 @@ def claude_sessions():
 
 
 def external_sessions():
-    """Conversations aidecamp could adopt. A foreground client parked on a background job (the
+    """Conversations claudesec could adopt. A foreground client parked on a background job (the
     daemon's `bg` host) is folded into that job: the conversation lives in the job, the
     client's own sessionId is empty. The job's session is under s["bg"]."""
     cfg = config()
@@ -622,7 +622,7 @@ def print_rows(rows):
 def cmd_sessions(args):
     sessions = external_sessions()
     if not sessions:
-        print("没有 aidecamp 之外的 Claude 会话。")
+        print("没有 claudesec 之外的 Claude 会话。")
         return
     print_rows(session_rows(sessions))
 
@@ -645,9 +645,9 @@ def exited_session(key):
     held = next((s for s in claude_sessions() if s.get("sessionId") == sid), None)
     if held:
         sys.exit(f"session {sid} is held by live pid {held['pid']} ({held.get('name')}), "
-                 f"which aidecamp manages or can't take over")
+                 f"which claudesec manages or can't take over")
     if sid in {w.get("session") for w in read_registry()[1].values()}:
-        sys.exit(f"session {sid} already belongs to a aidecamp worker")
+        sys.exit(f"session {sid} already belongs to a claudesec worker")
     cwd = None
     with open(path) as f:
         for line in f:
@@ -709,7 +709,7 @@ def cmd_adopt(args):
         return find_external(args.session)
 
     s = find() or exited_session(args.session) or sys.exit(
-        f"no unmanaged live session or exited session id {args.session!r}; see `aidecamp sessions`")
+        f"no unmanaged live session or exited session id {args.session!r}; see `claudesec sessions`")
     conv = s.get("bg") or s
     if not s.get("tmux") and conv.get("kind") not in ("bg", "exited"):
         sys.exit(f"{args.session} is not running in tmux; it can't be taken over in place")
@@ -730,7 +730,7 @@ def cmd_adopt(args):
             time.sleep(5)
     elif conv.get("status") != "idle":
         sys.exit(f"{args.session} is {conv.get('status')}. Only idle sessions are adopted: ask the user "
-                 f"to stop it, or run `aidecamp adopt {args.session} --wait` in the background")
+                 f"to stop it, or run `claudesec adopt {args.session} --wait` in the background")
 
     sid, cwd = conv["sessionId"], conv["cwd"]
     # Nothing is stopped until we know the conversation is on disk: a client attached to a
@@ -806,7 +806,7 @@ def cmd_adopt(args):
 
 # ---------- shelved: registered, but no process running ----------
 
-WAKE_PROMPT = "你刚被 aidecamp 秘书从搁置中唤醒：会话历史都在，继续按系统提示里的 worker 规则工作。\n"
+WAKE_PROMPT = "你刚被 claudesec 秘书从搁置中唤醒：会话历史都在，继续按系统提示里的 worker 规则工作。\n"
 WAKE_REPORT = """先用 SendMessage 给秘书发一条汇报：DID 写你之前在做什么、做到了哪里；
 TYPE: BLOCKED，ISSUE 写「等秘书给下一步」。发完就停，不要自己开始新的工作。
 """
@@ -860,7 +860,7 @@ def cmd_shelve(args):
         entry = dict(w)
     else:
         s = find_external(args.name) or exited_session(args.name) or sys.exit(
-            f"no worker, unmanaged live session or exited session id {args.name!r}; see `aidecamp status`")
+            f"no worker, unmanaged live session or exited session id {args.name!r}; see `claudesec status`")
         conv = s.get("bg") or s
         if conv.get("status") == "busy" and not args.force:
             sys.exit(f"{args.name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
@@ -889,7 +889,7 @@ def cmd_shelve(args):
     (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
     append_log(name, "shelved", f"session {sid}, {cwd}\n{summary}")
     print(f"shelved {label} as {name}: nothing is running for it now. Session {sid} in {cwd}. "
-          f"`aidecamp wake {name}` resumes it.")
+          f"`claudesec wake {name}` resumes it.")
 
 
 def cmd_wake(args):
@@ -906,7 +906,7 @@ def cmd_wake(args):
     holder = live_holder(sid)
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
-                 f"someone resumed it outside aidecamp")
+                 f"someone resumed it outside claudesec")
     quiet = getattr(args, "quiet", False)
     instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
     initial = WAKE_PROMPT + (f"\n秘书转来用户的新指令（原话），照做并按规则汇报：\n\n{instruction}\n"
@@ -1005,7 +1005,7 @@ def cmd_status(args):
     else:
         print("没有 worker。")
     if shelved:
-        print("\n搁置（没有进程在跑；aidecamp wake 唤醒）：")
+        print("\n搁置（没有进程在跑；claudesec wake 唤醒）：")
         rows = [("名字", "目录", "搁置于", "备注 / 最后一轮")]
         for n, w in shelved.items():
             rows.append((n, Path(w["dir"]).name, (w.get("shelved_at") or "")[:16].replace("T", " "),
@@ -1013,7 +1013,7 @@ def cmd_status(args):
         print_rows(rows)
     sessions = external_sessions()
     if sessions:
-        print(f"\n不归 aidecamp 管的 Claude 会话（空闲的可以 aidecamp adopt 接管）：")
+        print(f"\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：")
         print_rows(session_rows(sessions))
 
 
@@ -1079,7 +1079,7 @@ def cmd_close(args):
 
 def index_add(rel, line):
     index = HOME / "history" / "INDEX.md"
-    lines = index.read_text().splitlines() if index.exists() else ["# aidecamp 历史索引", ""]
+    lines = index.read_text().splitlines() if index.exists() else ["# claudesec 历史索引", ""]
     lines = [l for l in lines if f"→ {rel}" not in l] + [f"{line} → {rel}"]
     index.write_text("\n".join(lines) + "\n")
 
@@ -1148,7 +1148,7 @@ def cmd_archive(args):
     print(f"archived → {path}")
 
 
-LESSONS = "# 秘书的教训（用户说「复盘」时交给 aidecamp worker 归类，处理过的移到「已处理」）\n\n"
+LESSONS = "# 秘书的教训（用户说「复盘」时交给 claudesec worker 归类，处理过的移到「已处理」）\n\n"
 
 
 def cmd_lesson(args):
@@ -1228,7 +1228,7 @@ def hook_secretary_session_start():
     if data.get("session_id"):
         (HOME / "secretary.session").write_text(data["session_id"] + "\n")
     focus, workers = read_registry()
-    out = [f"[aidecamp] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}"]
+    out = [f"[claudesec] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}"]
     import io
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
@@ -1303,19 +1303,19 @@ def hook_worker_permission(name):
     token = str(time.time_ns())
     marker.write_text(json.dumps({"token": token, "detail": detail}, ensure_ascii=False))
     subprocess.Popen([str(SELF), "hook", "worker-permission-alert", name],
-                     env={**os.environ, "AIDECAMP_HOME": str(HOME), "AIDECAMP_TOKEN": token, "AIDECAMP_DELAY": str(delay)},
+                     env={**os.environ, "CLAUDESEC_HOME": str(HOME), "CLAUDESEC_TOKEN": token, "CLAUDESEC_DELAY": str(delay)},
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
 
 
 def hook_worker_permission_alert(name):
-    time.sleep(float(os.environ.get("AIDECAMP_DELAY", "0")))
+    time.sleep(float(os.environ.get("CLAUDESEC_DELAY", "0")))
     marker = worker_dir(name) / "waiting-permission"
     try:
         m = json.loads(marker.read_text())
     except (OSError, ValueError):
         return  # answered meanwhile
-    if m.get("token") != os.environ.get("AIDECAMP_TOKEN"):
+    if m.get("token") != os.environ.get("CLAUDESEC_TOKEN"):
         return
     with registry() as reg:
         w = reg["workers"].get(name)
@@ -1390,7 +1390,7 @@ def hook_secretary_watch():
             msgs = [f.read_text().strip() for f in files]
             for f in files:
                 f.rename(done / f.name)
-            print("[aidecamp 告警]\n" + "\n".join(msgs), file=sys.stderr)
+            print("[claudesec 告警]\n" + "\n".join(msgs), file=sys.stderr)
             sys.exit(2)
         try:
             os.kill(owner, 0)
@@ -1421,7 +1421,7 @@ def cmd_hook(args):
 # ---------- cli ----------
 
 def main():
-    p = argparse.ArgumentParser(prog="aidecamp", description=__doc__,
+    p = argparse.ArgumentParser(prog="claudesec", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
 

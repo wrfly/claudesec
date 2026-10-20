@@ -1,4 +1,4 @@
-# Aidecamp 设计文档 —— tmux 里的 Claude 秘书（最小版）
+# ClaudeSec 设计文档 —— tmux 里的 Claude 秘书（最小版）
 
 > 状态：设计稿 v2，未实现。给执行者（另一个 Claude Code 会话）看的。不含代码。
 > v1 有部门、审核门、三档模型分级、三层结构——都砍了，原因见第 1 节。
@@ -154,7 +154,7 @@ tmux pane id，`SendMessage` 可互发。
 实测结果（2026-10-16，claude 2.1.301）：
 1. 新 window 里的会话约 30 秒内出现在 `ListAgents`，带 tmux pane id。
 2. **秘书空闲时，worker 的 `SendMessage` 能直接唤醒它**。汇报无需走文件 + Monitor。
-3. 会话的自动名每次重启都变（`aidecamp-48` → `aidecamp-c4` → `aidecamp-5e`）→ 秘书必须用固定 `-n` 启动。
+3. 会话的自动名每次重启都变（`claudesec-48` → `claudesec-c4` → `claudesec-5e`）→ 秘书必须用固定 `-n` 启动。
 4. 新会话可能弹「模型额度」对话框卡住无人看的窗口，且在里面选「切换」会改全局默认模型
    → spawn 一律显式 `--model`，并在 spawn 后 8 秒内抓 pane 检测对话框。
 5. `--agent` 的正文会**替换**默认系统提示 → 不用 agent 文件，改用 `--append-system-prompt-file`。
@@ -164,11 +164,11 @@ tmux pane id，`SendMessage` 可互发。
 ### 3.2 组件（已实现）
 
 ```
-<repo>/bin/aidecamp            python3 单文件：秘书用的命令 + 全部 hook 逻辑
+<repo>/bin/claudesec            python3 单文件：秘书用的命令 + 全部 hook 逻辑
 <repo>/prompts/secretary.md  秘书宪法（--append-system-prompt-file 追加到默认系统提示）
 <repo>/prompts/worker.md     worker 规则，{{NAME}} {{SECRETARY}} 在 spawn 时替换
-<repo>/install.sh            只做一件事：软链 bin/aidecamp 到 ~/.local/bin
-~/.aidecamp/                     状态目录（AIDECAMP_HOME 可改）
+<repo>/install.sh            只做一件事：软链 bin/claudesec 到 ~/.local/bin
+~/.claudesec/                     状态目录（CLAUDESEC_HOME 可改）
   config.json                秘书名、秘书模型、worker 默认模型、worker 权限模式
   registry.json              注册表（3.3），hook 写，加文件锁
   reports/<worker>.log       双向全部消息：task / worker→secretary / secretary→worker
@@ -176,7 +176,7 @@ tmux pane id，`SendMessage` 可互发。
   history/                   3.5
   lessons.md                 3.6
   queue.md                   决策队列：要用户定的事按重要程度排队，秘书一次只问一件（首次启动时建）
-  secretary.session          秘书 session id，`aidecamp` 据此 --resume
+  secretary.session          秘书 session id，`claudesec` 据此 --resume
   secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）
 ```
 
@@ -189,31 +189,31 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | worker | Stop | 有后台任务 → 放行；有标记 → 清标记放行；`stop_hook_active` → 放行；否则 block 要求汇报 |
 | 秘书 | SessionStart（含 compact/resume） | 记 session id；注入状态表 + INDEX 最近 20 行 + 待复盘教训数 |
 | 秘书 | PostToolUse(SendMessage) | 发给 worker 的消息 → 追加到该 worker 的 log、更新 focus |
-| worker | PermissionRequest / Notification(permission_prompt 等) | 写「等待确认」标记；4 秒后仍未处理（排除自动放行的调用）→ 状态 WAITING_PERMISSION、记 log、写告警到 `~/.aidecamp/alerts/`（讨论窗口不告警，用户就在窗口里） |
+| worker | PermissionRequest / Notification(permission_prompt 等) | 写「等待确认」标记；4 秒后仍未处理（排除自动放行的调用）→ 状态 WAITING_PERMISSION、记 log、写告警到 `~/.claudesec/alerts/`（讨论窗口不告警，用户就在窗口里） |
 | worker | PostToolUse / PostToolUseFailure / PermissionDenied（全部工具）、Stop、汇报 | 有标记才进 python：清标记，状态恢复 |
 | worker | StopFailure（这一轮死在 API 错误上，如代理的 524） | 状态 API_ERROR（显示「API 出错」）、记 log、写告警叫醒秘书，秘书让它从中断处继续；下一轮正常结束时状态恢复（讨论窗口不告警） |
 | 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
 
-**生命周期**：秘书窗口里跑的是 `aidecamp run`，它不 exec claude，而是把它当子进程包一层。
-- 启动时：后台 `aidecamp lifecycle wake-all`。被秘书退出收起的 worker（`shelved_by: exit`），以及进程已经没了的
+**生命周期**：秘书窗口里跑的是 `claudesec run`，它不 exec claude，而是把它当子进程包一层。
+- 启动时：后台 `claudesec lifecycle wake-all`。被秘书退出收起的 worker（`shelved_by: exit`），以及进程已经没了的
   worker（窗口或整个 tmux session 被杀），都用 `--resume` **静默**恢复：不带首条 prompt，不跑模型，状态还原。
   用户手动搁置的不动。恢复失败的写告警，叫醒秘书。
-- 退出时（`/exit`、窗口被关、tmux session 被杀，包装进程都忽略 SIGHUP 并继续收尾）：后台 `aidecamp lifecycle shelve-all`
+- 退出时（`/exit`、窗口被关、tmux session 被杀，包装进程都忽略 SIGHUP 并继续收尾）：后台 `claudesec lifecycle shelve-all`
   收起所有 worker；忙着的等它做完这一轮；秘书在此期间回来了就停手。
-- `aidecamp --restart` / `--new` 先写 `restarting` 标记，退出的包装进程看到标记就不收尾，worker 照常跑。
+- `claudesec --restart` / `--new` 先写 `restarting` 标记，退出的包装进程看到标记就不收尾，worker 照常跑。
 - wake-all 和 shelve-all 靠 `lifecycle.lock` 串行。秘书可能启动几秒就退出（比如开机时被 tmux-resurrect 顶掉），
   这时先把 worker 唤醒完，再收起来。正在唤醒的 worker 在注册表里没有 session，两边同时动手会互相踩。
-  `run.pid` 记着当前的 `aidecamp run`：旧秘书的 shelve-all 看到有新的就停手；wake-all 发现启动它的秘书已经不在，就什么也不唤醒。
-- 开机：aidecamp 的 tmux session **不让 tmux-resurrect 保存**。aidecamp 给它设了 `@resurrect-skip on`，resurrect 的
+  `run.pid` 记着当前的 `claudesec run`：旧秘书的 shelve-all 看到有新的就停手；wake-all 发现启动它的秘书已经不在，就什么也不唤醒。
+- 开机：claudesec 的 tmux session **不让 tmux-resurrect 保存**。claudesec 给它设了 `@resurrect-skip on`，resurrect 的
   post-save-layout 钩子要把带这个选项的 session 从存档里去掉。否则恢复出来的 pane 是裸的 `claude --resume`，
-  没有 aidecamp 的 prompt、hook 和包装层；而且如果 tmux 服务器是 `aidecamp` 自己拉起的，continuum 一恢复就会把秘书的
-  pane 当作「从零恢复」顶掉。去掉之后，开机后跑 `aidecamp`：秘书由 aidecamp 拉起，worker 由 wake-all 恢复。
-- `aidecamp` 发现 secretary 窗口里跑的不是 `aidecamp run`（一个 shell，或者恢复出来的裸 `claude --resume`），就接管：
-  用 `aidecamp run` 重开这个 pane，对话照样 `--resume`。
-- 这些都是 aidecamp 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
+  没有 claudesec 的 prompt、hook 和包装层；而且如果 tmux 服务器是 `claudesec` 自己拉起的，continuum 一恢复就会把秘书的
+  pane 当作「从零恢复」顶掉。去掉之后，开机后跑 `claudesec`：秘书由 claudesec 拉起，worker 由 wake-all 恢复。
+- `claudesec` 发现 secretary 窗口里跑的不是 `claudesec run`（一个 shell，或者恢复出来的裸 `claude --resume`），就接管：
+  用 `claudesec run` 重开这个 pane，对话照样 `--resume`。
+- 这些都是 claudesec 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
 - 秘书不在时，worker 的 Stop hook 不再逼汇报；SendMessage 失败的汇报也照样记进 log 和 registry（PostToolUseFailure）。
-- `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 aidecamp 进程看不到。hook 运行在 claude 之下，
-  会把它记进 `config.json` 的 `claude_config_dir`，其他 aidecamp 进程从这里读。
+- `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 claudesec 进程看不到。hook 运行在 claude 之下，
+  会把它记进 `config.json` 的 `claude_config_dir`，其他 claudesec 进程从这里读。
 
 结果：秘书**不记账**。日志、注册表、焦点都由 hook 确定性维护，秘书只负责判断和措辞。
 
@@ -227,7 +227,7 @@ worker 卡在确认框上时自己发不了 `SendMessage`，hook 是 shell 也�
   "focus": "perf",
   "workers": {
     "auth": {
-      "session": "aidecamp-auth-12",
+      "session": "claudesec-auth-12",
       "window": "0:@7",
       "task": "重构 token 校验，加过期处理",
       "status": "PROGRESS",
@@ -248,13 +248,13 @@ worker 卡在确认框上时自己发不了 `SendMessage`，hook 是 shell 也�
 | 时效 | 内容 | 存在哪 | 谁写 | 何时进上下文 |
 |---|---|---|---|---|
 | 小时级 | 谁在跑、到哪了 | `registry.json`（3.3） | 秘书，每次汇报后 | 常驻摘要 |
-| 天～月级 | 做过什么、结果、改动文件、**决定及理由** | `~/.aidecamp/history/`（下） | 秘书，任务收尾时 | 只有 `INDEX.md` 常驻；正文按需检索 |
+| 天～月级 | 做过什么、结果、改动文件、**决定及理由** | `~/.claudesec/history/`（下） | 秘书，任务收尾时 | 只有 `INDEX.md` 常驻；正文按需检索 |
 | 永久 | 用户偏好、常设指令 | Claude Code 自带 memory + `settings.json` | 秘书，用户给元指令时 | 自带机制负责 |
 
 **历史库**，形状跟 Claude Code 自己的 memory 一样：一事一文件 + 一个索引。
 
 ```
-~/.aidecamp/history/
+~/.claudesec/history/
   INDEX.md                      一行一任务：日期 · 项目 · 名字 · 一句话结果 · 标签
   2026-10/
     auth-token-refactor.md
@@ -302,7 +302,7 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 - **worker 不写历史，但要在 DONE/FAILED 里交出 `DECISIONS`**。它不知道什么跨任务重要，
   但只有它知道自己放弃了哪些方案。秘书不过滤，原样存；INDEX 和推送里不出现。
 - **分类靠标签 + 按月目录**，不预设分类树。标签由秘书收尾时打，用户可在元指令里规定标签集。
-- **检索走 subagent**：用户问旧事 → 秘书派 Explore 在 `~/.aidecamp/history/` 按关键词/日期/
+- **检索走 subagent**：用户问旧事 → 秘书派 Explore 在 `~/.claudesec/history/` 按关键词/日期/
   标签 grep INDEX 再读命中文件 → 只把结论带回。秘书永远不把历史正文整段读进自己上下文。
 - **秘书会话长期 resume**，不每天新开。registry + history 在磁盘上，compact 才安全。
   `SessionStart` hook 注入 registry 和 INDEX 最近 20 行。
@@ -319,7 +319,7 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 | 层 | 内容 | 机制 | 审批 |
 |---|---|---|---|
 | **经验** | 事实、偏好、别名（「用户说 perf 指性能那个 worker」） | Claude Code 自带 memory：纠错即写一条 feedback memory，下次会话自动加载 | 不需要 |
-| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.aidecamp/lessons.md` 攒教训，不自己改宪法；用户说「复盘」时交给 `aidecamp` worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
+| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.claudesec/lessons.md` 攒教训，不自己改宪法；用户说「复盘」时交给 `claudesec` worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
 | **铁律** | 2.5 节四条 | 永不自改 | — |
 
 为什么宪法层要门槛和审批：
@@ -388,7 +388,7 @@ worker 干活（可开 subagent，结果不外泄）
 ## 7. 以后再说
 
 - 模型分级：账单疼了再加，一条规则「机械活用 haiku」起步
-- Go 二进制 `aidecamp`：`aidecamp spawn/status/attach`，秘书调它而不是拼 tmux 命令
+- Go 二进制 `claudesec`：`claudesec spawn/status/attach`，秘书调它而不是拼 tmux 命令
 - 跨项目：一个秘书管多个 repo
 - 历史：按天归档 reports
 
@@ -396,23 +396,23 @@ worker 干活（可开 subagent，结果不外泄）
 
 ## 8. 实现（已完成）
 
-秘书命令（秘书经 `--allowedTools "Bash(aidecamp *)"` 免确认调用）：
+秘书命令（秘书经 `--allowedTools "Bash(claudesec *)"` 免确认调用）：
 
 ```
-aidecamp                       切到/附着 tmux session "aidecamp"（不存在则创建，秘书 resume 上次会话）
-aidecamp --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
-aidecamp -d                    只在后台建好 session，不切换
-aidecamp spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
-aidecamp status | log NAME [-n N] | interrupt NAME | close NAME
-aidecamp peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）
-aidecamp archive NAME --summary S --tags a,b [--files x,y]
-aidecamp archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
-aidecamp lesson TYPE 情况 用户原话
-aidecamp sessions              不归 aidecamp 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
-aidecamp shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）
-aidecamp wake NAME [--model M] [<<< 新指令]     --resume 拉起，历史保留
-aidecamp --restart                             重载秘书的 prompt 和 hook，对话保留，worker 不动
-aidecamp adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
+claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
+claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
+claudesec -d                    只在后台建好 session，不切换
+claudesec spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
+claudesec status | log NAME [-n N] | interrupt NAME | close NAME
+claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）
+claudesec archive NAME --summary S --tags a,b [--files x,y]
+claudesec archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
+claudesec lesson TYPE 情况 用户原话
+claudesec sessions              不归 claudesec 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
+claudesec shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）
+claudesec wake NAME [--model M] [<<< 新指令]     --resume 拉起，历史保留
+claudesec --restart                             重载秘书的 prompt 和 hook，对话保留，worker 不动
+claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
 
 接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。SESSION 可以是会话名、后台 job id，
@@ -420,15 +420,15 @@ aidecamp adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job i
 - 前台会话：对话就是它自己的 sessionId。
 - 后台会话（daemon 的 bg job，sessions/<pid>.json 里 kind=bg）：没有 pane。
 - 挂在后台 job 上的前台客户端（带 parkedJobId）：这个客户端自己的 sessionId 是空的，对话在它挂着的那个 job 里。
-  `aidecamp sessions` 把它和 job 合成一行显示，接管的是 job 的会话。
+  `claudesec sessions` 把它和 job 合成一行显示，接管的是 job 的会话。
 - 已退出的会话：没有活进程，只能按 session id（或 ≥8 位前缀）接管，要求在 projects/*/ 里唯一匹配。
   有活进程占着它、已经归某个 worker、或 transcript 里最后的 cwd 已经不存在，都拒绝。
-  在 aidecamp session 新开窗口，在那个 cwd 里 resume；默认 worker 名取目录名。
+  在 claudesec session 新开窗口，在那个 cwd 里 resume；默认 worker 名取目录名。
 
 流程：先确认 projects/*/<sid>.jsonl 存在，不存在就什么都不动直接退出 → 后台 job 用 `claude stop <jobId>` 停
 （直接 kill 会被 daemon 重启），等宿主进程退出 → 有 pane 的设 remain-on-exit 并 SIGTERM 旧前台进程；
-没有 pane 的（后台、已退出）在 aidecamp session 新开窗口 → 注册 worker → `respawn-pane` 在原 cwd 运行
-`claude --resume <sid>`，带上 aidecamp 的 hooks 和 worker 规则。命令末尾没有 shell，claude 一退出 pane 就死
+没有 pane 的（后台、已退出）在 claudesec session 新开窗口 → 注册 worker → `respawn-pane` 在原 cwd 运行
+`claude --resume <sid>`，带上 claudesec 的 hooks 和 worker 规则。命令末尾没有 shell，claude 一退出 pane 就死
 → 等 worker 的 SessionStart hook 回写的 session id **等于 <sid>** 才报 adopted 并取消 remain-on-exit。
 接着改名：peer 按 sessions/<pid>.json 里的 name 寻址，而 resume 时 transcript 里存的名字（后台 job 的自动名）
 会盖过 `-n`，所以在会话里打 `/rename <worker 名>`，等那个 name 变成 worker 名才打印 adopted；
@@ -448,7 +448,7 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   renamed-test（nameSource=user），之后的轮次不会被改回去。
 - 真机：adopt 一个已退出的 `claude -p` 临时会话（按 8 位前缀）→ 新窗口 resume 同一 session id → 历史在 → adopted。
 
-- 真机：`aidecamp -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
+- 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
 
 未验证（需要用户真用时观察）：

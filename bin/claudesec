@@ -162,6 +162,54 @@ def tmux(*args, check=True):
     return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check).stdout
 
 
+SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+OTHER_ESCAPE = re.compile(r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z]|[=>78])")
+
+
+def dim_runs(line):
+    """A captured line with SGR escapes as (text, dim) runs; other escapes dropped."""
+    runs, dim, pos = [], False, 0
+    for m in SGR.finditer(line):
+        runs.append((line[pos:m.start()], dim))
+        params = (m.group(1) or "0").split(";")
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if p in ("38", "48", "58"):  # extended colour: 5;n or 2;r;g;b, whose numbers aren't attributes
+                i += 2 if params[i + 1:i + 2] == ["5"] else 4 if params[i + 1:i + 2] == ["2"] else 0
+            elif p in ("", "0", "22"):
+                dim = False
+            elif p == "2":
+                dim = True
+            i += 1
+        pos = m.end()
+    runs.append((line[pos:], dim))
+    runs = [(OTHER_ESCAPE.sub("", t), d) for t, d in runs]
+    return [(t, d) for t, d in runs if t]
+
+
+def pane_text(target, suggestion="mark"):
+    """A pane's text. In the input box after ❯, Claude Code shows the prompt it suggests next (or
+    a placeholder) dimmed, which plain text can't tell from a draft the user typed and didn't
+    send. Dimmed text there is dropped; with suggestion="mark", a box holding only that shows it
+    as 「CC 建议」."""
+    out = []
+    for line in tmux("capture-pane", "-p", "-e", "-t", target, check=False).splitlines():
+        runs = dim_runs(line)
+        plain = "".join(t for t, _ in runs)
+        if plain.startswith("❯"):
+            (first, first_dim), *more = runs
+            rest = [(first[1:], first_dim), *more]  # the ❯ itself is styled either way
+            typed = "".join(t for t, d in rest if not d)
+            ghost = "".join(t for t, d in rest if d).strip()
+            if ghost and not typed.strip():
+                plain = f"❯ 【CC 建议，不是用户输入】{ghost}" if suggestion == "mark" else "❯"
+            else:
+                plain = "❯" + typed
+        out.append(plain)
+    return "\n".join(out)
+
+
 def alive_windows():
     out = tmux("list-windows", "-a", "-F", "#{window_id}", check=False)
     return set(out.split())
@@ -550,7 +598,7 @@ def stuck_on_dialog(name, target):
     """Catch dialogs that would stall a window nobody is looking at."""
     for _ in range(8):
         time.sleep(1)
-        pane = tmux("capture-pane", "-p", "-t", target, check=False)
+        pane = pane_text(target, suggestion="drop")
         if not pane and target not in alive_windows():
             sys.exit(f"worker {name}: {target} exited right away")
         if re.search(r"trust this folder|Do you trust|Enter to confirm|Do you want to", pane):
@@ -1070,7 +1118,7 @@ def confirm_resume(name, pane, d, sid):
     screen, dialog = "", 0
     for _ in range(60):
         time.sleep(1)
-        screen = tmux("capture-pane", "-p", "-t", pane, check=False)
+        screen = pane_text(pane, suggestion="drop")
         got = read_registry()[1].get(name, {}).get("session")
         if got == sid:
             return "ok", screen
@@ -1167,7 +1215,7 @@ def cmd_peek(args):
         sys.exit(f"{args.name} has no window (status {w['status']})")
     holder = live_holder(w.get("session"))
     print(f"{args.name}: {status_label(holder) if holder else 'no live claude'}")
-    lines = [l for l in tmux("capture-pane", "-p", "-t", w["window"]).splitlines() if l.strip()]
+    lines = [l for l in pane_text(w["window"]).splitlines() if l.strip()]
     print("\n".join(lines[-args.n:]))
 
 

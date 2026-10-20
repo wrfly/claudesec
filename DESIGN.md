@@ -404,7 +404,8 @@ claudesec --new                 秘书开新会话（session 已存在则原地�
 claudesec -d                    只在后台建好 session，不切换
 claudesec spawn NAME --dir D [--model M] [--discuss] <<< 任务原文
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
-claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）
+claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
+                                Claude Code 的建议或占位，标成「【CC 建议，不是用户输入】」，和用户没发出的草稿区分开
 claudesec archive NAME --summary S --tags a,b [--files x,y]
 claudesec archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
 claudesec lesson TYPE 情况 用户原话

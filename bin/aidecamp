@@ -38,17 +38,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-def state_home():
-    """Use the new state directory, while preserving existing cmux installations."""
-    explicit = os.environ.get("AIDECAMP_HOME") or os.environ.get("CMUX_HOME")
-    if explicit:
-        return Path(explicit)
-    current = Path.home() / ".aidecamp"
-    legacy = Path.home() / ".cmux"
-    return legacy if legacy.exists() and not current.exists() else current
-
-
-HOME = state_home()
+HOME = Path(os.environ.get("AIDECAMP_HOME", Path.home() / ".aidecamp"))
 SELF = Path(__file__).resolve()
 REPO = SELF.parent.parent
 PROMPTS = REPO / "prompts"

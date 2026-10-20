@@ -1,3 +1,0 @@
-#!/bin/sh
-printf '%s\n' 'cmux has been renamed to aidecamp; use `aidecamp`.' >&2
-exec "$(dirname "$0")/aidecamp" "$@"

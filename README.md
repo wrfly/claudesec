@@ -5,15 +5,6 @@ Your AI aide-de-camp for long-running work.
 终端里的 AI 机要副官。你只跟主窗口说话；它把活派给 subagent 或独立 tmux 窗口里的 worker，
 收汇报、做总结、只在需要你时打断你，并记住一切以便一个月后还能追溯。设计见 [DESIGN.md](DESIGN.md)。
 
-## 从 cmux 升级
-
-先退出正在运行的 cmux，再拉取新版本并重新执行 `./install.sh`。原来的 `cmux` 命令仍可作为兼容入口，
-但会提示改用 `aidecamp`。如果只有 `~/.cmux/`，Aidecamp 会继续使用其中的配置和历史；要换成新目录，退出后执行：
-
-    mv ~/.cmux ~/.aidecamp
-
-已有配置中的 `tmux_session: "cmux"` 会保留，避免丢掉原 session；想连 tmux session 一起改名，再把它改成 `"aidecamp"`。
-
 ## 安装（新机器从零）
 
 需要：tmux、python3（3.8+）、Claude Code（`claude` 在 PATH 上，已经登录过一次）。

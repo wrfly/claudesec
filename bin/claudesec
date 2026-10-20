@@ -376,7 +376,8 @@ def is_claudesec_run(pid):
 
 def shelve_all(run_pid):
     """The secretary is gone: put every worker away, keeping its session to resume later.
-    A busy one is left to finish its turn first; if the secretary is back by then, it stays."""
+    A busy one, or one waiting on its background tasks, is left to finish first; if the secretary
+    is back by then, it stays."""
     pending = None
     deadline = time.time() + 6 * 3600
     while time.time() < deadline:
@@ -393,7 +394,7 @@ def shelve_all(run_pid):
                     pending.discard(name)
                     continue
                 holder = live_holder(w.get("session"))
-                if holder and holder.get("status") == "busy":
+                if holder and session_status(holder)[0] in ("busy", "background"):
                     continue
                 err = quietly(cmd_shelve, name=name, note=None, as_name=None, force=False, by="exit")
                 print(f"{name}: {err or 'shelved'}", flush=True)
@@ -570,6 +571,82 @@ def claude_sessions():
     return out
 
 
+def background_tasks(conv):
+    """What a live session started in the background and has not heard back from: async
+    subagents, background commands, monitors. The session sits at its prompt, status idle,
+    while they run, and restarting it kills them. A background job's daemon keeps count; for
+    any other session they are read off the transcript: launched since this process started,
+    with no final task-notification and not stopped. A finished subagent that a SendMessage
+    woke runs again, until its next notification."""
+    if not conv.get("startedAt"):
+        return []  # no live process, nothing of its can be running
+    if conv.get("kind") == "bg":
+        with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+            state = json.loads((claude_dir() / "jobs" / conv["jobId"] / "state.json").read_text())
+            flight = state.get("inFlight") or {}
+            n = flight.get("tasks", 0) + flight.get("queued", 0)
+            labels = [f"{f.get('kind')}「{f.get('label')}」" for f in state.get("fan") or []][:n]
+            return labels + ["后台任务"] * (n - len(labels))
+
+    def stamp(e):
+        with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError):
+            return dt.datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+        return 0
+
+    started, running, described = conv["startedAt"] / 1000, {}, {}
+    path = transcript(conv.get("sessionId") or "")
+    for line in open(path, errors="replace") if path else []:
+        if not any(k in line for k in ('"isAsync":true', '"resumedAgentId"', '"backgroundTaskId"', '"timeoutMs"',
+                                        "<task-notification>", '"TaskStop"', '"KillShell"')):
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        content = e.get("content") if e.get("type") == "queue-operation" else (e.get("message") or {}).get("content")
+        if isinstance(content, str) and content.startswith("<task-notification>"):
+            m = re.search(r"<task-id>([^<]+)</task-id>", content)
+            # A monitor's events carry no status; only its expiry notice ends it.
+            if m and (re.search(r"<status>(?!running<)[^<]+</status>", content) or "<event>[Monitor " in content):
+                running.pop(m.group(1), None)
+            continue
+        if e.get("type") == "assistant":
+            for b in content if isinstance(content, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in ("TaskStop", "KillShell"):
+                    inp = b.get("input") or {}
+                    running.pop(inp.get("task_id") or inp.get("shell_id"), None)
+            continue
+        r = e.get("toolUseResult")
+        if not isinstance(r, dict):
+            continue
+        if r.get("isAsync") and r.get("agentId"):
+            described[r["agentId"]] = f"subagent「{r.get('description', '')}」"
+        if stamp(e) < started:
+            continue  # what an earlier process of this conversation started died with it
+        if r.get("isAsync") and r.get("agentId"):
+            running[r["agentId"]] = (described[r["agentId"]], None)
+        elif r.get("resumedAgentId"):
+            running[r["resumedAgentId"]] = (described.get(r["resumedAgentId"], "subagent"), None)
+        elif r.get("backgroundTaskId"):
+            running[r["backgroundTaskId"]] = ("后台命令", None)
+        elif r.get("taskId") and r.get("timeoutMs"):
+            running[r["taskId"]] = ("monitor", None if r.get("persistent") else stamp(e) + r["timeoutMs"] / 1000)
+    return [what for what, until in running.values() if until is None or until > time.time()]
+
+
+def session_status(conv):
+    """A live session's status and its background tasks. Idle at the prompt with background
+    tasks still running is "background": as unsafe to restart as busy."""
+    status = conv.get("status", "?")
+    tasks = background_tasks(conv) if status == "idle" else []
+    return ("background" if tasks else status), tasks
+
+
+def status_label(conv):
+    status, tasks = session_status(conv)
+    return f"后台任务×{len(tasks)}" if tasks else status
+
+
 def external_sessions():
     """Conversations claudesec could adopt. A foreground client parked on a background job (the
     daemon's `bg` host) is folded into that job: the conversation lives in the job, the
@@ -608,7 +685,7 @@ def session_rows(sessions):
     rows = [("会话", "类型", "状态", "tmux", "目录")]
     for s in sessions:
         conv = s.get("bg") or s
-        rows.append((s.get("name", "?"), session_kind(s), conv.get("status", "?"),
+        rows.append((s.get("name", "?"), session_kind(s), status_label(conv),
                      s.get("tmux") or "（不在 tmux）", Path(conv.get("cwd", "")).name))
     return rows
 
@@ -718,7 +795,7 @@ def cmd_adopt(args):
         while True:
             s = find() or sys.exit(f"{args.session} exited before it could be adopted")
             conv = s.get("bg") or s
-            if conv.get("status") == "idle":
+            if session_status(conv)[0] == "idle":
                 idle_since = idle_since or time.time()
                 # Idle flickers between turns; only a quiet stretch means it has really stopped.
                 if time.time() - idle_since >= 30:
@@ -728,9 +805,15 @@ def cmd_adopt(args):
             if time.time() > deadline:
                 sys.exit(f"gave up: {args.session} was not idle for 12h")
             time.sleep(5)
-    elif conv.get("status") != "idle":
-        sys.exit(f"{args.session} is {conv.get('status')}. Only idle sessions are adopted: ask the user "
-                 f"to stop it, or run `claudesec adopt {args.session} --wait` in the background")
+    else:
+        status, tasks = session_status(conv)
+        if tasks:
+            sys.exit(f"{args.session} is at its prompt, but its background tasks are still running "
+                     f"({', '.join(tasks)}); adopting restarts it and kills them. Wait for them: run "
+                     f"`claudesec adopt {args.session} --wait` in the background")
+        if status != "idle":
+            sys.exit(f"{args.session} is {status}. Only idle sessions are adopted: ask the user "
+                     f"to stop it, or run `claudesec adopt {args.session} --wait` in the background")
 
     sid, cwd = conv["sessionId"], conv["cwd"]
     # Nothing is stopped until we know the conversation is on disk: a client attached to a
@@ -841,6 +924,15 @@ def live_holder(sid):
     return next((s for s in claude_sessions() if sid and s.get("sessionId") == sid), None)
 
 
+def refuse_if_working(name, conv):
+    status, tasks = session_status(conv)
+    if status == "busy":
+        sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+    if tasks:
+        sys.exit(f"{name} is at its prompt, but its background tasks are still running ({', '.join(tasks)}); "
+                 f"shelving would kill them. Wait for them, or pass --force")
+
+
 def cmd_shelve(args):
     workers = read_registry()[1]
     if args.name in workers:
@@ -851,8 +943,8 @@ def cmd_shelve(args):
         if not sid or not transcript(sid):
             sys.exit(f"{name}: no transcript recorded for it, so it could not be woken later. Not shelved.")
         holder = live_holder(sid)
-        if holder and holder.get("status") == "busy" and not args.force:
-            sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+        if holder and not args.force:
+            refuse_if_working(name, holder)
         if holder:
             stop_foreground(holder)
         if w.get("window"):
@@ -862,8 +954,8 @@ def cmd_shelve(args):
         s = find_external(args.name) or exited_session(args.name) or sys.exit(
             f"no worker, unmanaged live session or exited session id {args.name!r}; see `claudesec status`")
         conv = s.get("bg") or s
-        if conv.get("status") == "busy" and not args.force:
-            sys.exit(f"{args.name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+        if not args.force:
+            refuse_if_working(args.name, conv)
         sid, cwd = conv["sessionId"], conv["cwd"]
         if not transcript(sid):
             sys.exit(f"{args.name}: no transcript for session {sid}; nothing could be woken later. Nothing was touched.")
@@ -1059,7 +1151,7 @@ def cmd_peek(args):
     if w.get("window") not in alive_windows():
         sys.exit(f"{args.name} has no window (status {w['status']})")
     holder = live_holder(w.get("session"))
-    print(f"{args.name}: {holder.get('status', '?') if holder else 'no live claude'}")
+    print(f"{args.name}: {status_label(holder) if holder else 'no live claude'}")
     lines = [l for l in tmux("capture-pane", "-p", "-t", w["window"]).splitlines() if l.strip()]
     print("\n".join(lines[-args.n:]))
 

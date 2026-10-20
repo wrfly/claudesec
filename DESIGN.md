@@ -415,7 +415,11 @@ claudesec --restart                             重载秘书的 prompt 和 hook�
 claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
 
-接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。SESSION 可以是会话名、后台 job id，
+接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。停在提示符、但自己开的后台任务还在跑的会话
+（sessions/<pid>.json 照样写 idle）不算空闲，`sessions`/`status` 显示「后台任务×N」，adopt 和 shelve 都拒绝，
+`--wait` 等到它们结束：后台 job 读 daemon 的 jobs/<jobId>/state.json 里的 inFlight；其他会话从 transcript 里数
+本进程启动后发起的异步 subagent（含被 SendMessage 叫醒、重新跑起来的已完成 subagent）、后台 Bash、Monitor，减去收到终态 task-notification（completed/failed/killed、
+Monitor 到期）或被 TaskStop 的，非 persistent 的 Monitor 过了 timeoutMs 也算结束。SESSION 可以是会话名、后台 job id，
 或 session id（至少 8 位前缀）。对话可能在三种地方：
 - 前台会话：对话就是它自己的 sessionId。
 - 后台会话（daemon 的 bg job，sessions/<pid>.json 里 kind=bg）：没有 pane。

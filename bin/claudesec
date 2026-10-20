@@ -1081,8 +1081,16 @@ def external_sessions():
     client's own sessionId is empty. The job's session is under s["bg"]."""
     cfg = config()
     _, workers = read_registry()
-    names = {cfg["secretary_name"], *workers}
     ids = {w.get("session") for w in workers.values()}
+    with contextlib.suppress(OSError):
+        ids.add((HOME / "secretary.session").read_text().strip())
+    ids -= {None, ""}
+    # Not by name: Claude Code names a resumed session on its own (agentlodge-da) before
+    # /rename puts the worker's name back, and a stranger may share a worker's name. A worker
+    # being woken is in the registry with its window but no session id yet.
+    windows = {w.get("window") for w in workers.values()} - {None}
+    panes = set(tmux("list-panes", "-s", "-t", f"={cfg['tmux_session']}:", "-F", "#{pane_id}",
+                     check=False).split())
     live = claude_sessions()
     jobs = {s["jobId"]: s for s in live if s.get("kind") == "bg" and s.get("jobId")}
     out = []
@@ -1095,8 +1103,11 @@ def external_sessions():
         if s.get("kind") not in ("interactive", "bg"):
             continue
         conv = s.get("bg") or s
-        if s.get("name") in names or conv.get("sessionId") in ids:
+        if conv.get("sessionId") in ids or s.get("sessionId") in ids:
             continue
+        at = re.match(r"^[^:]*:(@\d+)\.(%\d+)$", s.get("tmux") or "")
+        if at and (at[1] in windows or at[2] in panes):
+            continue  # in claudesec's own tmux session, or a worker's window
         out.append(s)
     return sorted(out, key=lambda s: s.get("startedAt", 0))
 

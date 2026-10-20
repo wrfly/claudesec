@@ -431,6 +431,12 @@ claudesec --restart                             重载秘书的 prompt 和 hook�
 claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
 
+什么算「不归 claudesec 管」：**不看会话名**，看身份和位置。session id 是秘书的（secretary.session）或某个 worker 的，
+不算；pane 在 claudesec 自己的 tmux session 里，或者窗口是某个 worker 的（正在 spawn、wake 的 worker 在注册表里
+已经有窗口、还没有 session id），也不算。名字靠不住：Claude Code 恢复会话时会先给它起个自动名（如
+`agentlodge-da`），过一会儿 `/rename` 才改回 worker 名；外人的会话也可能恰好和某个 worker 同名。
+回归测试：`python3 -m unittest discover -s tests`。
+
 接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。停在提示符、但自己开的后台任务还在跑的会话
 （sessions/<pid>.json 照样写 idle）不算空闲，`sessions`/`status` 显示「后台任务×N」，adopt 和 shelve 都拒绝，
 `--wait` 等到它们结束：后台 job 读 daemon 的 jobs/<jobId>/state.json 里的 inFlight；其他会话从 transcript 里数

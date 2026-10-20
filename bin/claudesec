@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import functools
 import json
 import os
 import re
@@ -278,7 +279,7 @@ def cmd_run(args):
     }, indent=2) + "\n")
     argv = ["claude", "-n", cfg["secretary_name"],
             "--settings", str(settings),
-            "--append-system-prompt-file", str(PROMPTS / "secretary.md"),
+            "--append-system-prompt-file", str(PROMPTS / "secretary.md"), *fresh_prompt(),
             "--allowedTools", "Bash(claudesec *)"]
     if cfg["secretary_model"]:
         argv += ["--model", cfg["secretary_model"]]
@@ -522,12 +523,26 @@ def prepare_worker(name, cfg, initial, fresh_log=True):
     return d
 
 
+@functools.lru_cache(maxsize=None)
+def fresh_prompt():
+    """Claude Code records a conversation's system prompt on its first request and replays it on
+    every resume, ignoring the --append-system-prompt-file of a later launch. So an adopted
+    session would never see the worker rules, and a resumed worker or secretary would keep
+    rules since edited. Turn the record off, where this Claude Code has it."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(["claude", "--help"], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=30).stdout
+        if "--system-prompt-snapshot" in out:
+            return ["--system-prompt-snapshot", "off"]
+    return []
+
+
 def worker_command(name, d, cfg, model, *extra, prompt=True):
     return " ".join(shlex.quote(a) for a in [
         "claude", "-n", name, "--model", model,
         "--permission-mode", cfg["worker_permission_mode"],
         "--settings", str(d / "settings.json"),
-        "--append-system-prompt-file", str(d / "prompt.md"), *extra,
+        "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(), *extra,
     ]) + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if prompt else "")
 
 

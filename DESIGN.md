@@ -429,6 +429,10 @@ Monitor 到期）或被 TaskStop 的，非 persistent 的 Monitor 过了 timeout
   有活进程占着它、已经归某个 worker、或 transcript 里最后的 cwd 已经不存在，都拒绝。
   在 claudesec session 新开窗口，在那个 cwd 里 resume；默认 worker 名取目录名。
 
+秘书和 worker 的 claude 都带 `--system-prompt-snapshot off`。Claude Code 默认在会话第一次请求时录下系统提示，之后每次 resume 原样重发，
+后来传的 `--append-system-prompt-file` 不生效：接管来的会话看不到 worker 规则，`--restart` 和 wake 也拿不到改过的规则。
+旧版 claude 没有这个选项，就不加。
+
 流程：先确认 projects/*/<sid>.jsonl 存在，不存在就什么都不动直接退出 → 后台 job 用 `claude stop <jobId>` 停
 （直接 kill 会被 daemon 重启），等宿主进程退出 → 有 pane 的设 remain-on-exit 并 SIGTERM 旧前台进程；
 没有 pane 的（后台、已退出）在 claudesec session 新开窗口 → 注册 worker → `respawn-pane` 在原 cwd 运行

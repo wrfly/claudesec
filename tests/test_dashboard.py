@@ -7,13 +7,16 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from test_external_sessions import load
+from test_external_sessions import BIN, load
 
 QUEUE = """# 决策队列
 
@@ -185,7 +188,34 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.queue("add", "[b] 问过了", asked=True), "#2")
         self.assertEqual(self.queue("add", "[c] 第二件"), "#3")
         text = (self.home / "queue.md").read_text()
-        self.assertIn("## 待问（按优先级）\n\n- #1 [a] 第一件\n- #3 [c] 第二件\n\n## 已问未答\n\n- #2 [b] 问过了\n\n## 已处理", text)
+        today = dt.date.today().isoformat()
+        self.assertIn("## 待问（按优先级）\n\n- #1 [a] 第一件\n- #3 [c] 第二件\n\n## 已问未答\n\n"
+                      f"- #2 [b] {today} 已问：问过了\n\n## 已处理", text)
+
+    def test_add_asked_dates_it_once(self):
+        today = dt.date.today().isoformat()
+        self.queue("add", "没有 tag（中）", asked=True)
+        self.queue("add", "[b] 2026-10-01 已问：早就问了", asked=True)
+        items = self.cs.queue_items((self.home / "queue.md").read_text())
+        self.assertEqual([(tag, body, note) for _, _, tag, body, note in items],
+                         [(None, "没有 tag（中）", today), ("b", "早就问了", "2026-10-01")])
+
+    def test_add_takes_asked_before_or_after_the_text(self):
+        for argv in (["queue", "add", "--asked", "[w] x（中）"], ["queue", "add", "[w]", "x（中）", "--asked"]):
+            out = subprocess.run([sys.executable, str(BIN), *argv], capture_output=True, text=True,
+                                 env=dict(os.environ, CLAUDESEC_HOME=str(self.home)))
+            self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.numbers(), [("asked", 1), ("asked", 2)])
+
+    def test_an_asked_item_without_a_date_doesnt_break_the_pane(self):
+        # written by hand, or by an older `queue add --asked`: the （中） is taken for the note
+        (self.home / "queue.md").write_text(QUEUE.replace("- #9 [projmerge] {asked} 已问：", "- #9 [projmerge] ")
+                                            .replace("A/B/C。", "A/B/C。（中）"))
+        title, blocks = self.cs.queue_blocks(40)
+        full = [plain(l) for l in self.cs.unfold(blocks, {k for k, *_ in blocks if k})[0]]
+        self.assertTrue(any(l.endswith("A/B/C。（中）") for l in full), full)
+        (self.home / "queue.md").write_text(QUEUE.replace("{asked}", "2026-13-45"))  # not a date at all
+        self.cs.queue_blocks(40)
 
     def test_empty_queue(self):
         title, blocks = self.cs.queue_blocks(40)

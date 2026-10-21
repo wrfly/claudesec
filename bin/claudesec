@@ -540,8 +540,11 @@ def queue_blocks(cols):
             blocks.append(fixed([(DIM, "  （无）")]))
         for section, num, tag, text, note in group:
             if section == "asked":  # the number dim once asked; before that colored by priority
-                days = (dt.date.today() - dt.date.fromisoformat(note)).days if note else None
-                color, tail = DIM, "" if days is None else \
+                try:  # an item written without its date has its priority here, or nothing
+                    days = (dt.date.today() - dt.date.fromisoformat(note)).days
+                except (TypeError, ValueError):
+                    days = None
+                color, tail = DIM, (f"（{note}）" if note else "") if days is None else \
                     "（今天问的）" if days < 1 else "（昨天问的）" if days == 1 else f"（{days} 天前问的）"
             else:
                 color, tail = PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
@@ -803,6 +806,10 @@ def cmd_queue(args):
         if not text:
             sys.exit("queue add: what is the question?")
         want = "已问未答" if args.asked else "待问"
+        if args.asked and not re.search(r"\d{4}-\d{2}-\d{2}\s*已问", text):  # the panel shows how long ago
+            tag = re.match(r"\[[^\]]+\]\s*", text)
+            at_tag = tag.end() if tag else 0
+            text = f"{text[:at_tag]}{dt.date.today().isoformat()} 已问：{text[at_tag:]}"
         heads = [i for i, line in enumerate(lines) if line.startswith("## ")]
         at = next((i for i in heads if want in lines[i]), None)
         if at is None:
@@ -2891,8 +2898,10 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
-    s = sub.add_parser("queue"); s.add_argument("action", choices=["add", "number"])
-    s.add_argument("words", nargs="*"); s.add_argument("--asked", action="store_true"); s.set_defaults(fn=cmd_queue)
+    s = sub.add_parser("queue"); s.set_defaults(fn=cmd_queue)
+    queue = s.add_subparsers(dest="action", required=True)  # so --asked goes before or after the text
+    s = queue.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--asked", action="store_true")
+    s = queue.add_parser("number"); s.set_defaults(words=[], asked=False)
     s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
     s.add_argument("what", nargs="?", choices=["queue", "status"]); s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)

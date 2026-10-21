@@ -1,13 +1,17 @@
-"""The queue and progress panes beside the secretary: layout, line breaking, scrolling.
+"""The queue and progress panes beside the secretary (layout, line breaking, scrolling) and
+the decision queue's item numbers.
 
     python3 -m unittest discover -s tests
 """
+import contextlib
 import datetime as dt
+import io
 import json
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from test_external_sessions import load
 
@@ -15,18 +19,19 @@ QUEUE = """# 决策队列
 
 ## 待问（按优先级）
 
-0d. [web] landing-private 提交开 PR？A 现在提交（推荐）/B 等闲鱼链接一起。（中）
+- #12 [web] landing-private 提交开 PR？A 现在提交（推荐）/B 等闲鱼链接一起。（中）
 1. [web] 上游「Claude Max (local)」(id local-check-claude)，默认组和 test 组各分 50%，要不要删？（低，可选）
-5b. [sshpw] PermitRootLogin 现为 yes，要不要改？（高）
-6. [telegram] 接 Telegram，用户说以后再聊。
+- #3 [sshpw] PermitRootLogin 现为 yes，要不要改？（高）
+0d. [telegram] 接 Telegram，用户说以后再聊。
 
 ## 已问未答
 
-- [projmerge] {asked} 已问：接管原生 claude 到什么程度：A/B/C。
+- #9 [projmerge] {asked} 已问：接管原生 claude 到什么程度：A/B/C。
 
 ## 已处理
 
-- [old] 早就定了。
+- #14 [old] 早就定了。
+- [older] 更早，没编号。
 """
 
 
@@ -116,11 +121,12 @@ class Dashboard(unittest.TestCase):
     def test_queue_items_with_any_numbering(self):
         self.write_queue()
         items = self.cs.queue_items((self.home / "queue.md").read_text())
-        self.assertEqual([(s, tag) for s, tag, _, _ in items],
-                         [("ask", "web"), ("ask", "web"), ("ask", "sshpw"), ("ask", "telegram"),
-                          ("asked", "projmerge")])
+        self.assertEqual([(s, n, tag) for s, n, tag, _, _ in items],
+                         [("ask", 12, "web"), ("ask", None, "web"), ("ask", 3, "sshpw"),
+                          ("ask", None, "telegram"), ("asked", 9, "projmerge")])
         self.assertEqual([note for *_, note in items][:4], ["中", "低，可选", "高", None])
-        self.assertTrue(items[0][2].endswith("等闲鱼链接一起。"))
+        self.assertTrue(items[0][3].startswith("landing-private"))
+        self.assertTrue(items[0][3].endswith("等闲鱼链接一起。"))
 
     def test_queue_pane_folded_and_unfolded(self):
         self.write_queue()
@@ -129,18 +135,57 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.cs.width(plain(title)), 40)
         body, keys = self.cs.unfold(blocks, set())
         text = [plain(l) for l in body]
-        self.assertEqual(len([l for l in text if l and l[0] in "▪▫"]), 5)
+        items = [l for l in body if l and re.fullmatch(r" *(\d+|·)", l[0][1])]
+        self.assertEqual([l[0][1] for l in items], ["12", " ·", " 3", " ·", " 9"])  # numbers line up
         self.assertEqual(len(text), 5 + 3)  # one line an item, two headings, a blank line between
         self.assertTrue(all(self.cs.width(l) <= 40 for l in text), text)
         self.assertFalse([l for l in text if "早就定了" in l])
-        self.assertEqual([l[0][0] for l in body if l and l[0][1] in "▪▫"],
-                         [self.cs.YELLOW, self.cs.DIM, self.cs.RED, "", self.cs.DIM])
+        Y, R, D, B = self.cs.YELLOW, self.cs.RED, self.cs.DIM, self.cs.BOLD
+        self.assertEqual([l[0][0] for l in items], [f"{B};{Y}", f"{B};{D}", f"{B};{R}", B, f"{B};{D}"])
         every = {k for k in keys if k}
         full = [plain(l) for l in self.cs.unfold(blocks, every)[0]]
         self.assertGreater(len(full), len(text))
         self.assertTrue(all(self.cs.width(l) <= 40 for l in full), full)
         self.assertTrue(any(l.endswith("（2 天前问的）") for l in full), full)
         self.assertTrue(any(l.endswith("（低，可选）") for l in full), full)
+
+    # ---- item numbers
+
+    def queue(self, action, *words, asked=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cs.cmd_queue(SimpleNamespace(action=action, words=list(words), asked=asked))
+        return out.getvalue().strip()
+
+    def numbers(self):
+        return [(s, n) for s, n, *_ in self.cs.queue_items((self.home / "queue.md").read_text())]
+
+    def test_number_gives_open_items_one_past_any_in_the_file(self):
+        self.write_queue()
+        out = self.queue("number")
+        self.assertEqual([l.split()[1] for l in out.splitlines()], ["#15", "#16"])
+        self.assertEqual(self.numbers(), [("ask", 12), ("ask", 15), ("ask", 3), ("ask", 16), ("asked", 9)])
+        text = (self.home / "queue.md").read_text()
+        self.assertIn("- #16 [telegram] 接 Telegram", text)
+        self.assertIn("- [older] 更早，没编号。", text)  # 已处理 is left as it is
+        self.assertEqual(self.queue("number"), "every open item has a number")
+        self.assertEqual((self.home / "queue.md").read_text(), text)
+
+    def test_add_never_hands_out_a_number_twice(self):
+        self.write_queue()
+        self.assertEqual(self.queue("add", "[web]", "再问一件（低）"), "#15")
+        self.assertEqual(self.numbers()[-2:], [("ask", 15), ("asked", 9)])  # end of 待问
+        # the item is dealt with and 已处理 cleared out: its number still isn't reused
+        path = self.home / "queue.md"
+        path.write_text(path.read_text().split("## 已处理")[0].replace("- #15 [web] 再问一件（低）\n", ""))
+        self.assertEqual(self.queue("add", "下一件"), "#16")
+
+    def test_add_to_a_new_queue(self):
+        self.assertEqual(self.queue("add", "[a] 第一件"), "#1")
+        self.assertEqual(self.queue("add", "[b] 问过了", asked=True), "#2")
+        self.assertEqual(self.queue("add", "[c] 第二件"), "#3")
+        text = (self.home / "queue.md").read_text()
+        self.assertIn("## 待问（按优先级）\n\n- #1 [a] 第一件\n- #3 [c] 第二件\n\n## 已问未答\n\n- #2 [b] 问过了\n\n## 已处理", text)
 
     def test_empty_queue(self):
         title, blocks = self.cs.queue_blocks(40)

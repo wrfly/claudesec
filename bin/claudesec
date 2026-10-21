@@ -12,6 +12,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
   claudesec remind WHEN TARGET TEXT [--every 1d]   wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO)
                                     with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
+  claudesec queue add [--asked] TEXT     a decision queue item with the next number (printed: #N)
+  claudesec queue number                 number the open queue items written without one
   claudesec dashboard on|off              queue and progress panes beside the secretary (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
@@ -474,18 +476,24 @@ def ago(stamp, now=None):
 PRIORITY = {"高": RED, "中": YELLOW, "低": DIM}
 
 
+# A queue.md item: "- #12 [web] question（中）". The number is the item's for good (the user
+# answers by it); older files numbered items "1." or "0d." with no "#".
+QUEUE_ITEM = re.compile(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(?:#(\d+)\s+)?(\S.*)")
+
+
 def queue_items(text):
-    """The undecided items of queue.md: (section, tag, body, note), section "ask" (待问) or
-    "asked" (已问未答), note the trailing （中，…） or the date it was asked."""
+    """The undecided items of queue.md: (section, number, tag, body, note), section "ask"
+    (待问) or "asked" (已问未答), number None when it has none, note the trailing （中，…） or
+    the date it was asked."""
     items, section = [], None
     for line in text.splitlines():
         if line.startswith("## "):
             section = "ask" if "待问" in line else "asked" if "已问未答" in line else None
             continue
-        m = re.match(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(\S.*)", line)
+        m = QUEUE_ITEM.match(line)
         if not section or not m:
             continue
-        body = m[1].strip()
+        num, body = m[1] and int(m[1]), m[2].strip()
         tag = re.match(r"\[([^\]]+)\]\s*", body)
         if tag:
             tag, body = tag[1], body[tag.end():]
@@ -498,7 +506,7 @@ def queue_items(text):
                 note, body = note[1], body[:note.start()]
             else:
                 note = None
-        items.append((section, tag, body, note))
+        items.append((section, num, tag, body, note))
     return items
 
 
@@ -524,23 +532,24 @@ def queue_blocks(cols):
     title = bar(" 决策队列", f"待问 {len(ask)}  已问未答 {len(asked)} ", cols)
     if not items:
         return title, [fixed([(DIM, "没有要你定的事。")])]
-    blocks = []
+    blocks, num_w = [], max(len(str(i[1] or "·")) for i in items)
     for label, group in (("待问", ask), ("已问未答", asked)):
         blocks += [fixed([])] if blocks else []
         blocks.append(fixed(heading(f"{label} {len(group)}", cols)))
         if not group:
             blocks.append(fixed([(DIM, "  （无）")]))
-        for section, tag, text, note in group:
-            if section == "asked":  # ▫ asked, waiting for the answer; ▪ to ask, colored by priority
+        for section, num, tag, text, note in group:
+            if section == "asked":  # the number dim once asked; before that colored by priority
                 days = (dt.date.today() - dt.date.fromisoformat(note)).days if note else None
-                mark, color, tail = "▫", DIM, "" if days is None else \
+                color, tail = DIM, "" if days is None else \
                     "（今天问的）" if days < 1 else "（昨天问的）" if days == 1 else f"（{days} 天前问的）"
             else:
-                mark, color, tail = "▪", PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
-            head = [(color, mark), ("", " ")] + ([(CYAN + ";" + BOLD, tag), ("", " ")] if tag else [])
-            lines = wrap(head[2:] + [("", text), (DIM, tail)], cols - 2)
-            full = [head[:2] + lines[0]] + [[("", "  ")] + line for line in lines[1:]]
-            blocks.append(foldable(("q", tag, text), full, fit(head + [("", text)], cols)))
+                color, tail = PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
+            head = [(BOLD + ";" + color if color else BOLD, str(num or "·").rjust(num_w)), ("", " ")]
+            name = [(CYAN, tag), ("", " ")] if tag else []
+            lines = wrap(name + [("", text), (DIM, tail)], cols - num_w - 1)
+            full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
+            blocks.append(foldable(("q", num, tag, text), full, fit(head + name + [("", text)], cols)))
     return title, blocks
 
 
@@ -753,6 +762,8 @@ QUEUE = """# 决策队列
 
 秘书维护。worker 的 NEED_DECISION、要用户定的 TODO 先进这里，按重要程度排序，一次只问用户一件。
 问了还没回答的放「已问未答」；秘书自己能处理的直接处理，移到「已处理」。
+每条一行 `- #编号 [worker] 问题（高|中|低）`。编号用 `claudesec queue add` 拿，跟着条目走，不改、不复用；
+用户看着面板用编号回答。
 
 ## 待问（按优先级）
 
@@ -767,6 +778,55 @@ def secretary_prompt():
     path = HOME / "secretary-prompt.md"
     path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()))
     return path
+
+
+def take_queue_number(text):
+    """The next queue item number: past every one in queue.md and every one handed out before,
+    so a number cleared out of 已处理 isn't handed out again."""
+    last = HOME / "queue.last"
+    seen = [int(m[1]) for m in map(QUEUE_ITEM.match, text.splitlines()) if m and m[1]]
+    with contextlib.suppress(OSError, ValueError):
+        seen.append(int(last.read_text()))
+    n = max(seen, default=0) + 1
+    last.write_text(f"{n}\n")
+    return n
+
+
+def cmd_queue(args):
+    """`queue add`: an item at the end of 待问 (--asked: 已问未答) with the next number, which it
+    prints. `queue number`: a number for each open item written without one."""
+    path = HOME / "queue.md"
+    HOME.mkdir(parents=True, exist_ok=True)
+    lines = (path.read_text() if path.exists() else QUEUE).splitlines()
+    if args.action == "add":
+        text = " ".join(args.words).strip()
+        if not text:
+            sys.exit("queue add: what is the question?")
+        want = "已问未答" if args.asked else "待问"
+        heads = [i for i, line in enumerate(lines) if line.startswith("## ")]
+        at = next((i for i in heads if want in lines[i]), None)
+        if at is None:
+            sys.exit(f"{path} has no 「{want}」 section")
+        end = next((i for i in heads if i > at), len(lines))
+        while end > at + 1 and not lines[end - 1].strip():
+            end -= 1
+        n = take_queue_number("\n".join(lines))
+        lines[end:end] = ([""] if end == at + 1 else []) + [f"- #{n} {text}"]
+        print(f"#{n}")
+    else:
+        section, done = False, []
+        for i, line in enumerate(lines):
+            if line.startswith("## "):
+                section = "待问" in line or "已问未答" in line
+                continue
+            m = QUEUE_ITEM.match(line)
+            if section and m and not m[1]:
+                lines[i] = f"- #{take_queue_number(chr(10).join(lines))} {m[2].strip()}"
+                done.append(lines[i])
+        print("\n".join(done) or "every open item has a number")
+    tmp = path.with_name(".queue.md.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
 
 
 def cmd_run(args):
@@ -2565,7 +2625,7 @@ def hook_secretary_session_start():
             out += ["", f"lessons.md 里有 {n} 条教训待复盘。"]
     queue = HOME / "queue.md"
     if queue.exists():
-        todo = [l for l in open_part(queue).splitlines() if re.match(r"(\d+\.|-) ", l)]
+        todo = [l for l in open_part(queue).splitlines() if QUEUE_ITEM.match(l)]
         if todo:
             out += ["", f"决策队列 {queue} 里还有 {len(todo)} 件没定（一次只问用户一件）：", *todo]
     print("\n".join(out)[:9500])
@@ -2795,6 +2855,8 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("queue"); s.add_argument("action", choices=["add", "number"])
+    s.add_argument("words", nargs="*"); s.add_argument("--asked", action="store_true"); s.set_defaults(fn=cmd_queue)
     s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
     s.add_argument("what", nargs="?", choices=["queue", "status"]); s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)

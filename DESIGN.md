@@ -481,8 +481,11 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   打断的那一轮也报 error，所以 interrupt 先写标记，30 秒内的非 completed 结束都当作打断。
 - shelve / wake：会话在 `~/.cursor/chats/*/<chatId>` 就算还在；wake 用 `agent --resume <chatId>`，
   因为不触发 sessionStart，确认方式是 agent 画出界面并且活过 5 秒。没有 adopt。
-- 本机 Grok 4.7 / Auto（MAX）每轮都以「Server error」结束，stop 拿到 status=error；
-  默认模型因此是 `cursor_worker_model: "gemini-4-argon-high"`。
+- 传输：agent 默认用 HTTP/2 连 agentn.us.api5.cursor.sh，本机（疑似 CorpLink 网关）会卡在「Connection stalled」，
+  所以 `~/.cursor/cli-config.json` 要开 `network.useHttp1ForAgent`。不要改用 CURSOR_CONFIG_DIR：那样读不到
+  `~/.cursor/hooks.json`，hook 全部失效。
+- 模型：HTTP/1 下 Grok 4.7 仍每轮以「Server error」结束（交互、-p 都复现），stop 拿到 status=error；Auto 落到 Grok 4.7
+  时也一样。默认 `cursor_worker_model: "gemini-4-argon-high"`，它在本账号可用的模型里 CursorBench 4.0 分最高。
 
 已验证（真机，Cursor agent 2026.10.19-6bbf2c4，临时 CLAUDESEC_HOME）：spawn → PROGRESS、DONE 经告警送达、注册表更新；
 send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，闲时 shelve → wake 带指令 → 同一个会话 id

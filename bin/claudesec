@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
     "secretary_model": None,          # None = whatever claude defaults to
     "worker_model": "claude-opus-5-5",
     "worker_permission_mode": "auto",
-    "cursor_worker_model": "gemini-4-argon-high",  # Grok 4.7 / Auto turns end in "Server error" here
+    "cursor_worker_model": "gemini-4-argon-high",  # best CursorBench 4.0 score this account can use
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}

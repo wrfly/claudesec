@@ -107,7 +107,10 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - `claudesec interrupt` 对它发的是 Ctrl+C。它卡在 shell 命令上时不一定停得下来，peek 看一眼。
 - 没有「等你批权限」和后台任务检测；一轮以错误结束时 status 显示「API 出错」，用 send 让它继续。
 - shelve / wake / close / peek / status 和 Claude Code worker 用法一样；不能 adopt 外面的 Cursor 会话。
-- Grok 4.7 和 Auto 在这台机器上每轮都以「Server error」结束，`--model` 别选它们。
+- Cursor 要走 HTTP/1：`~/.cursor/cli-config.json` 里 `"network": {"useHttp1ForAgent": true}`（已开）。
+  关掉的话 agent 用 HTTP/2 连 agentn.us.api5.cursor.sh，任何模型都会卡在「Connection stalled」。
+- HTTP/1 下 Grok 4.7 仍然每轮以「Server error」结束（交互和 -p 都复现，2026-10-21），`--model` 别选它。
+  Auto 每次路由到的模型不一定，落到 Grok 4.7 时同样出错，也别用。
 
 ## 接管不归你管的会话
 

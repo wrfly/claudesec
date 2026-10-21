@@ -402,7 +402,7 @@ worker 干活（可开 subagent，结果不外泄）
 claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
-claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] <<< 任务原文
+claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] [--for WORKER] <<< 任务原文
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
 claudesec remind WHEN TARGET 内容   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
@@ -462,6 +462,21 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 - 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
+
+### worker 把小活委托给 Cursor（TYPE: DELEGATE）
+
+用户定了「独立、小任务尽量派 cursor 做」。原先 worker 不知道有这条路，Cursor 的结果也要秘书手动转回去。现在：
+- worker 规则（worker.md「把小活交给 Cursor」）写了够格的标准，以及 DELEGATE 汇报的字段：NAME、DIR、TASK（自包含任务书）。
+  worker 不自己 spawn，秘书要看得见、管得住所有 worker。DELEGATE 算终结类型，交出去后可以直接结束本轮等结果。
+- 秘书 `spawn --agent cursor --for <委托人>`，注册表记 `delegated_by`，status 的摘要前标「[为 X]」。
+- Cursor worker 的 `claudesec report` 告警里写明委托人，以及「除 PROGRESS 外用 SendMessage(to: X) 原样转」。
+  转发由秘书做，claudesec 不往委托人窗口里粘：Claude Code worker 的窗口可能正开着确认框（粘进去的回车会答掉它），
+  也可能用户正在里面打字；而且用户定过的原则是秘书居中。秘书的成本是每份汇报一次 SendMessage。
+- 委托人回答 Cursor worker 的问题，也用 DELEGATE，NAME 写已有的 Cursor worker 名，秘书 send 过去。
+
+已验证（临时 CLAUDESEC_HOME）：DELEGATE 汇报记为终结状态、写 reported 标记、摘要取 TASK；`--for` 不存在的 worker 被拒；
+`--for boss` 开的 Cursor worker 真跑一轮，PROGRESS 和 DONE 的告警都带「委托人 boss」，status 显示「[为 boss]」。
+未验证：Claude Code worker 拿到新规则后，会不会在合适的时候主动发 DELEGATE（要真用时观察）。
 
 ### 定时提醒（`claudesec remind`）
 

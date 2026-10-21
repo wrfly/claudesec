@@ -10,7 +10,7 @@
 每行 `KEY: 值`，值可以多行：
 
 ```
-TYPE: PROGRESS | BLOCKED | NEED_DECISION | DONE | FAILED
+TYPE: PROGRESS | BLOCKED | NEED_DECISION | DONE | FAILED | DELEGATE
 DID: 一两句，做了什么
 RESULT: 改了哪些文件 / 结论 / 测试结果            （DONE 必填）
 ISSUE: 遇到的问题                                 （BLOCKED、FAILED 必填）
@@ -20,13 +20,15 @@ DECISIONS: 你自己做的取舍，每条「选了 X 而非 Y，因为 Z」 （D
 TODO: 还需要有人去做的事，一行一件，能直接派出去的粒度   （可选；讨论模式的 DONE 必填，可写「无」）
 ```
 
+DELEGATE 的字段另见下面「把小活交给 Cursor」。
+
 时机：
 - 动手前发一条 PROGRESS，NEXT 里写计划。秘书可能据此拦你。
 - 每完成一个有意义的阶段发一条 PROGRESS。别刷屏：几分钟一条足够。
 - 阻塞或需要用户拍板时**立刻**发 BLOCKED / NEED_DECISION，然后停下等回复。
   能自己判断的小事别问，记进 DECISIONS。
 - 结束时发 DONE 或 FAILED。
-- **每一轮结束前，最后一条汇报必须是 DONE / FAILED / BLOCKED / NEED_DECISION 之一**，
+- **每一轮结束前，最后一条汇报必须是 DONE / FAILED / BLOCKED / NEED_DECISION / DELEGATE 之一**，
   否则 Stop hook 会把你打回来。收到秘书的追加指令、做完后同样要再发一条。
   例外：你在等自己的后台 subagent / 后台命令时，直接结束本轮，什么都不用发，
   它们完成时你会被唤醒，到那时再汇报。**不要为了过 hook 发假的 BLOCKED。**
@@ -50,6 +52,32 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。�
   - TODO：要落地的事，一行一件，写到别人不看讨论也能接手的程度
   发完 hook 会把用户切回秘书窗口。你在窗口里只说一句「已交给秘书」，不要再展开。
 - 之后用户如果又切回来接着聊，就继续讨论，结束时再发一条 DONE。
+
+## 把小活交给 Cursor
+
+用户定了：独立的小活尽量交给 Cursor worker 做，比你自己开 subagent 优先。够格的要同时满足：
+- 一轮能做完，结果说得清（一个数、一张表、一个小 diff、一个结论）；
+- 不需要你手上的上下文，任务书写清楚就够；
+- 只读调研，或者范围明确的小改动，而且不碰你正在改的文件；
+- 不涉及 push / merge / 部署 / 凭据 / 对外发消息这类动作。
+要你持续判断、要跟你来回讨论、或者做错了代价大的，自己做。
+
+交法：给秘书发一条 DELEGATE 汇报，**不要自己 spawn**（秘书要看得见、管得住所有 worker）：
+
+```
+TYPE: DELEGATE
+NAME: 建议的 worker 名（短、小写，如 count-alerts）；写已有的 Cursor worker 名 = 给它追加一句
+DIR: 它在哪个目录干活（绝对路径）
+TASK: 自包含的任务书，多行。写清：要做什么、输入在哪、产出放哪、做完算什么、哪些不许做。
+      对方看不到你的对话，也不知道项目背景；路径写绝对路径，命令写全。
+DID: 一句，为什么交出去（可选）
+```
+
+DELEGATE 可以作为一轮的结尾：交出去之后手上没别的可做，就直接结束本轮等结果。
+秘书会回你一句派给了谁；Cursor worker 的汇报（DONE / FAILED / BLOCKED / NEED_DECISION）会由秘书原样转给你，
+以「Cursor worker X 的汇报（你委托的）」开头。它问你问题（NEED_DECISION）时，你能答就用 DELEGATE、NAME 写它，
+TASK 写答复；要用户拍板的，照常发你自己的 NEED_DECISION。结果拿到后，核对一遍再用进你的活里，
+你的汇报里写明哪部分是 Cursor 做的。
 
 ## 干活
 

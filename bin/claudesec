@@ -5,9 +5,10 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec [start] [--new|--restart] [-d]   open the secretary in its own tmux session "claudesec"
                                     (resumes the last secretary; --new starts fresh; --restart reloads
                                     prompt and hooks keeping the conversation; -d don't switch)
-  claudesec spawn NAME --dir DIR [--model M] [--discuss] [--agent claude|cursor] < task.txt
+  claudesec spawn NAME --dir DIR [--model M] [--discuss] [--agent claude|cursor] [--for WORKER] < task.txt
                                     (--discuss: a discussion window the user is switched into;
-                                    --agent cursor: Cursor's `agent` CLI instead of Claude Code)
+                                    --agent cursor: Cursor's `agent` CLI instead of Claude Code;
+                                    --for: the worker that delegated it, named in its reports)
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
   claudesec remind WHEN TARGET TEXT     wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO) with TEXT
                                     for TARGET (a worker or `secretary`); --list [--all], --cancel ID
@@ -70,7 +71,9 @@ DEFAULT_CONFIG = {
     "cursor_worker_model": "gemini-4-argon-high",  # best CursorBench 4.0 score this account can use
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
 }
-TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
+# DELEGATE: a worker handing a small self-contained job to the secretary for a Cursor worker; it may
+# end its turn there, waiting for the result.
+TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION", "DELEGATE"}
 CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
 LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}
@@ -517,6 +520,8 @@ def cmd_spawn(args):
     if not task:
         sys.exit("empty task: pass the user's words on stdin")
     project = str(Path(args.dir).expanduser().resolve())
+    if args.for_worker and args.for_worker not in workers:
+        sys.exit(f"--for {args.for_worker}: no such worker")
     cursor = args.agent == "cursor"
     model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
     if cursor:
@@ -536,6 +541,7 @@ def cmd_spawn(args):
     with registry() as reg:
         reg["workers"][name] = {
             "window": window, "dir": project, "model": model, "task": task, "agent": args.agent,
+            "delegated_by": args.for_worker,
             "mode": "discuss" if args.discuss else "task",
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
@@ -1312,6 +1318,8 @@ def print_workers(focus, workers):
             age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.1f}h"
         summary = (w.get("pending_ask") if w["status"] in LABELS else
                    w.get("last_summary") or w["task"]).replace("\n", " ")
+        if w.get("delegated_by"):
+            summary = f"[为 {w['delegated_by']}] {summary}"
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
                      status, age, summary[:48], "← 是" if w["status"] in WAITING else ""))
     print_rows(rows)
@@ -1630,7 +1638,8 @@ def record_report(name, text):
         if w is not None:
             w["status"] = typ
             w["last_report_at"] = now()
-            w["last_summary"] = (r.get("DID") or text).splitlines()[0][:200]
+            w["last_summary"] = (r.get("DID") or (typ == "DELEGATE" and "委托：" + r.get("TASK", "")) or text
+                                 ).splitlines()[0][:200]
             w["pending_ask"] = r.get("ASK") if typ == "NEED_DECISION" else None
         if typ in TERMINAL:
             reg["focus"] = name
@@ -1650,8 +1659,10 @@ def cmd_report(args):
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
     record_report(args.name, text)
+    boss = read_registry()[1][args.name].get("delegated_by")
+    via = (f"（委托人 {boss}：除 PROGRESS 外，用 SendMessage(to: \"{boss}\") 把下面原文转给它）" if boss else "")
     if secretary_alive():
-        raise_alert(f"{CURSOR_REPORT}「{args.name}」：\n{text}")
+        raise_alert(f"{CURSOR_REPORT}「{args.name}」{via}：\n{text}")
         print(f"reported to {config()['secretary_name']}")
     else:
         print("recorded; the secretary is not running and will see it in `claudesec log`")
@@ -1778,7 +1789,7 @@ def hook_worker_stop(name):
     sec = config()["secretary_name"]
     print(json.dumps({"decision": "block", "reason":
         f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
-        "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
+        "DONE / FAILED / BLOCKED / NEED_DECISION / DELEGATE 之一（PROGRESS 不算）。"
         "若用户刚在你的窗口直接跟你说过话，汇报里注明。"}, ensure_ascii=False))
 
 
@@ -1993,7 +2004,8 @@ def main():
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir", required=True)
     s.add_argument("--model"); s.add_argument("--discuss", action="store_true")
-    s.add_argument("--agent", choices=["claude", "cursor"], default="claude"); s.set_defaults(fn=cmd_spawn)
+    s.add_argument("--agent", choices=["claude", "cursor"], default="claude")
+    s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)
     s.set_defaults(fn=cmd_log)

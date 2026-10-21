@@ -63,6 +63,11 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 - PROGRESS：**什么都不说**，直接结束这一轮。除非用户说过「X 的一切都告诉我」。
 - DONE / FAILED / BLOCKED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。纯告知的可以几条合成一条。
 - NEED_DECISION，以及 TODO 里要用户定的：进决策队列（下一节），不当场全抛给用户。
+- DELEGATE：worker 把一件独立小活交给 Cursor（规则在它那边）。NAME 是已有的 Cursor worker → `claudesec send NAME`，
+  TASK 原文；否则 `claudesec spawn <NAME> --dir <DIR> --agent cursor --for <委托它的 worker> <<'EOF'` + TASK 原文 + `EOF`
+  （NAME 被占了就换一个）。然后 SendMessage 回委托人一句「已派 Cursor worker NAME」，给用户一行收据
+  `[dc-route] 委托 cursor count-alerts：数 13 条规则的触发次数`。任务书越界的（push、部署、动凭据、对外发消息）别派，
+  打回给委托人自己处理或进决策队列。
 - 讨论窗口（你用 `--discuss` 开的）发来 DONE 时，hook 已经把用户切回你的窗口。这时不用一行格式，给一段总结：
   结论（RESULT）、关键取舍（DECISIONS 里用户拍板的那些）、待办（TODO 原样编号列出），最后问「要派哪些出去？」。
   用户点了哪些，就逐件按派活规则派（各自选 subagent 或 worker，收据照给）。讨论窗口不关，用户可能还会切回去接着聊。
@@ -117,6 +122,11 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 `spawn --agent cursor` 开的 worker 跑的是 Cursor 的 `agent` CLI，不是 Claude Code，有几处不一样：
 - **它的汇报不是跨会话消息**，而是一条告警，以「（不是告警）Cursor worker 的汇报」开头，后面是汇报原文。
   按上面「收到 worker 汇报」处理（PROGRESS 不说话、DONE 告诉用户……），不要当告警。注册表和日志已经记好了。
+- 它是 `--for X` 开的（某个 worker 委托的），告警里会写「委托人 X」。这时：PROGRESS 不说话；DONE / FAILED / BLOCKED /
+  NEED_DECISION 用 `SendMessage(to: X)` 原样转给 X，开头一行「Cursor worker 名字 的汇报（你委托的）：」。
+  DONE 不另外告诉用户（X 自己的汇报会带上），FAILED / BLOCKED 告诉用户一行；NEED_DECISION 先交给 X 答，
+  X 答不了才进决策队列。X 的答复以 DELEGATE、NAME=它 的形式回来，照上面 send 过去。
+  DONE 之后照常归档、close 这个 Cursor worker。
 - **给它说话不能用 SendMessage**（它不是会话，发不到）：`claudesec send <名字> <<'EOF'` + 原话 + `EOF`。
   它在忙时也能发，会排队到这一轮结束后执行。「用户决策：」的转发同样走 send。
 - `claudesec interrupt` 对它发的是 Ctrl+C。它卡在 shell 命令上时不一定停得下来，peek 看一眼。

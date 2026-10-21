@@ -53,6 +53,8 @@ claudesec 的 pane 显示 `(not saved: @resurrect-skip)`。
     claudesec -d               # 只在后台起好，不切过去
     claudesec dashboard off    # 关掉秘书右侧的队列 / 进展面板（on 打开）
 
+队列面板上每条有个编号，直接回秘书「12 A」「15 不用了」就是在答那一条。
+
 然后就在 secretary 窗口里说话。worker 会以同一个 session 里的 window 出现，名字就是任务名；
 想看就切过去，不想看就不用管。原来的 tmux session 不受影响，随时切回去。
 

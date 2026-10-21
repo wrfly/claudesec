@@ -843,6 +843,7 @@ def cmd_run(args):
     settings.write_text(json.dumps({
         # The user talks to the secretary in their own words; no Tab-completion guesses.
         "promptSuggestionEnabled": False,
+        **memory_settings(HOME),
         "hooks": {
             "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
                              {"hooks": [watch]}],
@@ -1053,7 +1054,8 @@ def cmd_spawn(args):
     else:
         initial = getattr(args, "intro", None) or "秘书派给你的任务（用户原话）：\n\n"
         initial += f"{task}\n"
-    d = prepare_worker(name, cfg, initial, agent=args.agent)
+    memory = getattr(args, "memory", None)
+    d = prepare_worker(name, cfg, initial, project, agent=args.agent, memory=memory)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project,
@@ -1062,7 +1064,7 @@ def cmd_spawn(args):
     with registry() as reg:
         reg["workers"][name] = {
             "window": window, "dir": project, "model": model, "task": task, "agent": args.agent,
-            "delegated_by": args.for_worker,
+            "delegated_by": args.for_worker, "memory": memory,
             "mode": "discuss" if args.discuss else "task",
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
@@ -1078,8 +1080,9 @@ def cmd_spawn(args):
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
+def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memory=None):
     """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir.
+    memory: another auto memory dir than cwd's (the review worker tidies the secretary's).
     A Cursor worker's hooks are global, in ~/.cursor/hooks.json (see install_cursor_hooks)."""
     # A reused name starts a fresh log; the old one stays next to it.
     if fresh_log and log_path(name).exists():
@@ -1103,7 +1106,8 @@ def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
     # Any tool event after a prompt means it was answered; the test keeps the common case cheap.
     answered = [{"matcher": "*", "hooks": [{"type": "command", "command":
                  f"[ ! -e {shlex.quote(str(d / 'waiting-permission'))} ] || {cmd} hook worker-permission-done {q}"}]}]
-    (d / "settings.json").write_text(json.dumps({"hooks": {
+    own = {"autoMemoryDirectory": memory} if memory else memory_settings(cwd)
+    (d / "settings.json").write_text(json.dumps({**own, "hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-session-start {q}"}]}],
         "PermissionRequest": [{"matcher": "*", "hooks": [asking]}],
         "Notification": [{"matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
@@ -1570,7 +1574,7 @@ def cmd_adopt(args):
     label = s.get("name") or conv.get("jobId") or sid[:8]
     name = worker_name_for(s, conv, args.as_name)
     model = args.model or cfg["worker_model"]
-    d = prepare_worker(name, cfg, ADOPT_PROMPT)
+    d = prepare_worker(name, cfg, ADOPT_PROMPT, cwd)
     (d / "exit").unlink(missing_ok=True)
     # No trailing shell: when claude exits the pane dies, and remain-on-exit keeps it (with the
     # error on screen) until resume is confirmed.
@@ -1755,7 +1759,8 @@ def cmd_wake(args):
     initial = WAKE_PROMPT + (f"\n秘书转来用户的新指令（原话），照做并按规则汇报：\n\n{instruction}\n"
                              if instruction else "\n" + WAKE_REPORT)
     model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
-    d = prepare_worker(name, cfg, initial, fresh_log=False, agent=w.get("agent", "claude"))
+    d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=w.get("agent", "claude"),
+                       memory=w.get("memory"))
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
     cmd = ((cursor_command(name, model, "--resume", sid, d=None if quiet else d) if cursor else
@@ -2210,12 +2215,40 @@ def secretary_memory_dir():
     return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HOME)) / "memory"
 
 
+def memory_settings(cwd):
+    """Settings so a session started in cwd reads and writes its own auto memory without asking.
+    Claude Code asks nothing for that dir, unless its path resolves through a symlink into a
+    protected place: with ~/.agentlodge/claude/projects a link to ~/.claude/projects, the
+    exemption goes by the path asked for and the protection by where it lands, and allow rules
+    don't count for protected paths. So name the resolved dir as the memory dir: the same files,
+    no link on the way. Untouched (no setting) where no link is involved or the dir can't be
+    worked out the way Claude Code does it: by the git repository's main checkout (worktrees
+    and subdirectories share one), else by cwd."""
+    root = Path(cwd).resolve()
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            common = Path(out.stdout.strip()).resolve()
+            if common.name != ".git":  # a submodule, a bare repo
+                return {}
+            root = common.parent
+    name = re.sub(r"[^A-Za-z0-9]", "-", str(root))
+    if len(name) > 200:  # Claude Code shortens it with a hash of its own
+        return {}
+    d = claude_dir() / "projects" / name / "memory"
+    return {"autoMemoryDirectory": str(d.resolve())} if d.resolve() != d else {}
+
+
 def cmd_review(args):
     """A fresh worker each day: the review needs none of yesterday's context, and a long-lived
     one would carry every past review along."""
     date = dt.date.today().isoformat()
     brief = (PROMPTS / "review.md").read_text()
-    for key, value in {"DATE": date, "MEMORY": secretary_memory_dir(), "LESSONS": HOME / "lessons.md",
+    # Resolved: through a symlink every write would ask (see memory_settings). The worker gets it
+    # as its own auto memory dir, where Write and Edit don't ask either.
+    memory = secretary_memory_dir().resolve()
+    for key, value in {"DATE": date, "MEMORY": memory, "LESSONS": HOME / "lessons.md",
                        "REPO": REPO, "QUEUE": HOME / "queue.md", "INDEX": HOME / "history" / "INDEX.md",
                        "REVIEWS": HOME / "reviews"}.items():
         brief = brief.replace("{{" + key + "}}", str(value))
@@ -2223,6 +2256,8 @@ def cmd_review(args):
         print(brief)
         return
     (HOME / "reviews").mkdir(parents=True, exist_ok=True)
+    if memory.is_dir():  # the backup the brief points to, made here so the worker needs no Bash for it
+        shutil.copytree(memory, HOME / "reviews" / f"{date}-memory-before", dirs_exist_ok=True)
     name = f"review-{date[5:7]}{date[8:]}"
     w = read_registry()[1].get(name)
     if w and w["status"] != "SHELVED" and w.get("window") in alive_windows():
@@ -2230,7 +2265,8 @@ def cmd_review(args):
     if w:
         quietly(cmd_close, name=name)
     cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=None, discuss=False, agent="claude",
-                                 for_worker=None, task=brief, intro="claudesec 每日例行派给你的任务：\n\n"))
+                                 for_worker=None, task=brief, intro="claudesec 每日例行派给你的任务：\n\n",
+                                 memory=str(memory)))
 
 
 # ---------- hooks ----------

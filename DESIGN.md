@@ -172,14 +172,14 @@ tmux pane id，`SendMessage` 可互发。
   config.json                秘书名、秘书模型、worker 默认模型、worker 权限模式
   registry.json              注册表（3.3），hook 写，加文件锁
   reports/<worker>.log       双向全部消息：task / worker→secretary / secretary→worker
-  workers/<name>/            每个 worker 的 prompt.md、task.md、settings.json（hooks）
+  workers/<name>/            每个 worker 的 prompt.md、task.md、settings.json（hooks、autoMemoryDirectory）
   history/                   3.5
   lessons.md                 3.6
   queue.md                   决策队列：要用户定的事按重要程度排队，秘书一次只问一件（首次启动时建）。
                              每条 `- #编号 [worker] 问题（中）`；编号由 `claudesec queue add` 给，跟着条目走
   queue.last                 最后发出去的队列编号：「已处理」清掉了也不会再发同一个号
   secretary.session          秘书 session id，`claudesec` 据此 --resume
-  secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）
+  secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）；autoMemoryDirectory
 ```
 
 hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 settings.json**：
@@ -195,6 +195,16 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | worker | PostToolUse / PostToolUseFailure / PermissionDenied（全部工具）、Stop、汇报 | 有标记才进 python：清标记，状态恢复 |
 | worker | StopFailure（这一轮死在 API 错误上，如代理的 524） | 状态 API_ERROR（显示「API 出错」）、记 log、写告警叫醒秘书，秘书让它从中断处继续；下一轮正常结束时状态恢复（讨论窗口不告警） |
 | 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
+
+**memory 不弹框**：Claude Code 本来就不为会话自己的 auto memory 目录弹确认框，例外是这个路径经符号链接落到受保护的地方。
+这台机器上 `~/.agentlodge/claude/projects` 链到 `~/.claude/projects`：豁免按请求的路径算，保护按解析后的路径算（`~/.claude` 下），
+于是每次写 memory 都被当成敏感文件。allow 规则救不了：受保护路径不认 allow 规则。所以 settings 里写
+`autoMemoryDirectory` = 解析后的真实目录，同一批文件，路上不经过链接。只在确实有链接时写；算不准的情况不写，照 Claude Code
+默认走：裸仓库、submodule，以及目录名超过 200 字符（Claude Code 会加哈希缩短）。目录按 git 主 checkout 定，worktree 和子目录
+共用一个；不在 git 里就按 cwd。
+验证（`claude -p`，haiku，临时目录）：经链接的路径，default 和 auto 两种模式写入都被拒，加了 allow 规则也一样被拒；
+设成解析后的目录，不加任何规则，default、auto 两种模式写、default 模式读都直接通过。worktree 和子目录在 init 事件里
+报出的 memory 路径都是主仓库的。worker 改 memory 用 Write / Edit（worker.md）；Bash 的 `rm`、`cat >` 照样会问。
 
 **生命周期**：秘书窗口里跑的是 `claudesec run`，它不 exec claude，而是把它当子进程包一层。
 - 启动时：后台 `claudesec lifecycle wake-all`。被秘书退出收起的 worker（`shelved_by: exit`），以及进程已经没了的
@@ -337,7 +347,8 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
   跨会话消息、后台任务通知、claudesec 告警不算用户的消息。用户说「复盘」时随时跑。
 - 每天开一个新 worker（`review-MMDD`，在 claudesec 仓库目录），不 wake 长期的 `claudesec` worker：
   复盘用不到昨天的上下文，长期 worker 会把每天的复盘都背在上下文里。
-- 记忆（经验层）直接整理落盘，落盘前把目录拷到 `~/.claudesec/reviews/<日期>-memory-before/`。
+- 记忆（经验层）直接整理落盘。`claudesec review` 派 worker 前自己把目录拷到 `~/.claudesec/reviews/<日期>-memory-before/`，
+  并把秘书的 memory 目录设成这个 worker 的 auto memory 目录（`autoMemoryDirectory`），改记忆不弹框（见下「memory 不弹框」）。
 - 宪法层只出 diff：分支 `review/<日期>` 不 push，`git diff origin/main` 存到 `~/.claudesec/reviews/<日期>.diff`，
   NEED_DECISION 一行一处改动，进秘书的决策队列；用户决定后 worker 自己 rebase、push，把教训移到「已处理」。
 

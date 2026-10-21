@@ -12,7 +12,8 @@
   相关的互相补上 `[[name]]` 链接；`MEMORY.md` 每条记忆一行 `- [标题](文件) — 一句话`，删掉指向不存在文件的行。
 - 每条记忆保持一个事实；feedback / project 类要有 **Why:** 和 **How to apply:**。
 - 已经写进提示词、而且下面第二步不会删的规则，memory 里可以只留一行指向它，不用重复全文。
-- 动之前先把整个目录拷一份到 `{{REVIEWS}}/{{DATE}}-memory-before/`，出了错能还原。
+- 派你之前 claudesec 已经把整个目录备份到 `{{REVIEWS}}/{{DATE}}-memory-before/`，出了错从那里还原。
+- 这个目录就是你这次的 auto memory 目录：用 Read / Write / Edit 改不弹确认框。整条删掉只能 `rm`，会问一次，攒到最后一起删。
 
 ## 二、提示词 diff（只提，不落到 main）
 

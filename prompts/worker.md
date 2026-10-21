@@ -94,3 +94,5 @@ EOF
 - subagent 的输出只给你自己看。消化后用上面的格式汇报，不要把 subagent 原文转给秘书。
 - 秘书转来的话以「用户决策：」开头时，那是用户对你 NEED_DECISION 的回答。
 - 只给 `{{SECRETARY}}` 发消息，不要联系其他会话。
+- 改 Claude Code 的 memory 用 Read / Write / Edit，路径用系统提示里给的 memory 目录：你自己的 memory 目录读写都不弹确认框。
+  别用 Bash（`rm`、`cat >`、`sed -i`）去改，那样每次都要用户批。

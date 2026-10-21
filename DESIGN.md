@@ -404,6 +404,7 @@ claudesec --new                 秘书开新会话（session 已存在则原地�
 claudesec -d                    只在后台建好 session，不切换
 claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] <<< 任务原文
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
+claudesec remind WHEN TARGET 内容   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
 claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
@@ -461,6 +462,28 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 - 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
+
+### 定时提醒（`claudesec remind`）
+
+秘书原先拿后台 Bash 的 sleep 当定时器，秘书重启、compact 就丢，status 里也看不到。现在：
+- 存储：`~/.claudesec/reminders.json`（加锁读写，同 registry）。每条有 id（r1、r2…）、到点时间（带时区的 ISO）、
+  对象（worker 名或 secretary）、原文、状态（pending / fired / cancelled）、投递结果。
+  已发和已取消的只留最近 30 条。
+- 检查：`claudesec run` 起 `lifecycle reminders`，每 15 秒一次，只要它那个 run 还是 run.pid 里的那个就一直跑；
+  秘书重启后新的检查进程等旧的交出锁再接手。到点的先标 fired 再投递，所以最多投一次。
+  秘书没在跑（包括整机重启）时不检查：提醒还在文件里，下次启动时补发，并注明迟到多久。没有用 launchd：
+  投递的去处是秘书或 worker，它们都要 claudesec 在跑才有意义。
+- 投递：一律写告警叫醒秘书（「[提醒 rN]」开头），由秘书路由，不直接找 worker。用户定的：「肯定是先找你呀，
+  你维护的脚本，你是我的秘书」。也因为秘书能 SendMessage 给在跑的 Claude Code worker，claudesec 自己不能；
+  转不转、告不告诉用户（「别打扰我」）也是秘书的判断。曾做过直投 worker 的 --direct（搁置的 wake、Cursor 用 send），
+  按用户这句去掉了。
+- 跟决策队列不打通：queue.md 是秘书手写、按重要程度排的 markdown，提醒要的是机器能读的时间；
+  合在一起，秘书得手改结构化数据、检查进程得解析 markdown。用户也认为决策队列用 md 就够。
+  没有时间点的待办照旧进 queue.md 或直接派出去。
+
+已验证（临时 CLAUDESEC_HOME）：13 种时间写法的换算、3 种坏输入报错；登记、过去时间被拒；--list / --cancel；
+到点出告警；run 换代后旧检查进程退出、新的接手；改成 22 分钟前到点的提醒补发时带「迟到 22 分钟」；
+status 列出未到点的提醒。
 
 ### Cursor worker（`spawn --agent cursor`）
 

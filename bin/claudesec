@@ -9,6 +9,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     (--discuss: a discussion window the user is switched into;
                                     --agent cursor: Cursor's `agent` CLI instead of Claude Code)
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
+  claudesec remind WHEN TARGET TEXT     wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO) with TEXT
+                                    for TARGET (a worker or `secretary`); --list [--all], --cancel ID
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
   claudesec status                       one-screen table of workers
   claudesec log NAME [-n N]              last N report entries of a worker
@@ -344,6 +346,7 @@ def cmd_run(args):
     os.chdir(HOME)
     (HOME / "run.pid").write_text(str(os.getpid()))  # a newer one tells an older shelve-all to stop
     detach("wake-all")
+    detach("reminders")
     # Not exec: the workers are put away after the secretary exits. That is done here, by claudesec,
     # so the user has no chores and no tool call of the secretary's can be refused.
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C belongs to claude
@@ -395,6 +398,8 @@ def cmd_lifecycle(args):
     print(f"=== {now()} {args.job} (claudesec run {args.run_pid})", flush=True)
     if args.job == "shelve-all":
         shelve_all(args.run_pid)
+    elif args.job == "reminders":
+        check_reminders(args.run_pid)
     else:
         wake_all(args.run_pid)
     print(f"=== {now()} {args.job} done", flush=True)
@@ -1283,6 +1288,7 @@ def cmd_status(args):
             rows.append((n, Path(w["dir"]).name, (w.get("shelved_at") or "")[:16].replace("T", " "),
                          (w.get("shelf_summary") or w.get("last_summary") or "").replace("\n", " ")[:60]))
         print_rows(rows)
+    print_reminders()
     sessions = external_sessions()
     if sessions:
         print(f"\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：")
@@ -1437,6 +1443,163 @@ def cmd_lesson(args):
     pending, mark, done = text.partition("\n## 已处理")  # new ones go above the reviewed ones
     path.write_text(pending.rstrip("\n") + "\n" + entry + (mark and "\n" + mark.lstrip("\n") + done))
     print("noted")
+
+
+# ---------- reminders: things to do at a given time ----------
+# reminders.json under HOME, so they outlive the secretary's context, a restart and a reboot. A
+# checker started by `claudesec run` fires them; one that came due while no secretary was
+# running fires late, saying how late, when the next one starts. A due reminder always goes to
+# the secretary, never straight to a worker: the user's call, routing is the secretary's job.
+
+REMINDER_CHECK_SECS = 15
+REMINDERS_KEPT = 30  # fired or cancelled ones kept for `remind --list --all`
+
+
+@contextlib.contextmanager
+def reminders():
+    """Locked read-modify-write of reminders.json, like registry()."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    with open(HOME / "reminders.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = HOME / "reminders.json"
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data.setdefault("next_id", 1)
+        data.setdefault("items", [])
+        yield data
+        done = [r for r in data["items"] if r["status"] != "pending"]
+        drop = {id(r) for r in done[:-REMINDERS_KEPT]} if len(done) > REMINDERS_KEPT else set()
+        data["items"] = [r for r in data["items"] if id(r) not in drop]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        tmp.replace(path)
+
+
+def read_reminders():
+    path = HOME / "reminders.json"
+    return json.loads(path.read_text()).get("items", []) if path.exists() else []
+
+
+def parse_when(when, at=None):
+    """+30m / +2h / +1d / +90s; HH:MM (the next one); MM-DD HH:MM; YYYY-MM-DD HH:MM; full ISO.
+    A trailing Z means UTC, otherwise local time. Returns an aware datetime."""
+    at = at or dt.datetime.now().astimezone()
+    w = when.strip()
+    m = re.fullmatch(r"\+(\d+)([smhd])", w)
+    if m:
+        unit = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}[m.group(2)]
+        return at + dt.timedelta(**{unit: int(m.group(1))})
+    tz = dt.timezone.utc if w.endswith(("Z", "z")) else at.tzinfo
+    w = w.rstrip("Zz")
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", w)
+    if m:
+        base = at.astimezone(tz)
+        t = base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return t if t > base else t + dt.timedelta(days=1)
+    m = re.fullmatch(r"(?:(\d{4})-)?(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})", w)
+    if m:
+        year = int(m.group(1)) if m.group(1) else at.astimezone(tz).year
+        return dt.datetime(year, int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), tzinfo=tz)
+    try:
+        t = dt.datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"can't read {when!r} as a time: use +30m, 09:05Z, 17:05, '10-21 09:05Z' or ISO 8601")
+    return t if t.tzinfo else t.replace(tzinfo=at.tzinfo)
+
+
+def show_time(iso):
+    t = dt.datetime.fromisoformat(iso)
+    return f"{t.astimezone():%m-%d %H:%M}（{t.astimezone(dt.timezone.utc):%H:%MZ}）"
+
+
+def cmd_remind(args):
+    if args.cancel:
+        with reminders() as data:
+            r = next((r for r in data["items"] if r["id"] == args.cancel and r["status"] == "pending"), None)
+            if r is None:
+                sys.exit(f"no pending reminder {args.cancel}; see `claudesec remind --list`")
+            r.update(status="cancelled", done_at=now())
+        print(f"cancelled {r['id']}: {r['text']}")
+        return
+    if args.list or not args.words:
+        items = read_reminders() if args.all else [r for r in read_reminders() if r["status"] == "pending"]
+        if not items:
+            print("没有提醒。" if args.all else "没有未到点的提醒。")
+            return
+        rows = [("id", "时间", "给", "状态", "内容")]
+        for r in sorted(items, key=lambda r: r["due"]):
+            rows.append((r["id"], show_time(r["due"]), r["target"],
+                         {"pending": "未到点", "fired": "已发", "cancelled": "已取消"}[r["status"]], r["text"][:60]))
+        print_rows(rows)
+        return
+    if len(args.words) < 3:
+        sys.exit("usage: claudesec remind WHEN TARGET TEXT...   (TARGET: a worker name, or `secretary`)")
+    when, target, text = args.words[0], args.words[1], " ".join(args.words[2:]).strip()
+    try:
+        due = parse_when(when)
+    except ValueError as e:
+        sys.exit(str(e))
+    if due < dt.datetime.now().astimezone() - dt.timedelta(seconds=30):
+        sys.exit(f"{when!r} is {show_time(due.isoformat())}, already past")
+    workers = read_registry()[1]
+    with reminders() as data:
+        rid = f"r{data['next_id']}"
+        data["next_id"] += 1
+        data["items"].append({"id": rid, "due": due.isoformat(timespec="seconds"), "target": target, "text": text,
+                              "status": "pending", "created_at": now()})
+    note = "" if target in workers or target == "secretary" else f"（注意：{target} 现在不是 worker）"
+    print(f"{rid}: {show_time(due.isoformat())} 叫醒秘书，给 {target}：{text}{note}")
+
+
+def deliver_reminder(r):
+    """Wake the secretary with a due reminder, through the alert channel."""
+    due = dt.datetime.fromisoformat(r["due"])
+    late = (dt.datetime.now().astimezone() - due).total_seconds()
+    late_note = f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）" if late > 3 * REMINDER_CHECK_SECS + 60 else ""
+    raise_alert(f"[提醒 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}")
+    if r["target"] in read_registry()[1]:
+        append_log(r["target"], "reminder", r["text"])
+    return "secretary alerted"
+
+
+def fire_due_reminders():
+    """Each due reminder is marked fired before it is handed on: at most once, even if two
+    checkers overlap or delivery dies halfway."""
+    cutoff = dt.datetime.now().astimezone()
+    with reminders() as data:
+        due = [r for r in data["items"] if r["status"] == "pending" and dt.datetime.fromisoformat(r["due"]) <= cutoff]
+        for r in due:
+            r.update(status="fired", done_at=now())
+    for r in due:
+        try:
+            how = deliver_reminder(r)
+        except Exception as e:  # keep checking the others; tell the secretary this one went wrong
+            how = f"failed: {e}"
+            raise_alert(f"[提醒 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}")
+        with reminders() as data:
+            for x in data["items"]:
+                if x["id"] == r["id"]:
+                    x["result"] = how
+        print(f"{now()} {r['id']} → {r['target']}: {how}", flush=True)
+
+
+def check_reminders(run_pid):
+    """Runs alongside the secretary, for as long as its `claudesec run` is the current one.
+    The lock hands over from an older checker whose secretary is gone."""
+    with open(HOME / "reminders-checker.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        while current_run() == run_pid:
+            fire_due_reminders()
+            time.sleep(REMINDER_CHECK_SECS)
+
+
+def print_reminders():
+    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
+    if pending:
+        print("\n提醒（未到点；claudesec remind --cancel ID 取消）：")
+        rows = [("id", "时间", "给", "内容")]
+        for r in pending:
+            rows.append((r["id"], show_time(r["due"]), r["target"], r["text"][:60]))
+        print_rows(rows)
 
 
 # ---------- hooks ----------
@@ -1845,9 +2008,12 @@ def main():
     s.add_argument("--as", dest="as_name"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_shelve)
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
+    s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
+    s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
+    s.add_argument("--cancel"); s.set_defaults(fn=cmd_remind)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
-    s = sub.add_parser("lifecycle"); s.add_argument("job", choices=["shelve-all", "wake-all"])
+    s = sub.add_parser("lifecycle"); s.add_argument("job", choices=["shelve-all", "wake-all", "reminders"])
     s.add_argument("run_pid", type=int, nargs="?"); s.set_defaults(fn=cmd_lifecycle)
     s = sub.add_parser("archive"); s.add_argument("name"); s.add_argument("--summary")
     s.add_argument("--tags"); s.add_argument("--files"); s.add_argument("--subagent", action="store_true")

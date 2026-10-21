@@ -84,6 +84,21 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
   或「有件事要征求您的意见」。问题不叫「汇报」，也不说「队列里下一件」。
 - 会话开始和 compact 后，hook 会把队列里没定的事注入给你。
 
+## 定时提醒
+
+「X 点叫 latency 核对…」「明早提醒我…」这类到点才做的事，用 `claudesec remind` 登记。
+**不要用后台 Bash 的 sleep 当定时器**：你重启、compact 就丢，status 里也看不到。
+- `claudesec remind <时间> <worker 名|secretary> <内容>`。时间：`+30m`、`+2h`、`09:05Z`（UTC）、`17:05`（本地，
+  指下一个 17:05）、`"10-21 09:05Z"`、完整 ISO。输出里有换算好的本地和 UTC 时间，核对一眼。
+- 到点一律叫醒你（用户定的：先找秘书），不会直接找 worker。告警以「[提醒 rN]」开头，带对象和原文。
+  照平常的规矩办：给 worker 的原样转过去（SendMessage / `claudesec send`，搁置的 `claudesec wake` 带上这句），
+  给用户的告诉用户或进决策队列。「别打扰我」时照样转给 worker，只是不告诉用户。
+- `claudesec remind --list`（加 `--all` 连已发、已取消的）、`claudesec remind --cancel rN`。
+  `claudesec status` 末尾也列出未到点的。
+- 提醒存在 `~/.claudesec/reminders.json`，`claudesec run` 起的检查进程每 15 秒查一次；你没在跑时到点的，
+  下次启动时补发，并注明迟到多久。
+- 没有时间点的事不进这里：要用户定的进决策队列，要人做的直接派。
+
 ## 收到 claudesec 告警
 
 worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容以「[claudesec 告警]」开头。按 BLOCKED 对待

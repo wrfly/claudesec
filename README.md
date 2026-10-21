@@ -28,7 +28,7 @@ A Claude secretary in tmux.
 | `secretary_name` | `"secretary"` | 秘书的会话名，worker 用它发汇报 |
 | `tmux_session` | `"claudesec"` | 秘书和 worker 所在的 tmux session |
 | `cursor` | `"auto"` | Cursor worker（`spawn --agent cursor`、worker 的 `claudesec delegate`）能不能用。`"auto"`：机器上有 `agent` 命令就能用；`false` 关掉；`true` 要用（没装 `agent` 仍不可用）。不可用时这两个命令拒绝并说明原因，秘书和 worker 的规则里也不出现交给 Cursor 的内容。`claudesec status` 末尾显示当前状态。改完 `claudesec --restart`，worker 下次启动或唤醒时生效 |
-| `dashboard` | `true` | 秘书窗口右侧的两块面板：上面决策队列（待问、已问未答），下面任务进展（worker、搁置、未到点提醒），3 秒刷新。各自能上下滚：鼠标滚轮，或点进去用 ↑↓ / PgUp PgDn / g G。窗口宽 ≥110 列显示，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
+| `dashboard` | `true` | 秘书窗口右侧的两块面板：上面决策队列（待问、已问未答），下面任务进展（worker、搁置、未到点提醒），3 秒刷新。每条默认折叠成一行，点一条展开看全文，点标题栏全部展开 / 收起；各自用鼠标滚轮上下滚（焦点在面板上时也可以用 ↑↓ / PgUp PgDn / g G）。窗口宽 ≥110 列显示，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
 | `claude_config_dir` | 自动 | Claude Code 的配置目录。如果 `CLAUDE_CONFIG_DIR` 只在 claude 的启动脚本里设，从 tmux 起的 claudesec 进程看不到它；hook 第一次运行时会自动记到这里。想一开始就对，手动写上（比如 `"/home/me/.agentlodge/claude"`）|
 
 ### 用 tmux-resurrect / continuum 的话

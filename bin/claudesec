@@ -502,20 +502,34 @@ def queue_items(text):
     return items
 
 
-def queue_lines(cols):
-    """The decision queue pane: (title bar, body lines)."""
+# A pane's body is a list of blocks (key, folded, unfolded): the lines of one item folded to one
+# line, and all of them. Headings and spacing have key None and don't fold. Everything starts
+# folded; a click on an item unfolds it, a click on the title bar (or Tab) does all of them.
+
+def fixed(*lines):
+    return None, list(lines), list(lines)
+
+
+def foldable(key, full, short):
+    """A block that unfolds to full; one-line items are the same either way."""
+    return key, (full if len(full) == 1 else [short]), full
+
+
+def queue_blocks(cols):
+    """The decision queue pane: (title bar, blocks)."""
     path = HOME / "queue.md"
     items = queue_items(path.read_text() if path.exists() else "")
     ask = [i for i in items if i[0] == "ask"]
     asked = [i for i in items if i[0] == "asked"]
-    title = bar(" 决策队列", f"待问 {len(ask)} · 已问未答 {len(asked)} ", cols)
+    title = bar(" 决策队列", f"待问 {len(ask)}  已问未答 {len(asked)} ", cols)
     if not items:
-        return title, [[(DIM, "没有要你定的事。")]]
-    body = []
+        return title, [fixed([(DIM, "没有要你定的事。")])]
+    blocks = []
     for label, group in (("待问", ask), ("已问未答", asked)):
-        body.append(heading(f"{label} {len(group)}", cols))
+        blocks += [fixed([])] if blocks else []
+        blocks.append(fixed(heading(f"{label} {len(group)}", cols)))
         if not group:
-            body.append([(DIM, "  （无）")])
+            blocks.append(fixed([(DIM, "  （无）")]))
         for section, tag, text, note in group:
             if section == "asked":  # ▫ asked, waiting for the answer; ▪ to ask, colored by priority
                 days = (dt.date.today() - dt.date.fromisoformat(note)).days if note else None
@@ -523,10 +537,11 @@ def queue_lines(cols):
                     "（今天问的）" if days < 1 else "（昨天问的）" if days == 1 else f"（{days} 天前问的）"
             else:
                 mark, color, tail = "▪", PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
-            segs = ([(CYAN + ";" + BOLD, tag), ("", " ")] if tag else []) + [("", text), (DIM, tail)]
-            lines = wrap(segs, cols - 2)
-            body += [[(color, mark), ("", " ")] + lines[0]] + [[("", "  ")] + line for line in lines[1:]]
-    return title, body
+            head = [(color, mark), ("", " ")] + ([(CYAN + ";" + BOLD, tag), ("", " ")] if tag else [])
+            lines = wrap(head[2:] + [("", text), (DIM, tail)], cols - 2)
+            full = [head[:2] + lines[0]] + [[("", "  ")] + line for line in lines[1:]]
+            blocks.append(foldable(("q", tag, text), full, fit(head + [("", text)], cols)))
+    return title, blocks
 
 
 # How each status shows in the progress pane: group (the order they're listed in), mark, word, color
@@ -542,8 +557,9 @@ STATUS_LOOK = {
 }
 
 
-def status_lines(cols, now=None):
-    """The progress pane: (title bar, body lines)."""
+def status_blocks(cols, now=None):
+    """The progress pane: (title bar, blocks). A worker folds to its status line; unfolded it
+    adds its last report (the question, for those waiting on the user)."""
     focus, workers = read_registry()
     alive = alive_windows()
     active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
@@ -567,70 +583,95 @@ def status_lines(cols, now=None):
                      ago(w["last_report_at"], now) if w.get("last_report_at") else ""))
     rows.sort()
     counts = [sum(1 for r in rows if r[0] == g) for g in range(4)]
-    right = " · ".join(f"{label} {n}" for label, n in zip(("等你", "出错", "在做", "做完"), counts) if n)
-    title = bar(" 任务进展", (right + f" · 搁置 {len(shelved)} " if right else f"搁置 {len(shelved)} "), cols)
-    body = []
+    right = "".join(f"{label} {n}  " for label, n in zip(("等你", "出错", "在做", "做完"), counts) if n)
+    title = bar(" 任务进展", right + f"搁置 {len(shelved)} ", cols)
+    blocks = []
     name_w = min(max((width(r[2]) for r in rows), default=0), 16)
-    for group, _, name, mark, word, color, summary, age in rows:
+    for i, (group, _, name, mark, word, color, summary, age) in enumerate(rows):
+        if i and group != rows[i - 1][0]:
+            blocks.append(fixed([]))
         name_style = BOLD + (";4" if name == focus else "")
-        head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "), (name_style, cut(name, name_w).ljust(name_w)), ("", "  "),
-                (color, word)]
+        head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "),
+                (name_style, cut(name, name_w).ljust(name_w)), ("", "  "), (color, word)]
         gap = cols - sum(width(t) for _, t in head) - width(age)
-        body.append(head + [("", " " * gap), (DIM, age)] if gap >= 1 else fit(head, cols))
-        body.append([("", "  ")] + fit([(DIM, summary)], cols - 2))
+        head = head + [("", " " * gap), (DIM, age)] if gap >= 1 else fit(head, cols)
+        blocks.append((("s", name), [head], [head] + [[("", "  ")] + line
+                                                      for line in wrap([(DIM, summary)], cols - 2)]))
     if not rows:
-        body.append([(DIM, "没有在跑的 worker。")])
+        blocks.append(fixed([(DIM, "没有在跑的 worker。")]))
     if shelved:
-        lines = wrap([(BOLD, f"搁置 {len(shelved)}"), ("", "  "), (DIM, "、".join(shelved))], cols, cols - 2)
-        body += [[], lines[0]] + [[("", "  ")] + line for line in lines[1:]]
+        segs = [(BOLD, f"搁置 {len(shelved)}"), ("", "  "), (DIM, "、".join(shelved))]
+        lines = wrap(segs, cols, cols - 2)
+        blocks += [fixed([]), foldable(("shelved",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
+                                       fit(segs, cols))]
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
     if pending:
-        body += [[], heading(f"提醒 {len(pending)}", cols)]
+        blocks += [fixed([]), fixed(heading(f"提醒 {len(pending)}", cols))]
         for r in pending:
             t = dt.datetime.fromisoformat(r["due"]).astimezone()
-            body.append(fit([(DIM, f"{t:%m-%d %H:%M}"), ("", " "), (CYAN, r["target"]), ("", "  "),
-                             ("", " ".join(r["text"].split()))], cols))
-    return title, body
+            segs = [(DIM, f"{t:%m-%d %H:%M}"), ("", " "), (CYAN, r["target"]), ("", "  "),
+                    ("", " ".join(r["text"].split()))]
+            lines = wrap(segs, cols, cols - 2)
+            blocks.append(foldable(("r", r["due"], r["target"], r["text"]),
+                                   [lines[0]] + [[("", "  ")] + l for l in lines[1:]], fit(segs, cols)))
+    return title, blocks
+
+
+def unfold(blocks, opened):
+    """The body lines with the blocks in opened unfolded, and each line's block key."""
+    body, keys = [], []
+    for key, folded, full in blocks:
+        lines = full if key in opened else folded
+        body += lines
+        keys += [key] * len(lines)
+    return body, keys
 
 
 def dash_view(title, body, rows, top):
     """The rows the pane shows: the title, then body from line `top` on, with a note above and
-    below when there is more that way. Returns (lines, top) with top kept in range."""
+    below when there is more that way. Returns (lines, top kept in range, the body line each
+    shown row is, None for the title and notes)."""
     room = rows - 1
     if len(body) <= room or room < 3:
-        return [title] + body[:room], 0
+        return [title] + body[:room], 0, [None] + list(range(min(room, len(body))))
     top = max(0, min(top, len(body) - room + 1))
-    above = [[(DIM, f"  ↑ 上面还有 {top} 行")]] if top else []
+    above = [[(DIM, f"  ↑ 还有 {top} 行")]] if top else []
     shown = room - len(above)
+    below = []
     if top + shown < len(body):
         shown -= 1
-        below = [[(DIM, f"  ↓ 下面还有 {len(body) - top - shown} 行（滚轮 / ↑↓ 翻）")]]
-    else:
-        below = []
-    return [title] + above + body[top:top + shown] + below, top
+        below = [[(DIM, f"  ↓ 还有 {len(body) - top - shown} 行 · 滚轮翻 · 点一条展开")]]
+    rowmap = [None] * (1 + len(above)) + list(range(top, top + shown)) + [None] * len(below)
+    return [title] + above + body[top:top + shown] + below, top, rowmap
 
 
-def scroll_by(data, page):
-    """How many lines a burst of input from the pane's terminal scrolls: the mouse wheel,
-    ↑↓ j k, PgUp PgDn b space, Home End g G."""
+def dash_input(data, page):
+    """What a burst of input from the pane's terminal asks for: (lines to scroll, rows clicked,
+    whether to unfold or fold everything). Scrolling: the mouse wheel, ↑↓ j k, PgUp PgDn b
+    space, Home End g G. Tab folds or unfolds everything."""
     big = 1 << 20
     keys = {b"\x1b[A": -1, b"\x1bOA": -1, b"k": -1, b"\x1b[B": 1, b"\x1bOB": 1, b"j": 1,
             b"\x1b[5~": -page, b"b": -page, b"\x1b[6~": page, b" ": page,
             b"\x1b[H": -big, b"\x1bOH": -big, b"\x1b[1~": -big, b"g": -big,
             b"\x1b[F": big, b"\x1bOF": big, b"\x1b[4~": big, b"G": big}
-    total = 0
-    for m in re.finditer(rb"\x1b\[<(\d+);\d+;\d+[Mm]|\x1b\[[0-9;]*[~A-Za-z]|\x1bO.|.", data, re.S):
-        if m[1] is not None:  # SGR mouse report; 64/65 are the wheel, 4/8/16 shift/meta/ctrl
-            total += {64: -3, 65: 3}.get(int(m[1]) & ~28, 0)
+    scroll, clicks, everything = 0, [], False
+    for m in re.finditer(rb"\x1b\[<(\d+);\d+;(\d+)([Mm])|\x1b\[[0-9;]*[~A-Za-z]|\x1bO.|.", data, re.S):
+        if m[1] is not None:  # SGR mouse report: 64/65 the wheel, 0 the left button; 4/8/16 modifiers
+            button = int(m[1]) & ~28
+            scroll += {64: -3, 65: 3}.get(button, 0)
+            if button == 0 and m[3] == b"M":
+                clicks.append(int(m[2]) - 1)
+        elif m[0] == b"\t":
+            everything = not everything
         else:
-            total += keys.get(m[0], 0)
-    return total
+            scroll += keys.get(m[0], 0)
+    return scroll, clicks, everything
 
 
 def show_dashboard(what):
     """The loop in a dashboard pane: redraw when the content or the pane size changes, scroll
-    on the wheel and keys; leave when the secretary's pane is gone, which closes the window
-    with it."""
+    on the wheel and keys, fold and unfold on clicks; leave when the secretary's pane is gone,
+    which closes the window with it."""
     me = os.environ.get("TMUX_PANE", "")
     fd = sys.stdin.fileno()
     saved = None
@@ -642,22 +683,24 @@ def show_dashboard(what):
     os.set_blocking(waker, False)
     signal.signal(signal.SIGWINCH, lambda *_: None)
     signal.set_wakeup_fd(waker)
-    # own screen (nothing piles up in tmux's history), no cursor, wheel events as SGR reports
+    # own screen (nothing piles up in tmux's history), no cursor, clicks and the wheel as SGR reports
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
-    top, shown, content, due = 0, None, None, 0
+    top, opened, shown, content, due, sec = 0, set(), None, None, 0, None
     try:
         while True:
             size = shutil.get_terminal_size()
             if time.monotonic() >= due or content is None or content[0] != size:
-                roles = [role for _, role, _ in window_panes(me)] if me else ["secretary"]
-                if "secretary" not in roles:
+                panes = window_panes(me) if me else [("", "secretary", "0")]
+                sec = next((p for p, role, _ in panes if role == "secretary"), None)
+                if sec is None:
                     return
                 try:
-                    content = (size, *(queue_lines if what == "queue" else status_lines)(size.columns - 1))
+                    content = (size, *(queue_blocks if what == "queue" else status_blocks)(size.columns - 1))
                 except Exception as e:  # a half-written file, a bad entry: show it, try again
-                    content = (size, [(REV, f" 读状态出错，{DASH_REFRESH} 秒后重试 ")], [[("", repr(e))]])
+                    content = (size, [(REV, f" 读状态出错，{DASH_REFRESH} 秒后重试 ")], [fixed([("", repr(e))])])
                 due = time.monotonic() + DASH_REFRESH
-            lines, top = dash_view(content[1], content[2], size.lines, top)
+            body, keys = unfold(content[2], opened)
+            lines, top, rowmap = dash_view(content[1], body, size.lines, top)
             frame = "\x1b[K\r\n".join(paint(fit(line, size.columns - 1)) for line in lines)
             if frame != shown:
                 sys.stdout.write("\x1b[H" + frame + "\x1b[K\x1b[J")
@@ -666,11 +709,23 @@ def show_dashboard(what):
             ready, _, _ = select.select([fd, wake] if saved else [wake], [], [], max(0.0, due - time.monotonic()))
             if wake in ready:
                 os.read(wake, 512)
-            if fd in ready:
-                data = os.read(fd, 4096)
-                if not data:
-                    return
-                top += scroll_by(data, max(1, size.lines - 3))
+            if fd not in ready:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                return
+            scroll, clicks, everything = dash_input(data, max(1, size.lines - 3))
+            top += scroll
+            every = {key for key, _, _ in content[2] if key}
+            for row in clicks:
+                if row == 0:
+                    everything = not everything
+                elif row < len(rowmap) and rowmap[row] is not None and keys[rowmap[row]]:
+                    opened ^= {keys[rowmap[row]]}
+            if everything:
+                opened = set() if every <= opened else every
+            if clicks and sec and me:  # a click selects this pane; typing should go on to the secretary
+                tmux("select-pane", "-t", sec, check=False)
     finally:
         sys.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()

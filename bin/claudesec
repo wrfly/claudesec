@@ -779,7 +779,7 @@ def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
     if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
-    for mark in ("reported", "finish", "subagents.json"):
+    for mark in ("reported", "finish"):
         (d / mark).unlink(missing_ok=True)
     prompt = render_prompt((PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
@@ -843,10 +843,8 @@ def worker_command(name, d, cfg, model, *extra, prompt=True):
 # secretary talks to it with `claudesec send`, a paste into its window.
 
 CURSOR_HOOKS = {"sessionStart": "cursor-session-start", "beforeSubmitPrompt": "cursor-prompt",
-                "stop": "cursor-stop", "subagentStart": "cursor-subagent-start",
-                "subagentStop": "cursor-subagent-stop"}
+                "stop": "cursor-stop"}
 CURSOR_NAGS = 3  # follow-ups asking for a report before the stop hook gives up and alerts
-SUBAGENT_STALE = 3 * 3600  # a subagent mark older than this is a lost subagentStop, not a running one
 
 
 def install_cursor_hooks():
@@ -856,11 +854,11 @@ def install_cursor_hooks():
     old = path.read_text() if path.exists() else ""
     conf = json.loads(old) if old.strip() else {"version": 1, "hooks": {}}
     hooks = conf.setdefault("hooks", {})
+    for event in list(hooks):  # also drops entries for events claudesec no longer hooks
+        hooks[event] = [e for e in hooks[event] if "CLAUDESEC_WORKER" not in e.get("command", "")]
     for event, hook in CURSOR_HOOKS.items():
-        entries = [e for e in hooks.get(event, []) if "CLAUDESEC_WORKER" not in e.get("command", "")]
-        entries.append({"type": "command", "command":
+        hooks.setdefault(event, []).append({"type": "command", "command":
                         f'[ -z "${{CLAUDESEC_WORKER:-}}" ] || {shlex.quote(str(SELF))} hook {hook}'})
-        hooks[event] = entries
     new = json.dumps(conf, indent=2, ensure_ascii=False) + "\n"
     if new == old:
         return
@@ -1966,15 +1964,17 @@ def cmd_report(args):
     if args.name not in read_registry()[1]:
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
-    if running_subagents(args.name):
-        # Cursor's subagents inherit the worker's environment and rules, so one may think the
-        # report is its to send. Only the worker's own counts: a subagent's DONE would end the
-        # delegator's wait and get the worker archived before it finished.
+    # Cursor's subagents (Task tool) inherit the worker's environment and rules, and send
+    # reports of their own. Only the worker's counts: a subagent's DONE ends the delegator's
+    # wait and gets the worker archived before it is done. Cursor puts the conversation's id in
+    # each shell's environment; a subagent is a conversation of its own, the worker's is the
+    # session sessionStart recorded. (Cursor 2026.10 fires no subagentStart / subagentStop.)
+    conv, session = os.environ.get("CURSOR_CONVERSATION_ID"), read_registry()[1][args.name].get("session")
+    if conv and session and conv != session:
         append_log(args.name, "subagent-report-refused", text)
-        sys.exit(f"NOT REPORTED: {args.name} has a subagent running, and only the worker itself reports. "
-                 f"If you are that subagent: don't report; put your findings in your final answer to the "
-                 f"agent that started you. If you are {args.name} itself: wait until your subagents "
-                 f"finish, then report again.")
+        sys.exit(f"NOT REPORTED: you are a subagent of {args.name} (conversation {conv}, the worker's is "
+                 f"{session}), and only the worker itself reports. Don't report; put your findings in "
+                 f"your final answer to the agent that started you.")
     record_report(args.name, text)
     boss = read_registry()[1][args.name].get("delegated_by")
     if boss:
@@ -2191,47 +2191,6 @@ def hook_cursor_prompt():
     name = cursor_worker()
     if name:
         (worker_dir(name) / "busy").write_text(now())
-        (worker_dir(name) / "subagents.json").unlink(missing_ok=True)  # a new turn: none left running
-
-
-def running_subagents(name):
-    """The worker's subagents between their subagentStart and subagentStop: {id: started}."""
-    try:
-        marks = json.loads((worker_dir(name) / "subagents.json").read_text())
-    except (OSError, ValueError):
-        return {}
-    return {k: t for k, t in marks.items() if time.time() - t < SUBAGENT_STALE}
-
-
-def mark_subagent(name, sid, running):
-    path = worker_dir(name) / "subagents.json"
-    with open(path.with_suffix(".lock"), "w") as lock:  # parallel subagents start together
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        marks = running_subagents(name)
-        marks.pop(sid, None)
-        if running:
-            marks[sid] = time.time()
-        path.write_text(json.dumps(marks))
-
-
-def hook_cursor_subagent_start():
-    """A subagent (Cursor's Task tool) starts: mark it, so `report` turns away what it sends,
-    and tell it up front that the report isn't its job."""
-    data = hook_input()
-    name = cursor_worker()
-    if not name:
-        return
-    mark_subagent(name, data.get("subagent_id") or data.get("tool_call_id") or "?", True)
-    print(json.dumps({"additional_context":
-        f"你是 ClaudeSec worker「{name}」开的 subagent，不是 worker 本人。不要运行 `claudesec report`，"
-        "也不要联系秘书或其他会话：把结果写进你的最终回答，交回给开你的 agent，由它汇报。"}, ensure_ascii=False))
-
-
-def hook_cursor_subagent_stop():
-    data = hook_input()
-    name = cursor_worker()
-    if name:
-        mark_subagent(name, data.get("subagent_id") or data.get("tool_call_id") or "?", False)
 
 
 def hook_cursor_stop():
@@ -2539,8 +2498,6 @@ HOOKS = {
     "cursor-prompt": hook_cursor_prompt,
     "cursor-stop": hook_cursor_stop,
     "cursor-finish": hook_cursor_finish,
-    "cursor-subagent-start": hook_cursor_subagent_start,
-    "cursor-subagent-stop": hook_cursor_subagent_stop,
 }
 
 

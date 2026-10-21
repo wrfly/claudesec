@@ -557,8 +557,8 @@ status 列出未到点的提醒。
 
 跑的是 Cursor 的 `agent` CLI。Claude Code 那一套它都没有：没有按会话装的 hook（`--settings`）、没有
 `--append-system-prompt`、没有 SendMessage、没有 sessions/<pid>.json。对应的做法：
-- hook 只能装在全局 `~/.cursor/hooks.json`。spawn / wake 时 claudesec 把自己的五条（sessionStart、
-  beforeSubmitPrompt、stop、subagentStart、subagentStop）写进去，其他条目不动，文件有变化就先备份成 `hooks.json.bak-claudesec-<时间>`。
+- hook 只能装在全局 `~/.cursor/hooks.json`。spawn / wake 时 claudesec 把自己的三条（sessionStart、
+  beforeSubmitPrompt、stop）写进去，其他条目不动，文件有变化就先备份成 `hooks.json.bak-claudesec-<时间>`。
   每条都是 `[ -z "$CLAUDESEC_WORKER" ] || claudesec hook cursor-…`：只有 worker 命令设了这个变量
   （hook 进程会继承 agent 的环境，已验证），用户别的 Cursor 会话里什么都不做。
 - 规则：sessionStart 返回 `additional_context`（prompts/worker-cursor.md）。只在新会话触发；`--resume` 不触发，
@@ -566,11 +566,10 @@ status 列出未到点的提醒。
 - 汇报：worker 用 shell 跑 `claudesec report NAME`，记日志、注册表后经告警通道（alerts/ + 秘书的 watcher）叫醒秘书，
   正文以「（不是告警）Cursor worker 的汇报」开头。
 - subagent：Cursor 的 subagent（Task 工具）继承 worker 的环境变量和规则，会自己跑 `claudesec report`（实际发生过：
-  四个并行 subagent 各报一条 DONE，委托人的 wait 拿到的是第一个 subagent 的 DONE，`finish` 标记还会让 worker
-  在没写完时就被归档关掉）。所以 subagentStart / subagentStop 维护 `subagents.json`（3 小时没 stop 的当作丢了），
-  有 subagent 在跑时 `report` 拒收，原文记成 `subagent-report-refused`，不进注册表、不叫醒谁；subagentStart 也返回
-  `additional_context` 叫它把结果交回上级。worker 本人在 subagent 跑着时发的汇报同样被拒，等它们结束再发。
-  新一轮（beforeSubmitPrompt）清空标记。
+  四个并行 subagent 各报一条 DONE，委托人的 wait 拿到的是 subagent 的 DONE，`finish` 标记还会让 worker 没写完就被
+  归档关掉）。Cursor 给每个 shell 设 `CURSOR_CONVERSATION_ID`：worker 本人的等于 sessionStart 记下的会话 id，
+  subagent 的是它自己的会话 id（已验证）。`report` 见到不一致就拒收，原文记成 `subagent-report-refused`，
+  不进注册表、不叫醒谁。Cursor 2026.10 的 CLI 不触发 subagentStart / subagentStop，所以不靠它们。
 - 秘书 → worker：`claudesec send`，tmux 粘贴（bracketed paste，多行算一条）+ 回车。它在忙时消息进 Cursor 的队列，
   这一轮结束后执行。
 - 忙/闲：beforeSubmitPrompt 写 busy 标记，stop 清掉。没汇报就停下：stop 返回 `followup_message` 让它补发，

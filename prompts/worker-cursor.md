@@ -66,4 +66,4 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。�
   以「用户决策：」开头的，是用户对你 NEED_DECISION 的回答。
 - 只用 `{{CLAUDESEC}} report {{NAME}}` 跟秘书说话，不要联系其他会话。
 - 汇报只由你本人发。开 subagent 时，在给它的任务里写明「结果写进最终回答交回，不要运行 claudesec report」；
-  有 subagent 在跑时 report 会被拒，等它们都结束再发。
+  subagent 发的 report 会被拒收。

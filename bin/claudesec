@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "worker_permission_mode": "auto",
     "cursor_worker_model": "gemini-4-argon-high",  # best CursorBench 4.0 score this account can use
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
+    "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
@@ -515,6 +516,13 @@ QUEUE = """# 决策队列
 """
 
 
+def secretary_prompt():
+    """secretary.md with the Cursor parts kept or dropped for this machine, as a file for claude."""
+    path = HOME / "secretary-prompt.md"
+    path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()))
+    return path
+
+
 def cmd_run(args):
     """Runs inside the secretary's tmux window: the secretary's Claude Code process itself."""
     cfg = config()
@@ -540,7 +548,7 @@ def cmd_run(args):
     }, indent=2) + "\n")
     argv = ["claude", "-n", cfg["secretary_name"],
             "--settings", str(settings),
-            "--append-system-prompt-file", str(PROMPTS / "secretary.md"), *fresh_prompt(),
+            "--append-system-prompt-file", str(secretary_prompt()), *fresh_prompt(),
             "--allowedTools", "Bash(claudesec *)"]
     if cfg["secretary_model"]:
         argv += ["--model", cfg["secretary_model"]]
@@ -728,6 +736,7 @@ def cmd_spawn(args):
     cursor = args.agent == "cursor"
     model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
     if cursor:
+        require_cursor("spawn --agent cursor")
         check_cursor_http1()
 
     if args.discuss:
@@ -771,7 +780,7 @@ def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
     (d / "reported").unlink(missing_ok=True)
-    prompt = (PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text()
+    prompt = render_prompt((PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
               .replace("{{CLAUDESEC}}", hook_cmd()))
     (d / "prompt.md").write_text(prompt)
@@ -869,6 +878,32 @@ def cursor_command(name, model, *extra, d=None):
 
 def is_cursor(w):
     return (w or {}).get("agent") == "cursor"
+
+
+def cursor_available():
+    """(usable, why): whether Cursor workers can be started on this machine."""
+    setting = config().get("cursor", "auto")
+    if setting is False or str(setting).lower() in ("false", "off", "no", "0"):
+        return False, "已关（config.json 里 \"cursor\": false）"
+    path = shutil.which("agent")
+    if path:
+        return True, f"可用（{path}）"
+    return False, ("config.json 里开着，但" if setting is True else "") + "这台机器上没有 `agent` 命令（Cursor CLI）"
+
+
+def require_cursor(what):
+    ok, why = cursor_available()
+    if not ok:
+        sys.exit(f"{what}: Cursor workers are not available here — {why}.")
+
+
+def render_prompt(text):
+    """Keep or drop the prompt's Cursor parts: <!-- if cursor --> A [<!-- else --> B] <!-- end cursor -->."""
+    on = cursor_available()[0]
+
+    def pick(m):
+        return m.group(1) if on else (m.group(2) or "")
+    return re.sub(r"<!-- if cursor -->\n(.*?)(?:<!-- else -->\n(.*?))?<!-- end cursor -->\n", pick, text, flags=re.S)
 
 
 def check_cursor_http1():
@@ -1392,6 +1427,7 @@ def cmd_wake(args):
         sys.exit(f"{name}: its directory {cwd} is gone; nothing to resume in")
     holder = None if cursor else live_holder(sid)
     if cursor:
+        require_cursor(f"wake {name}")
         check_cursor_http1()
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
@@ -1502,6 +1538,7 @@ def cmd_status(args):
                          (w.get("shelf_summary") or w.get("last_summary") or "").replace("\n", " ")[:60]))
         print_rows(rows)
     print_reminders()
+    print(f"\nCursor worker：{cursor_available()[1]}")
     sessions = external_sessions()
     if sessions:
         print(f"\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：")
@@ -2005,6 +2042,10 @@ def cmd_delegate(args):
     boss = args.boss
     if boss not in workers:
         sys.exit(f"no worker {boss}: the first argument is your own worker name")
+    ok, why = cursor_available()
+    if not ok:
+        sys.exit(f"NOT DELEGATED: Cursor workers are not available here — {why}. Do it yourself, "
+                 f"or with a subagent if it runs alongside your work.")
     task = sys.stdin.read().strip() or sys.exit("empty task: pass the task brief on stdin")
     name = args.name
     if not NAME_RE.match(name):

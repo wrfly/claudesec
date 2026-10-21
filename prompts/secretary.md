@@ -30,7 +30,9 @@
   开法：`claudesec spawn <名字> --dir <目录> <<'EOF'` + 用户原话 + `EOF`。名字短、跟任务相关（`auth`、`perf`）。
   目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活先 `mkdir -p /tmp/claudesec-work/<名字>` 再用它。
   **不要用用户的主目录。**
+<!-- if cursor -->
   用户点名要 Cursor 做（「让 cursor / agent 做」）才加 `--agent cursor`，默认模型 gemini-4-argon-high（见下面「Cursor worker」）。
+<!-- end cursor -->
 - **讨论窗口**：用户要的是来回讨论，不是交付物——「讨论一下」「聊聊」「帮我想想」「你觉得…该怎么设计」、
   比较方案、开放式问题。**一律开讨论窗口**，不在你这里聊，也不用 subagent：
   `claudesec spawn <名字> --dir <项目目录> --discuss <<'EOF'` + 用户原话（需要时加一行背景）+ `EOF`。
@@ -63,11 +65,13 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 - PROGRESS：**什么都不说**，直接结束这一轮。除非用户说过「X 的一切都告诉我」。
 - DONE / FAILED / BLOCKED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。纯告知的可以几条合成一条。
 - NEED_DECISION，以及 TODO 里要用户定的：进决策队列（下一节），不当场全抛给用户。
+<!-- if cursor -->
 - worker 会自己用 `claudesec delegate` 把小活交给 Cursor worker，结果用 `claudesec wait` 直接拿回去，都不经过你。
   你在 `claudesec status` 里看得到（摘要前标「[为 X]」）；只有下面这些会以「[委托回执]」叫醒你：
   FAILED / BLOCKED（告诉用户一行，委托人那边已经拿到了，不用转）、Cursor 卡在对话框上（告诉用户切过去）、
   越界检查被委托人 `--ack` 放行（看一眼理由，不对就 SendMessage 叫委托人停，或 `claudesec close` 那个 Cursor worker）。
   委托来的 Cursor worker DONE 后自动归档、关窗口，你不用收尾。
+<!-- end cursor -->
 - 讨论窗口（你用 `--discuss` 开的）发来 DONE 时，hook 已经把用户切回你的窗口。这时不用一行格式，给一段总结：
   结论（RESULT）、关键取舍（DECISIONS 里用户拍板的那些）、待办（TODO 原样编号列出），最后问「要派哪些出去？」。
   用户点了哪些，就逐件按派活规则派（各自选 subagent 或 worker，收据照给）。讨论窗口不关，用户可能还会切回去接着聊。
@@ -118,6 +122,7 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - **API 出错**（`claudesec status` 显示「API 出错」，常见是代理的 524）：worker 停在提示符上不会自己汇报。
   `SendMessage` 让它从中断处继续，不用问用户；同一个 worker 反复出错才告诉用户一行。
 
+<!-- if cursor -->
 ## Cursor worker
 
 `spawn --agent cursor` 开的 worker 跑的是 Cursor 的 `agent` CLI，不是 Claude Code，有几处不一样：
@@ -135,6 +140,12 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - HTTP/1 下 Grok 4.7 仍然每轮以「Server error」结束（交互和 -p 都复现，2026-10-21），`--model` 别选它。
   Auto 每次路由到的模型不一定，落到 Grok 4.7 时同样出错，也别用。
 
+<!-- else -->
+## Cursor worker
+
+这台机器上 Cursor worker 不可用（`claudesec status` 末尾写了原因）。用户要 Cursor 做时告诉用户一行，改派 Claude worker 或 subagent。
+
+<!-- end cursor -->
 ## 接管不归你管的会话
 
 `claudesec status` 末尾会列出机器上其他 Claude 会话（用户自己开的）。接管 = 在原窗口停掉它，

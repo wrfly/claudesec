@@ -475,6 +475,16 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
 
+### Cursor 开关（config `cursor`）
+
+有的机器没装 Cursor。`cursor_available()`：config `cursor` 为 false → 关；否则看 PATH 里有没有 `agent`
+（`"auto"` 默认，`true` 也一样要求装了）。不可用时：
+- `spawn --agent cursor`、Cursor worker 的 `wake` 拒绝；`delegate` 拒绝并告诉委托人自己做或开 subagent。
+- 提示词里 Cursor 相关的段落用 `<!-- if cursor --> … [<!-- else --> …] <!-- end cursor -->` 包起来。
+  worker 的 prompt.md 在 spawn / wake 时按开关渲染；秘书的在 `claudesec run` 时渲染成 `~/.claudesec/secretary-prompt.md`
+  再传给 claude。关的时候秘书只看到一句「不可用，用户要 Cursor 时告诉用户、改派」，worker 看到「小活自己做或开 subagent」。
+- `claudesec status` 末尾一行「Cursor worker：可用（路径）/ 已关 / 没有 agent 命令」。
+
 ### worker 把小活委托给 Cursor（`claudesec delegate` / `wait`）
 
 用户定了「独立、小任务尽量派 cursor 做」。第一版让 worker 发 TYPE: DELEGATE 给秘书、秘书 spawn、Cursor 的汇报

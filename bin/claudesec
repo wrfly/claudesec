@@ -10,8 +10,9 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     --agent cursor: Cursor's `agent` CLI instead of Claude Code;
                                     --for: the worker that delegated it, named in its reports)
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
-  claudesec remind WHEN TARGET TEXT     wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO) with TEXT
-                                    for TARGET (a worker or `secretary`); --list [--all], --cancel ID
+  claudesec remind WHEN TARGET TEXT [--every 1d]   wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO)
+                                    with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
+  claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
   claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
   claudesec wait N                       the delegator waits for N's final report (background Bash)
@@ -534,7 +535,8 @@ def cmd_spawn(args):
     elif args.for_worker:
         initial = f"worker {args.for_worker} 委托给你的任务（它写的任务书原文）：\n\n{task}\n"
     else:
-        initial = f"秘书派给你的任务（用户原话）：\n\n{task}\n"
+        initial = getattr(args, "intro", None) or "秘书派给你的任务（用户原话）：\n\n"
+        initial += f"{task}\n"
     d = prepare_worker(name, cfg, initial, agent=args.agent)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
@@ -1518,6 +1520,21 @@ def parse_when(when, at=None):
     return t if t.tzinfo else t.replace(tzinfo=at.tzinfo)
 
 
+def parse_every(every):
+    """1d / 12h / 30m: the period of a repeating reminder, in seconds."""
+    m = re.fullmatch(r"(\d+)([mhd])", every.strip())
+    if not m or int(m.group(1)) == 0:
+        raise ValueError(f"can't read {every!r} as a period: use 30m, 12h, 1d, 7d")
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def show_every(secs):
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs % n == 0:
+            return f"每 {secs // n}{unit}"
+    return f"每 {secs}s"
+
+
 def show_time(iso):
     t = dt.datetime.fromisoformat(iso)
     return f"{t.astimezone():%m-%d %H:%M}（{t.astimezone(dt.timezone.utc):%H:%MZ}）"
@@ -1537,10 +1554,11 @@ def cmd_remind(args):
         if not items:
             print("没有提醒。" if args.all else "没有未到点的提醒。")
             return
-        rows = [("id", "时间", "给", "状态", "内容")]
+        rows = [("id", "时间", "重复", "给", "状态", "内容")]
         for r in sorted(items, key=lambda r: r["due"]):
-            rows.append((r["id"], show_time(r["due"]), r["target"],
-                         {"pending": "未到点", "fired": "已发", "cancelled": "已取消"}[r["status"]], r["text"][:60]))
+            rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
+                         r["target"], {"pending": "未到点", "fired": "已发", "cancelled": "已取消"}[r["status"]],
+                         r["text"][:60]))
         print_rows(rows)
         return
     if len(args.words) < 3:
@@ -1548,6 +1566,7 @@ def cmd_remind(args):
     when, target, text = args.words[0], args.words[1], " ".join(args.words[2:]).strip()
     try:
         due = parse_when(when)
+        every = parse_every(args.every) if args.every else None
     except ValueError as e:
         sys.exit(str(e))
     if due < dt.datetime.now().astimezone() - dt.timedelta(seconds=30):
@@ -1557,9 +1576,10 @@ def cmd_remind(args):
         rid = f"r{data['next_id']}"
         data["next_id"] += 1
         data["items"].append({"id": rid, "due": due.isoformat(timespec="seconds"), "target": target, "text": text,
-                              "status": "pending", "created_at": now()})
+                              "every": every, "status": "pending", "created_at": now()})
     note = "" if target in workers or target == "secretary" else f"（注意：{target} 现在不是 worker）"
-    print(f"{rid}: {show_time(due.isoformat())} 叫醒秘书，给 {target}：{text}{note}")
+    repeat = f"起，{show_every(every)}" if every else ""
+    print(f"{rid}: {show_time(due.isoformat())}{repeat} 叫醒秘书，给 {target}：{text}{note}")
 
 
 def deliver_reminder(r):
@@ -1575,12 +1595,24 @@ def deliver_reminder(r):
 
 def fire_due_reminders():
     """Each due reminder is marked fired before it is handed on: at most once, even if two
-    checkers overlap or delivery dies halfway."""
+    checkers overlap or delivery dies halfway. A repeating one moves on to its next time
+    instead; occurrences missed while no secretary ran fire once, not once each."""
     cutoff = dt.datetime.now().astimezone()
     with reminders() as data:
-        due = [r for r in data["items"] if r["status"] == "pending" and dt.datetime.fromisoformat(r["due"]) <= cutoff]
-        for r in due:
-            r.update(status="fired", done_at=now())
+        due = []
+        for r in data["items"]:
+            when = dt.datetime.fromisoformat(r["due"])
+            if r["status"] != "pending" or when > cutoff:
+                continue
+            due.append(dict(r))
+            if r.get("every"):
+                step = dt.timedelta(seconds=r["every"])
+                while when + step <= cutoff:
+                    when += step
+                due[-1]["due"] = when.isoformat(timespec="seconds")  # the latest one missed, for "how late"
+                r.update(due=(when + step).isoformat(timespec="seconds"), last_fired=now())
+            else:
+                r.update(status="fired", done_at=now())
     for r in due:
         try:
             how = deliver_reminder(r)
@@ -1590,7 +1622,7 @@ def fire_due_reminders():
         with reminders() as data:
             for x in data["items"]:
                 if x["id"] == r["id"]:
-                    x["result"] = how
+                    x["result"] = f"{now()} {how}" if x.get("every") else how
         print(f"{now()} {r['id']} → {r['target']}: {how}", flush=True)
 
 
@@ -1608,10 +1640,41 @@ def print_reminders():
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
     if pending:
         print("\n提醒（未到点；claudesec remind --cancel ID 取消）：")
-        rows = [("id", "时间", "给", "内容")]
+        rows = [("id", "时间", "重复", "给", "内容")]
         for r in pending:
-            rows.append((r["id"], show_time(r["due"]), r["target"], r["text"][:60]))
+            rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
+                         r["target"], r["text"][:60]))
         print_rows(rows)
+
+
+# ---------- daily review: tidy the secretary's memory, propose prompt changes ----------
+
+def secretary_memory_dir():
+    """Claude Code keys auto memory by cwd, and the secretary's cwd is HOME."""
+    return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HOME)) / "memory"
+
+
+def cmd_review(args):
+    """A fresh worker each day: the review needs none of yesterday's context, and a long-lived
+    one would carry every past review along."""
+    date = dt.date.today().isoformat()
+    brief = (PROMPTS / "review.md").read_text()
+    for key, value in {"DATE": date, "MEMORY": secretary_memory_dir(), "LESSONS": HOME / "lessons.md",
+                       "REPO": REPO, "QUEUE": HOME / "queue.md", "INDEX": HOME / "history" / "INDEX.md",
+                       "REVIEWS": HOME / "reviews"}.items():
+        brief = brief.replace("{{" + key + "}}", str(value))
+    if args.print:
+        print(brief)
+        return
+    (HOME / "reviews").mkdir(parents=True, exist_ok=True)
+    name = f"review-{date[5:7]}{date[8:]}"
+    w = read_registry()[1].get(name)
+    if w and w["status"] != "SHELVED" and w.get("window") in alive_windows():
+        sys.exit(f"{name} is already running (status {w['status']})")
+    if w:
+        quietly(cmd_close, name=name)
+    cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=None, discuss=False, agent="claude",
+                                 for_worker=None, task=brief, intro="claudesec 每日例行派给你的任务：\n\n"))
 
 
 # ---------- hooks ----------
@@ -2195,7 +2258,8 @@ def main():
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
-    s.add_argument("--cancel"); s.set_defaults(fn=cmd_remind)
+    s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
     s = sub.add_parser("delegate"); s.add_argument("boss"); s.add_argument("--name", required=True)

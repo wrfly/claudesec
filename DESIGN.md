@@ -319,7 +319,7 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 | 层 | 内容 | 机制 | 审批 |
 |---|---|---|---|
 | **经验** | 事实、偏好、别名（「用户说 perf 指性能那个 worker」） | Claude Code 自带 memory：纠错即写一条 feedback memory，下次会话自动加载 | 不需要 |
-| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.claudesec/lessons.md` 攒教训，不自己改宪法；用户说「复盘」时交给 `claudesec` worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
+| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.claudesec/lessons.md` 攒教训，不自己改宪法；每天一次（周期提醒到点，或用户说「复盘」）跑 `claudesec review`，开一个当天的复盘 worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
 | **铁律** | 2.5 节四条 | 永不自改 | — |
 
 为什么宪法层要门槛和审批：
@@ -328,7 +328,15 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 - 没有回归测试：改坏了自己没人发现
 
 `lessons.md` 格式：日期 · 信号类型 · 当时情况一句话 · 用户纠正原话。
-秘书每周（或用户说「复盘」时）读一遍，归类计数，达到门槛的提 diff。
+每日复盘（`claudesec review`，任务书在 prompts/review.md）：
+- 触发：秘书登记一条周期提醒 `claudesec remind 08:30 secretary "每日复盘：跑 claudesec review" --every 1d`。
+  08:30 在用户上班前，diff 等用户一来就能批；机器夜里关着的话，claudesec 下次启动时补发一次。
+  用户说「复盘」时随时跑。
+- 每天开一个新 worker（`review-MMDD`，在 claudesec 仓库目录），不 wake 长期的 `claudesec` worker：
+  复盘用不到昨天的上下文，长期 worker 会把每天的复盘都背在上下文里。
+- 记忆（经验层）直接整理落盘，落盘前把目录拷到 `~/.claudesec/reviews/<日期>-memory-before/`。
+- 宪法层只出 diff：分支 `review/<日期>` 不 push，`git diff origin/main` 存到 `~/.claudesec/reviews/<日期>.diff`，
+  NEED_DECISION 一行一处改动，进秘书的决策队列；用户决定后 worker 自己 rebase、push，把教训移到「已处理」。
 
 ### 3.4 数据流
 
@@ -406,7 +414,8 @@ claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] [--for WOR
 claudesec delegate ME --name N [--dir D] [--ack 理由] <<< 任务书   worker 把小活交给 Cursor worker
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
-claudesec remind WHEN TARGET 内容   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
+claudesec remind WHEN TARGET 内容 [--every 1d]   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
+claudesec review [--print]       开当天的复盘 worker（整理秘书记忆、提提示词 diff）
 claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
 claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
@@ -499,6 +508,8 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - 存储：`~/.claudesec/reminders.json`（加锁读写，同 registry）。每条有 id（r1、r2…）、到点时间（带时区的 ISO）、
   对象（worker 名或 secretary）、原文、状态（pending / fired / cancelled）、投递结果。
   已发和已取消的只留最近 30 条。
+- 周期：`--every 30m|12h|1d|7d`。到点后 due 往后推到下一个未来的时间点，错过的几次只补发一次，
+  「迟到多久」按最近错过的那次算。
 - 检查：`claudesec run` 起 `lifecycle reminders`，每 15 秒一次，只要它那个 run 还是 run.pid 里的那个就一直跑；
   秘书重启后新的检查进程等旧的交出锁再接手。到点的先标 fired 再投递，所以最多投一次。
   秘书没在跑（包括整机重启）时不检查：提醒还在文件里，下次启动时补发，并注明迟到多久。没有用 launchd：

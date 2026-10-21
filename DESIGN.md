@@ -483,7 +483,8 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   因为不触发 sessionStart，确认方式是 agent 画出界面并且活过 5 秒。没有 adopt。
 - 传输：agent 默认用 HTTP/2 连 agentn.us.api5.cursor.sh，本机（疑似 CorpLink 网关）会卡在「Connection stalled」，
   所以 `~/.cursor/cli-config.json` 要开 `network.useHttp1ForAgent`。不要改用 CURSOR_CONFIG_DIR：那样读不到
-  `~/.cursor/hooks.json`，hook 全部失效。
+  `~/.cursor/hooks.json`，hook 全部失效。spawn / wake Cursor worker 时会检查这一项，没开就打 WARNING，
+  说明后果和改法，但不替用户改文件，worker 照样开。
 - 模型：HTTP/1 下 Grok 4.7 仍每轮以「Server error」结束（交互、-p 都复现），stop 拿到 status=error；Auto 落到 Grok 4.7
   时也一样。默认 `cursor_worker_model: "gemini-4-argon-high"`，它在本账号可用的模型里 CursorBench 4.0 分最高。
 

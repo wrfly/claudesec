@@ -514,6 +514,8 @@ def cmd_spawn(args):
     project = str(Path(args.dir).expanduser().resolve())
     cursor = args.agent == "cursor"
     model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
+    if cursor:
+        check_cursor_http1()
 
     if args.discuss:
         initial = (f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
@@ -649,6 +651,22 @@ def cursor_command(name, model, *extra, d=None):
 
 def is_cursor(w):
     return (w or {}).get("agent") == "cursor"
+
+
+def check_cursor_http1():
+    """Over HTTP/2 the agent stalls on agentn.us.api5.cursor.sh here, whatever the model; say so
+    rather than leave a worker that never answers. Only a warning: the file is the user's."""
+    path = Path.home() / ".cursor" / "cli-config.json"
+    try:
+        on = (json.loads(path.read_text()).get("network") or {}).get("useHttp1ForAgent") is True
+    except (OSError, ValueError, AttributeError):
+        on = False
+    if not on:
+        print(f"WARNING: {path} does not set \"network\": {{\"useHttp1ForAgent\": true}}. Without it the "
+              "agent talks HTTP/2 to agentn.us.api5.cursor.sh and, on this network, stalls on "
+              "\"Connection stalled\" with any model, so the worker never gets through a turn. "
+              "To fix: back the file up, add that key under \"network\" (leave the rest as it is), "
+              "then restart the worker: close and spawn it again, or shelve and wake it.", flush=True)
 
 
 def cursor_chat_exists(chat):
@@ -1155,6 +1173,8 @@ def cmd_wake(args):
     if not Path(cwd).is_dir():
         sys.exit(f"{name}: its directory {cwd} is gone; nothing to resume in")
     holder = None if cursor else live_holder(sid)
+    if cursor:
+        check_cursor_http1()
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
                  f"someone resumed it outside claudesec")

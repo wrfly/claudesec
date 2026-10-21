@@ -27,6 +27,7 @@ A Claude secretary in tmux.
 | `cursor_worker_model` | `"gemini-4-argon-high"` | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
 | `secretary_name` | `"secretary"` | 秘书的会话名，worker 用它发汇报 |
 | `tmux_session` | `"claudesec"` | 秘书和 worker 所在的 tmux session |
+| `dashboard` | `true` | 秘书窗口右侧的只读面板：右上决策队列（待问、已问未答），右下任务进展（worker、搁置、未到点提醒），3 秒刷新。窗口宽 ≥150 列两块，110–149 列合成一块，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
 | `claude_config_dir` | 自动 | Claude Code 的配置目录。如果 `CLAUDE_CONFIG_DIR` 只在 claude 的启动脚本里设，从 tmux 起的 claudesec 进程看不到它；hook 第一次运行时会自动记到这里。想一开始就对，手动写上（比如 `"/home/me/.agentlodge/claude"`）|
 
 ### 用 tmux-resurrect / continuum 的话
@@ -49,6 +50,7 @@ claudesec 的 pane 显示 `(not saved: @resurrect-skip)`。
     claudesec --new            # 秘书从头开始（新会话）
     claudesec --restart        # 重新加载秘书的 prompt 和 hook，对话和 worker 都不受影响
     claudesec -d               # 只在后台起好，不切过去
+    claudesec dashboard off    # 关掉秘书右侧的队列 / 进展面板（on 打开）
 
 然后就在 secretary 窗口里说话。worker 会以同一个 session 里的 window 出现，名字就是任务名；
 想看就切过去，不想看就不用管。原来的 tmux session 不受影响，随时切回去。

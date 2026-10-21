@@ -503,6 +503,22 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 16 个样例句子的关键词命中符合预期（「token 数」「release notes」「merge sort」会误伤，靠 --ack）。
 未验证：Claude Code worker 在真实任务里会不会用、后台 wait 结束后能不能顺利接着干（要真用时观察）。
 
+### 主窗口面板（`claudesec dashboard`）
+
+秘书窗口左边是秘书，右边一列只读面板（窗口宽的 36%）：右上 `dashboard show queue` 显示 queue.md 的「待问 / 已问未答」
+（不显示「已处理」），右下 `dashboard show status` 显示 worker（状态、距今、摘要，等用户的标黄）、搁置的名字、未到点提醒。
+- 每块面板是个循环：每 3 秒重读文件，内容或面板尺寸变了才重画，不抢焦点、不接受输入。秘书的 pane 没了就自己退出，
+  窗口随之关闭（不留下只有面板的窗口）。
+- pane 靠 pane 选项 `@claudesec-role`（secretary / queue / status / both）区分。秘书 pane 的定位、`--restart` 的
+  respawn 都改成按这个找，不再按窗口取当前 pane（用户把焦点放在面板上时会认错）。
+- 布局由 `arrange_dashboard` 定，幂等：窗口 ≥150 列两块，110–149 列一块合并的（上队列下进展），更窄不显示；
+  配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
+  client-attached 两个 hook 跑 `claudesec dashboard layout`，终端尺寸变了自动重排。整机重启后用户敲 `claudesec`
+  重建 session，布局随之恢复（这个 session 本来就不交给 tmux-resurrect）。
+- 已验证（临时 tmux session、假的秘书进程）：191 列两块、130 列一块、100 列没有、再宽回去恢复；on / off；
+  重复 layout 不动已有 pane；新开窗口和 --restart 后面板都在、--restart 只换秘书 pane；杀掉秘书 pane 后面板退出、窗口关闭；
+  resize hook 的命令能正确重排。没验证：真用户终端里拖动窗口大小时 client-resized 的触发（tmux 文档行为）。
+
 ### 定时提醒（`claudesec remind`）
 
 秘书原先拿后台 Bash 的 sleep 当定时器，秘书重启、compact 就丢，status 里也看不到。现在：

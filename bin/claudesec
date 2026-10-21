@@ -12,6 +12,7 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
   claudesec remind WHEN TARGET TEXT [--every 1d]   wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO)
                                     with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
+  claudesec dashboard on|off              queue and progress panes beside the secretary (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
   claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
@@ -41,6 +42,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -74,6 +76,7 @@ DEFAULT_CONFIG = {
     "worker_permission_mode": "auto",
     "cursor_worker_model": "gemini-4-argon-high",  # best CursorBench 4.0 score this account can use
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
+    "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
@@ -261,9 +264,9 @@ def has_session(name):
     return subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True).returncode == 0
 
 
-def secretary_runs_claudesec(sess):
-    """Is the secretary window running `claudesec run` (directly, or under the shell tmux started)?"""
-    out = tmux("display-message", "-p", "-t", f"={sess}:secretary", "#{pane_dead} #{pane_pid}", check=False).split()
+def secretary_runs_claudesec(sess, pane):
+    """Is the secretary's pane running `claudesec run` (directly, or under the shell tmux started)?"""
+    out = tmux("display-message", "-p", "-t", pane, "#{pane_dead} #{pane_pid}", check=False).split()
     if len(out) != 2 or out[0] != "0":
         return False
     try:
@@ -278,28 +281,225 @@ def cmd_start(args):
     sess = config()["tmux_session"]
     remember_claude_dir()
     run = f"CLAUDESEC_HOME={shlex.quote(str(HOME))} {shlex.quote(str(SELF))} run" + (" --new" if args.new else "")
+    pane = secretary_pane(sess) if has_session(sess) else None
+    if pane is None and has_session(sess) and "secretary" in tmux(
+            "list-windows", "-t", f"={sess}", "-F", "#{window_name}").split():
+        tmux("kill-window", "-t", f"={sess}:secretary", check=False)  # only dashboards left in it
     if not has_session(sess):
-        tmux("new-session", "-d", "-s", sess, "-n", "secretary", "-c", str(HOME), run)
-    elif "secretary" not in tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}").split():
-        tmux("new-window", "-t", f"={sess}:", "-n", "secretary", "-c", str(HOME), run)
+        pane = tmux("new-session", "-d", "-s", sess, "-n", "secretary", "-c", str(HOME),
+                    "-P", "-F", "#{pane_id}", run).strip()
+    elif pane is None:
+        pane = tmux("new-window", "-t", f"={sess}:", "-n", "secretary", "-c", str(HOME),
+                    "-P", "-F", "#{pane_id}", run).strip()
     else:
-        wrapped = secretary_runs_claudesec(sess)
+        wrapped = secretary_runs_claudesec(sess, pane)
         if args.new or args.restart or not wrapped:
             # --restart: same conversation, freshly loaded prompt and hooks. Not wrapped: a restored
             # tmux layout left a shell or a bare `claude --resume` in the window; take it over.
             if wrapped:  # the exiting `claudesec run` sees this and leaves the workers running
                 (HOME / "restarting").write_text(str(time.time()))
-            tmux("respawn-pane", "-k", "-t", f"={sess}:secretary", "-c", str(HOME), run)
+            tmux("respawn-pane", "-k", "-t", pane, "-c", str(HOME), run)
+    tmux("set-option", "-p", "-t", pane, "@claudesec-role", "secretary", check=False)
+    arrange_dashboard(sess)
     # Keep this session out of tmux-resurrect's saved layouts (a post-save hook that honours
     # @resurrect-skip drops it): restored, its panes would be bare `claude --resume`s without
     # claudesec's prompts and hooks. `claudesec` starts the secretary itself; its wake-all brings the workers.
     tmux("set-option", "-t", f"={sess}:", "@resurrect-skip", "on", check=False)
+    # Re-arrange when the terminal changes size: fewer panes, or none, on a narrow one.
+    for hook in ("client-resized", "client-attached"):
+        tmux("set-hook", "-t", sess, hook,  # set-hook takes no "=" exact-match prefix
+             f"run-shell -b {shlex.quote(hook_cmd() + ' dashboard layout')}", check=False)
     if args.detach:
         print(f"secretary is in tmux session '{sess}'")
     elif os.environ.get("TMUX"):
         tmux("switch-client", "-t", f"={sess}")
     else:
         os.execvp("tmux", ["tmux", "attach-session", "-t", f"={sess}"])
+
+
+# ---------- dashboard: queue and progress beside the secretary ----------
+# Read-only panes in the secretary's window, told apart by the pane option @claudesec-role
+# (secretary / queue / status / both). Laid out by `arrange_dashboard`, run at every start and
+# when a client resizes; each pane redraws itself every few seconds and exits with the secretary.
+
+DASH_WIDE, DASH_NARROW = 150, 110  # window columns: two panes / one combined pane / none
+DASH_SHARE = 36                    # percent of the window the right column takes
+DASH_REFRESH = 3
+
+
+def window_panes(target):
+    """(pane id, role, index) of each pane in target's window; role is "" when unmarked."""
+    out = tmux("list-panes", "-t", target, "-F", "#{pane_id}|#{@claudesec-role}|#{pane_index}", check=False)
+    return [tuple(line.split("|")) for line in out.splitlines() if line.count("|") == 2]
+
+
+def secretary_pane(sess):
+    """The secretary's pane id: the one marked so, else (a window from before the dashboard,
+    or a restored layout) the first unmarked pane of the secretary window."""
+    panes = window_panes(f"={sess}:secretary")
+    marked = [p for p, role, _ in panes if role == "secretary"]
+    if marked:
+        return marked[0]
+    plain = sorted((int(i), p) for p, role, i in panes if not role and i.isdigit())
+    return plain[0][1] if plain else None
+
+
+def arrange_dashboard(sess):
+    """Make the secretary window's panes match its width and the `dashboard` setting."""
+    sec = secretary_pane(sess)
+    if not sec:
+        return
+    tmux("set-option", "-p", "-t", sec, "@claudesec-role", "secretary", check=False)
+    width = int(tmux("display", "-p", "-t", sec, "#{window_width}", check=False).strip() or 0)
+    want = [] if not config().get("dashboard", True) else \
+        ["queue", "status"] if width >= DASH_WIDE else ["both"] if width >= DASH_NARROW else []
+    have = {role: p for p, role, _ in window_panes(sec) if role in ("queue", "status", "both")}
+    if sorted(have) == sorted(want):
+        return
+    for p in have.values():
+        tmux("kill-pane", "-t", p, check=False)
+    if not want:
+        return
+    dash = f"{hook_cmd()} dashboard show"
+    right = tmux("split-window", "-d", "-h", "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
+                 "-P", "-F", "#{pane_id}", f"{dash} {want[0]}").strip()
+    tmux("set-option", "-p", "-t", right, "@claudesec-role", want[0], check=False)
+    if len(want) == 2:
+        below = tmux("split-window", "-d", "-v", "-l", "55%", "-t", right, "-c", str(HOME),
+                     "-P", "-F", "#{pane_id}", f"{dash} {want[1]}").strip()
+        tmux("set-option", "-p", "-t", below, "@claudesec-role", want[1], check=False)
+    tmux("select-pane", "-t", sec, check=False)  # focus stays with the secretary
+
+
+def fit(text, cols):
+    """Cut a line to cols display columns."""
+    out, used = "", 0
+    for ch in text:
+        w = width(ch)
+        if used + w > cols:
+            return out[:-1] + "…" if out else ""
+        out, used = out + ch, used + w
+    return out
+
+
+def wrap(text, cols, indent="  "):
+    lines, cur, used = [], "", 0
+    for ch in text:
+        w = width(ch)
+        if used + w > cols:
+            lines.append(cur)
+            cur, used = indent, width(indent)
+        cur, used = cur + ch, used + w
+    return lines + [cur]
+
+
+def queue_lines(cols):
+    """The undecided part of queue.md: 待问 and 已问未答, one wrapped item each."""
+    path = HOME / "queue.md"
+    text = path.read_text() if path.exists() else ""
+    out, section = [], None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            section = "ask" if "待问" in line else "asked" if "已问未答" in line else None
+            if section:
+                out.append(("\x1b[1m" + ("待问" if section == "ask" else "已问未答") + "\x1b[0m", True))
+            continue
+        if section and re.match(r"\s*(\d+\.|-)\s+\S", line):
+            item = re.sub(r"^\s*(\d+\.|-)\s+", "", line.strip())
+            for i, part in enumerate(wrap(("· " if section == "ask" else "… ") + item, cols)):
+                out.append((part, False))
+    out = [x for i, x in enumerate(out)  # an empty section says so
+           for x in ([x] + ([("  （无）", False)] if x[1] and (i + 1 == len(out) or out[i + 1][1]) else []))]
+    counts = [sum(1 for l, head in out if not head and l.startswith(m)) for m in ("· ", "… ")]
+    title = f"\x1b[7m 决策队列  待问 {counts[0]} · 已问未答 {counts[1]} \x1b[0m"
+    body = [l for l, _ in out] if any(counts) else ["（空）"]
+    return [title, *body]
+
+
+def status_lines(cols):
+    focus, workers = read_registry()
+    alive = alive_windows()
+    active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
+    shelved = [n for n, w in workers.items() if w["status"] == "SHELVED"]
+    waiting = sum(1 for w in active.values() if w["status"] in WAITING)
+    out = [f"\x1b[7m 任务进展  在跑 {len(active)} · 等你 {waiting} · 搁置 {len(shelved)} \x1b[0m"]
+    for name, w in active.items():
+        status = LABELS.get(w["status"], w["status"])
+        if w.get("mode") == "discuss" and w["status"] not in ("DONE", "FAILED"):
+            status = "讨论中"
+        if w.get("window") not in alive and w["status"] not in ("DONE", "FAILED"):
+            status += "(关)"
+        age = ""
+        if w.get("last_report_at"):
+            secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
+            age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.0f}h"
+        summary = (w.get("pending_ask") if w["status"] in LABELS else w.get("last_summary") or w["task"])
+        summary = (f"[为 {w['delegated_by']}] " if w.get("delegated_by") else "") + summary.replace("\n", " ")
+        flag = "←" if w["status"] in WAITING else ("*" if name == focus else " ")
+        head = f"{flag}{name} {status} {age}".rstrip()
+        color = "\x1b[33m" if w["status"] in WAITING else "\x1b[31m" if w["status"] in ("FAILED", "API_ERROR") else ""
+        out.append(color + fit(head, cols) + ("\x1b[0m" if color else ""))
+        out.append("\x1b[2m" + fit("   " + summary, cols) + "\x1b[0m")
+    if not active:
+        out.append("没有在跑的 worker。")
+    if shelved:
+        out += [""] + wrap("搁置：" + "、".join(shelved), cols)
+    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
+    if pending:
+        out += ["", "\x1b[1m提醒\x1b[0m"]
+        for r in pending:
+            t = dt.datetime.fromisoformat(r["due"]).astimezone()
+            out.append(fit(f"{t:%m-%d %H:%M} {r['target']}：{r['text']}", cols))
+    return out
+
+
+def dash_frame(what, cols, rows):
+    if what == "both":
+        q = queue_lines(cols)
+        lines = q[:max(4, rows // 2 - 1)] + [""] + status_lines(cols)
+    else:
+        lines = queue_lines(cols) if what == "queue" else status_lines(cols)
+    if len(lines) > rows:
+        lines = lines[:rows - 1] + [f"\x1b[2m…还有 {len(lines) - rows + 1} 行\x1b[0m"]
+    return "\n".join(lines)
+
+
+def show_dashboard(what):
+    """The loop in a dashboard pane: redraw when the content or the pane size changes; leave
+    when the secretary's pane is gone, which closes the window with it."""
+    me = os.environ.get("TMUX_PANE", "")
+    sys.stdout.write("\x1b[?25l")  # no cursor
+    last = None
+    while True:
+        roles = [role for _, role, _ in window_panes(me)] if me else ["secretary"]
+        if "secretary" not in roles:
+            return
+        size = shutil.get_terminal_size()
+        try:
+            frame = dash_frame(what, size.columns - 1, size.lines)
+        except Exception as e:  # a half-written file, a bad entry: show it, try again
+            frame = f"（读状态出错，{DASH_REFRESH} 秒后重试）\n{e!r}"
+        if (frame, size) != last:
+            sys.stdout.write("\x1b[H\x1b[2J" + frame)
+            sys.stdout.flush()
+            last = (frame, size)
+        time.sleep(DASH_REFRESH)
+
+
+def cmd_dashboard(args):
+    sess = config()["tmux_session"]
+    if args.action == "show":
+        show_dashboard(args.what or "both")
+        return
+    if args.action in ("on", "off"):
+        path = HOME / "config.json"
+        conf = json.loads(path.read_text()) if path.exists() else {}
+        conf["dashboard"] = args.action == "on"
+        path.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+    if has_session(sess):
+        arrange_dashboard(sess)
+    if args.action != "layout":
+        print(f"dashboard {'on' if config().get('dashboard', True) else 'off'}")
 
 
 QUEUE = """# 决策队列
@@ -2285,6 +2485,8 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
+    s.add_argument("what", nargs="?", choices=["queue", "status", "both"]); s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)

@@ -160,6 +160,11 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - `claudesec status` 的「搁置」区里是用户搁置的和自动恢复失败的。用户搁置的要等用户发话再 wake；
   恢复失败的，你下次启动时 claudesec 会再试。
 
+## 主窗口面板
+
+你的窗口右侧有两块只读面板，用户随时看得到：右上是决策队列的「待问 / 已问未答」，右下是 worker 状态和未到点的提醒，
+几秒刷新一次。所以不用为了让用户看见而复述队列或状态表；用户问起时照常答。面板的开关是 `claudesec dashboard on|off`。
+
 ## 记忆
 
 - 进行中：`claudesec status`、`claudesec log`。会话开始和 compact 后，hook 会把注册表、最近历史和决策队列注入给你，以它为准。

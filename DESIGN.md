@@ -521,17 +521,28 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 ### 主窗口面板（`claudesec dashboard`）
 
-秘书窗口左边是秘书，右边一列只读面板（窗口宽的 36%）：右上 `dashboard show queue` 显示 queue.md 的「待问 / 已问未答」
-（不显示「已处理」），右下 `dashboard show status` 显示 worker（状态、距今、摘要，等用户的标黄）、搁置的名字、未到点提醒。
-- 每块面板是个循环：每 3 秒重读文件，内容或面板尺寸变了才重画，不抢焦点、不接受输入。秘书的 pane 没了就自己退出，
-  窗口随之关闭（不留下只有面板的窗口）。
-- pane 靠 pane 选项 `@claudesec-role`（secretary / queue / status / both）区分。秘书 pane 的定位、`--restart` 的
+秘书窗口左边是秘书，右边一列两块面板（窗口宽的 36%，上下各半）：上面 `dashboard show queue` 显示 queue.md 的
+「待问 / 已问未答」（不显示「已处理」），下面 `dashboard show status` 显示 worker、搁置的名字、未到点提醒。
+- 队列：每条一个标记，`▪` 待问（颜色按条目末尾的优先级：高红、中黄、低灰），`▫` 已问未答（附「N 天前问的」）；
+  `[tag]` 拆出来作 worker 名高亮；条目编号随便写（`1.`、`0d.`、`5b.`、`-` 都认）。换行不拆英文词和路径，
+  逗号句号不落到行首。
+- 进展：按「等你（要你拍板 / 卡住了 / 等你批权限）→ 出错 → 在做（启动中 / 进行中 / 讨论中）→ 做完」排，同组新的在前；
+  每个 worker 两行：标记、名字、状态、距今，下一行一句摘要（等你的显示它问的问题）。标题栏是各组计数。
+- 两块各自能上下滚：鼠标滚轮（tmux `mouse on` 时；面板开了鼠标上报，tmux 把滚轮转给它，不进 copy mode）、
+  点进面板后 ↑↓ / j k、PgUp PgDn / b 空格、Home End / g G。标题栏不动，上下有「还有 N 行」。
+  内容刷新不重置滚动位置。面板用自己的屏幕（alternate screen），重画不会堆进 tmux 的历史。
+- 每块面板是个循环：每 3 秒重读文件，内容、尺寸或滚动位置变了才重画；尺寸变了（SIGWINCH）立刻重画，
+  刚分出来的面板第一帧就是对的。不抢焦点。秘书的 pane 没了就自己退出，窗口随之关闭（不留下只有面板的窗口）。
+- pane 靠 pane 选项 `@claudesec-role`（secretary / queue / status）区分。秘书 pane 的定位、`--restart` 的
   respawn 都改成按这个找，不再按窗口取当前 pane（用户把焦点放在面板上时会认错）。
-- 布局由 `arrange_dashboard` 定，幂等：窗口 ≥150 列两块，110–149 列一块合并的（上队列下进展），更窄不显示；
-  配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
+- 布局由 `arrange_dashboard` 定，幂等：窗口 ≥110 列就是两块，更窄不显示（秘书独占）；早先版本 110–149 列合成的
+  一块（role `both`）会被换成两块。配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
   client-attached 两个 hook 跑 `claudesec dashboard layout`，终端尺寸变了自动重排。整机重启后用户敲 `claudesec`
   重建 session，布局随之恢复（这个 session 本来就不交给 tmux-resurrect）。
-- 已验证（临时 tmux session、假的秘书进程）：191 列两块、130 列一块、100 列没有、再宽回去恢复；on / off；
+- 回归测试 `tests/test_dashboard.py`：布局、换行、队列解析、进展排序、滚动和按键。端到端（隔离的 tmux server，
+  pty 里挂一个真 client，往 client 写 SGR 滚轮序列）：130 / 120 列两块、100 列没有；滚轮下 3 次滚 9 行、上 1 次回 3 行，
+  焦点留在秘书；G / g 到底 / 回顶；杀掉秘书 pane 面板退出。
+- 更早的验证（临时 tmux session、假的秘书进程）：191 列两块、100 列没有、再宽回去恢复；on / off；
   重复 layout 不动已有 pane；新开窗口和 --restart 后面板都在、--restart 只换秘书 pane；杀掉秘书 pane 后面板退出、窗口关闭；
   resize hook 的命令能正确重排。没验证：真用户终端里拖动窗口大小时 client-resized 的触发（tmux 文档行为）。
 

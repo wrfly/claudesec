@@ -41,13 +41,16 @@ import io
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 import unicodedata
 from pathlib import Path
 
@@ -319,12 +322,13 @@ def cmd_start(args):
 
 
 # ---------- dashboard: queue and progress beside the secretary ----------
-# Read-only panes in the secretary's window, told apart by the pane option @claudesec-role
-# (secretary / queue / status / both). Laid out by `arrange_dashboard`, run at every start and
-# when a client resizes; each pane redraws itself every few seconds and exits with the secretary.
+# Panes in the secretary's window, told apart by the pane option @claudesec-role (secretary /
+# queue / status). Laid out by `arrange_dashboard`, run at every start and when a client resizes;
+# each dashboard pane redraws itself every few seconds, scrolls on the wheel and keys, and exits
+# with the secretary.
 
-DASH_WIDE, DASH_NARROW = 150, 110  # window columns: two panes / one combined pane / none
-DASH_SHARE = 36                    # percent of the window the right column takes
+DASH_MIN = 110    # window columns below which the secretary keeps the whole window
+DASH_SHARE = 36   # percent of the window the right column takes
 DASH_REFRESH = 3
 
 
@@ -352,8 +356,8 @@ def arrange_dashboard(sess):
         return
     tmux("set-option", "-p", "-t", sec, "@claudesec-role", "secretary", check=False)
     width = int(tmux("display", "-p", "-t", sec, "#{window_width}", check=False).strip() or 0)
-    want = [] if not config().get("dashboard", True) else \
-        ["queue", "status"] if width >= DASH_WIDE else ["both"] if width >= DASH_NARROW else []
+    want = ["queue", "status"] if config().get("dashboard", True) and width >= DASH_MIN else []
+    # "both" is the combined pane earlier versions put in a narrower window
     have = {role: p for p, role, _ in window_panes(sec) if role in ("queue", "status", "both")}
     if sorted(have) == sorted(want):
         return
@@ -362,135 +366,322 @@ def arrange_dashboard(sess):
     if not want:
         return
     dash = f"{hook_cmd()} dashboard show"
-    right = tmux("split-window", "-d", "-h", "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
-                 "-P", "-F", "#{pane_id}", f"{dash} {want[0]}").strip()
-    tmux("set-option", "-p", "-t", right, "@claudesec-role", want[0], check=False)
-    if len(want) == 2:
-        below = tmux("split-window", "-d", "-v", "-l", "55%", "-t", right, "-c", str(HOME),
-                     "-P", "-F", "#{pane_id}", f"{dash} {want[1]}").strip()
-        tmux("set-option", "-p", "-t", below, "@claudesec-role", want[1], check=False)
+    top = tmux("split-window", "-d", "-h", "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
+               "-P", "-F", "#{pane_id}", f"{dash} queue").strip()
+    tmux("set-option", "-p", "-t", top, "@claudesec-role", "queue", check=False)
+    below = tmux("split-window", "-d", "-v", "-l", "50%", "-t", top, "-c", str(HOME),
+                 "-P", "-F", "#{pane_id}", f"{dash} status").strip()
+    tmux("set-option", "-p", "-t", below, "@claudesec-role", "status", check=False)
     tmux("select-pane", "-t", sec, check=False)  # focus stays with the secretary
 
 
-def fit(text, cols):
-    """Cut a line to cols display columns."""
-    out, used = "", 0
-    for ch in text:
-        w = width(ch)
-        if used + w > cols:
-            return out[:-1] + "…" if out else ""
-        out, used = out + ch, used + w
+# A dashboard line is a list of (style, text) segments, style an SGR parameter string ("" plain);
+# `paint` turns one into what the terminal gets.
+BOLD, DIM, REV, RED, GREEN, YELLOW, CYAN = "1", "2", "7", "31", "32", "33", "36"
+CLOSING, OPENING = set("，。、；：？！）」』》】,.;:?!)]}…"), set("（「『《【([{")
+
+
+def paint(segs):
+    return "".join(f"\x1b[{style}m{text}\x1b[0m" if style else text for style, text in segs if text)
+
+
+def cut(text, cols):
+    """The longest start of text that fits in cols display columns."""
+    used = 0
+    for i, ch in enumerate(text):
+        used += width(ch)
+        if used > cols:
+            return text[:i]
+    return text
+
+
+def fit(segs, cols):
+    """segs cut to cols display columns, the last one fitting ending in "…"."""
+    out, used = [], 0
+    for style, text in segs:
+        if used + width(text) <= cols:
+            out.append((style, text))
+            used += width(text)
+            continue
+        if cols - used > 0:
+            out.append((style, cut(text, cols - used - 1) + "…"))
+        break
     return out
 
 
-def wrap(text, cols, indent="  "):
-    lines, cur, used = [], "", 0
-    for ch in text:
-        w = width(ch)
-        if used + w > cols:
-            lines.append(cur)
-            cur, used = indent, width(indent)
-        cur, used = cur + ch, used + w
-    return lines + [cur]
+def wrap(segs, first, rest=None):
+    """segs laid out in lines of first, then rest, display columns. Lines break at spaces and
+    between CJK characters, not inside a Latin word unless it's longer than a line, and not
+    before a closing mark or after an opening one."""
+    rest = first if rest is None else rest
+    toks = []
+    for style, text in segs:
+        for t in re.findall(r"[!-~]+|\s+|.", text):
+            prev = toks[-1] if toks else None
+            if prev and prev[0] == style and not t.isspace() and not prev[1].isspace() and (
+                    t[0] in CLOSING or prev[1][-1] in OPENING):
+                toks[-1] = (style, prev[1] + t)
+            else:
+                toks.append((style, t))
+    lines, used, room = [[]], 0, first
+    for style, t in toks:
+        if t.isspace():
+            if used and used + width(t) < room:
+                lines[-1].append((style, " "))
+                used += 1
+            elif used:
+                lines.append([])
+                used, room = 0, rest
+            continue
+        if used + width(t) > room and used:
+            while lines[-1] and lines[-1][-1][1] == " ":
+                lines[-1].pop()
+            lines.append([])
+            used, room = 0, rest
+        while width(t) > room:  # a word longer than a line
+            head = cut(t, room) or t[0]
+            lines[-1].append((style, head))
+            lines.append([])
+            t, used, room = t[len(head):], 0, rest
+        lines[-1].append((style, t))
+        used += width(t)
+    return lines
 
 
-def queue_lines(cols):
-    """The undecided part of queue.md: 待问 and 已问未答, one wrapped item each."""
-    path = HOME / "queue.md"
-    text = path.read_text() if path.exists() else ""
-    out, section = [], None
+def bar(left, right, cols):
+    """A full-width title bar: left at the start, right at the end; only right when both
+    don't fit."""
+    gap = cols - width(left) - width(right)
+    text = left + " " * gap + right if gap >= 2 else cut(" " + right.strip(), cols)
+    return [(BOLD + ";" + REV, text + " " * (cols - width(text)))]
+
+
+def heading(label, cols):
+    return [(BOLD, label), (DIM, " " + "─" * max(0, cols - width(label) - 1))]
+
+
+def ago(stamp, now=None):
+    """How long ago an ISO time or date was: 5m, 3h, 2d."""
+    now = now or dt.datetime.now().astimezone()
+    t = dt.datetime.fromisoformat(stamp)
+    if t.tzinfo is None:
+        t = t.astimezone()
+    secs = max(0, (now - t).total_seconds())
+    return f"{int(secs // 60)}m" if secs < 3600 else f"{int(secs // 3600)}h" if secs < 86400 \
+        else f"{int(secs // 86400)}d"
+
+
+PRIORITY = {"高": RED, "中": YELLOW, "低": DIM}
+
+
+def queue_items(text):
+    """The undecided items of queue.md: (section, tag, body, note), section "ask" (待问) or
+    "asked" (已问未答), note the trailing （中，…） or the date it was asked."""
+    items, section = [], None
     for line in text.splitlines():
         if line.startswith("## "):
             section = "ask" if "待问" in line else "asked" if "已问未答" in line else None
-            if section:
-                out.append(("\x1b[1m" + ("待问" if section == "ask" else "已问未答") + "\x1b[0m", True))
             continue
-        if section and re.match(r"\s*(\d+\.|-)\s+\S", line):
-            item = re.sub(r"^\s*(\d+\.|-)\s+", "", line.strip())
-            for i, part in enumerate(wrap(("· " if section == "ask" else "… ") + item, cols)):
-                out.append((part, False))
-    out = [x for i, x in enumerate(out)  # an empty section says so
-           for x in ([x] + ([("  （无）", False)] if x[1] and (i + 1 == len(out) or out[i + 1][1]) else []))]
-    counts = [sum(1 for l, head in out if not head and l.startswith(m)) for m in ("· ", "… ")]
-    title = f"\x1b[7m 决策队列  待问 {counts[0]} · 已问未答 {counts[1]} \x1b[0m"
-    body = [l for l, _ in out] if any(counts) else ["（空）"]
-    return [title, *body]
+        m = re.match(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(\S.*)", line)
+        if not section or not m:
+            continue
+        body = m[1].strip()
+        tag = re.match(r"\[([^\]]+)\]\s*", body)
+        if tag:
+            tag, body = tag[1], body[tag.end():]
+        note = re.match(r"(\d{4}-\d{2}-\d{2})\s*已问[:：]\s*", body)
+        if note:
+            note, body = note[1], body[note.end():]
+        else:
+            note = re.search(r"\s*（([^（）]*)）\s*$", body)
+            if note and note[1][:1] in PRIORITY:
+                note, body = note[1], body[:note.start()]
+            else:
+                note = None
+        items.append((section, tag, body, note))
+    return items
 
 
-def status_lines(cols):
+def queue_lines(cols):
+    """The decision queue pane: (title bar, body lines)."""
+    path = HOME / "queue.md"
+    items = queue_items(path.read_text() if path.exists() else "")
+    ask = [i for i in items if i[0] == "ask"]
+    asked = [i for i in items if i[0] == "asked"]
+    title = bar(" 决策队列", f"待问 {len(ask)} · 已问未答 {len(asked)} ", cols)
+    if not items:
+        return title, [[(DIM, "没有要你定的事。")]]
+    body = []
+    for label, group in (("待问", ask), ("已问未答", asked)):
+        body.append(heading(f"{label} {len(group)}", cols))
+        if not group:
+            body.append([(DIM, "  （无）")])
+        for section, tag, text, note in group:
+            if section == "asked":  # ▫ asked, waiting for the answer; ▪ to ask, colored by priority
+                days = (dt.date.today() - dt.date.fromisoformat(note)).days if note else None
+                mark, color, tail = "▫", DIM, "" if days is None else \
+                    "（今天问的）" if days < 1 else "（昨天问的）" if days == 1 else f"（{days} 天前问的）"
+            else:
+                mark, color, tail = "▪", PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
+            segs = ([(CYAN + ";" + BOLD, tag), ("", " ")] if tag else []) + [("", text), (DIM, tail)]
+            lines = wrap(segs, cols - 2)
+            body += [[(color, mark), ("", " ")] + lines[0]] + [[("", "  ")] + line for line in lines[1:]]
+    return title, body
+
+
+# How each status shows in the progress pane: group (the order they're listed in), mark, word, color
+STATUS_LOOK = {
+    "NEED_DECISION": (0, "!", "要你拍板", YELLOW),
+    "BLOCKED": (0, "!", "卡住了", YELLOW),
+    "WAITING_PERMISSION": (0, "!", "等你批权限", YELLOW),
+    "API_ERROR": (1, "✗", "API 出错", RED),
+    "FAILED": (1, "✗", "失败了", RED),
+    "STARTING": (2, "▸", "启动中", CYAN),
+    "PROGRESS": (2, "▸", "进行中", GREEN),
+    "DONE": (3, "✓", "做完了", DIM),
+}
+
+
+def status_lines(cols, now=None):
+    """The progress pane: (title bar, body lines)."""
     focus, workers = read_registry()
     alive = alive_windows()
     active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
     shelved = [n for n, w in workers.items() if w["status"] == "SHELVED"]
-    waiting = sum(1 for w in active.values() if w["status"] in WAITING)
-    out = [f"\x1b[7m 任务进展  在跑 {len(active)} · 等你 {waiting} · 搁置 {len(shelved)} \x1b[0m"]
+    rows = []
     for name, w in active.items():
-        status = LABELS.get(w["status"], w["status"])
-        if w.get("mode") == "discuss" and w["status"] not in ("DONE", "FAILED"):
-            status = "讨论中"
-        if w.get("window") not in alive and w["status"] not in ("DONE", "FAILED"):
-            status += "(关)"
-        age = ""
-        if w.get("last_report_at"):
-            secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
-            age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.0f}h"
-        summary = (w.get("pending_ask") if w["status"] in LABELS else w.get("last_summary") or w["task"])
-        summary = (f"[为 {w['delegated_by']}] " if w.get("delegated_by") else "") + summary.replace("\n", " ")
-        flag = "←" if w["status"] in WAITING else ("*" if name == focus else " ")
-        head = f"{flag}{name} {status} {age}".rstrip()
-        color = "\x1b[33m" if w["status"] in WAITING else "\x1b[31m" if w["status"] in ("FAILED", "API_ERROR") else ""
-        out.append(color + fit(head, cols) + ("\x1b[0m" if color else ""))
-        out.append("\x1b[2m" + fit("   " + summary, cols) + "\x1b[0m")
-    if not active:
-        out.append("没有在跑的 worker。")
+        group, mark, word, color = STATUS_LOOK.get(w["status"], (2, "▸", w["status"], ""))
+        if w.get("mode") == "discuss" and group == 2:
+            word, color = "讨论中", CYAN
+        if w.get("window") not in alive and group < 3 and w["status"] != "FAILED":
+            word += " · 窗口关了"
+        if group == 0 or w["status"] == "API_ERROR":
+            summary = w.get("pending_ask") or w.get("last_summary") or w["task"]
+        else:
+            summary = w.get("last_summary") or w["task"]
+        summary = " ".join(summary.split())
+        if w.get("delegated_by"):
+            summary = f"为 {w['delegated_by']}：{summary}"
+        rows.append((group, -(dt.datetime.fromisoformat(w["last_report_at"]).timestamp()
+                              if w.get("last_report_at") else 0), name, mark, word, color, summary,
+                     ago(w["last_report_at"], now) if w.get("last_report_at") else ""))
+    rows.sort()
+    counts = [sum(1 for r in rows if r[0] == g) for g in range(4)]
+    right = " · ".join(f"{label} {n}" for label, n in zip(("等你", "出错", "在做", "做完"), counts) if n)
+    title = bar(" 任务进展", (right + f" · 搁置 {len(shelved)} " if right else f"搁置 {len(shelved)} "), cols)
+    body = []
+    name_w = min(max((width(r[2]) for r in rows), default=0), 16)
+    for group, _, name, mark, word, color, summary, age in rows:
+        name_style = BOLD + (";4" if name == focus else "")
+        head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "), (name_style, cut(name, name_w).ljust(name_w)), ("", "  "),
+                (color, word)]
+        gap = cols - sum(width(t) for _, t in head) - width(age)
+        body.append(head + [("", " " * gap), (DIM, age)] if gap >= 1 else fit(head, cols))
+        body.append([("", "  ")] + fit([(DIM, summary)], cols - 2))
+    if not rows:
+        body.append([(DIM, "没有在跑的 worker。")])
     if shelved:
-        out += [""] + wrap("搁置：" + "、".join(shelved), cols)
+        lines = wrap([(BOLD, f"搁置 {len(shelved)}"), ("", "  "), (DIM, "、".join(shelved))], cols, cols - 2)
+        body += [[], lines[0]] + [[("", "  ")] + line for line in lines[1:]]
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
     if pending:
-        out += ["", "\x1b[1m提醒\x1b[0m"]
+        body += [[], heading(f"提醒 {len(pending)}", cols)]
         for r in pending:
             t = dt.datetime.fromisoformat(r["due"]).astimezone()
-            out.append(fit(f"{t:%m-%d %H:%M} {r['target']}：{r['text']}", cols))
-    return out
+            body.append(fit([(DIM, f"{t:%m-%d %H:%M}"), ("", " "), (CYAN, r["target"]), ("", "  "),
+                             ("", " ".join(r["text"].split()))], cols))
+    return title, body
 
 
-def dash_frame(what, cols, rows):
-    if what == "both":
-        q = queue_lines(cols)
-        lines = q[:max(4, rows // 2 - 1)] + [""] + status_lines(cols)
+def dash_view(title, body, rows, top):
+    """The rows the pane shows: the title, then body from line `top` on, with a note above and
+    below when there is more that way. Returns (lines, top) with top kept in range."""
+    room = rows - 1
+    if len(body) <= room or room < 3:
+        return [title] + body[:room], 0
+    top = max(0, min(top, len(body) - room + 1))
+    above = [[(DIM, f"  ↑ 上面还有 {top} 行")]] if top else []
+    shown = room - len(above)
+    if top + shown < len(body):
+        shown -= 1
+        below = [[(DIM, f"  ↓ 下面还有 {len(body) - top - shown} 行（滚轮 / ↑↓ 翻）")]]
     else:
-        lines = queue_lines(cols) if what == "queue" else status_lines(cols)
-    if len(lines) > rows:
-        lines = lines[:rows - 1] + [f"\x1b[2m…还有 {len(lines) - rows + 1} 行\x1b[0m"]
-    return "\n".join(lines)
+        below = []
+    return [title] + above + body[top:top + shown] + below, top
+
+
+def scroll_by(data, page):
+    """How many lines a burst of input from the pane's terminal scrolls: the mouse wheel,
+    ↑↓ j k, PgUp PgDn b space, Home End g G."""
+    big = 1 << 20
+    keys = {b"\x1b[A": -1, b"\x1bOA": -1, b"k": -1, b"\x1b[B": 1, b"\x1bOB": 1, b"j": 1,
+            b"\x1b[5~": -page, b"b": -page, b"\x1b[6~": page, b" ": page,
+            b"\x1b[H": -big, b"\x1bOH": -big, b"\x1b[1~": -big, b"g": -big,
+            b"\x1b[F": big, b"\x1bOF": big, b"\x1b[4~": big, b"G": big}
+    total = 0
+    for m in re.finditer(rb"\x1b\[<(\d+);\d+;\d+[Mm]|\x1b\[[0-9;]*[~A-Za-z]|\x1bO.|.", data, re.S):
+        if m[1] is not None:  # SGR mouse report; 64/65 are the wheel, 4/8/16 shift/meta/ctrl
+            total += {64: -3, 65: 3}.get(int(m[1]) & ~28, 0)
+        else:
+            total += keys.get(m[0], 0)
+    return total
 
 
 def show_dashboard(what):
-    """The loop in a dashboard pane: redraw when the content or the pane size changes; leave
-    when the secretary's pane is gone, which closes the window with it."""
+    """The loop in a dashboard pane: redraw when the content or the pane size changes, scroll
+    on the wheel and keys; leave when the secretary's pane is gone, which closes the window
+    with it."""
     me = os.environ.get("TMUX_PANE", "")
-    sys.stdout.write("\x1b[?25l")  # no cursor
-    last = None
-    while True:
-        roles = [role for _, role, _ in window_panes(me)] if me else ["secretary"]
-        if "secretary" not in roles:
-            return
-        size = shutil.get_terminal_size()
-        try:
-            frame = dash_frame(what, size.columns - 1, size.lines)
-        except Exception as e:  # a half-written file, a bad entry: show it, try again
-            frame = f"（读状态出错，{DASH_REFRESH} 秒后重试）\n{e!r}"
-        if (frame, size) != last:
-            sys.stdout.write("\x1b[H\x1b[2J" + frame)
-            sys.stdout.flush()
-            last = (frame, size)
-        time.sleep(DASH_REFRESH)
+    fd = sys.stdin.fileno()
+    saved = None
+    with contextlib.suppress(termios.error):
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    # a resize (the split that makes the pane, a terminal change) wakes the loop at once
+    wake, waker = os.pipe()
+    os.set_blocking(waker, False)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+    signal.set_wakeup_fd(waker)
+    # own screen (nothing piles up in tmux's history), no cursor, wheel events as SGR reports
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
+    top, shown, content, due = 0, None, None, 0
+    try:
+        while True:
+            size = shutil.get_terminal_size()
+            if time.monotonic() >= due or content is None or content[0] != size:
+                roles = [role for _, role, _ in window_panes(me)] if me else ["secretary"]
+                if "secretary" not in roles:
+                    return
+                try:
+                    content = (size, *(queue_lines if what == "queue" else status_lines)(size.columns - 1))
+                except Exception as e:  # a half-written file, a bad entry: show it, try again
+                    content = (size, [(REV, f" 读状态出错，{DASH_REFRESH} 秒后重试 ")], [[("", repr(e))]])
+                due = time.monotonic() + DASH_REFRESH
+            lines, top = dash_view(content[1], content[2], size.lines, top)
+            frame = "\x1b[K\r\n".join(paint(fit(line, size.columns - 1)) for line in lines)
+            if frame != shown:
+                sys.stdout.write("\x1b[H" + frame + "\x1b[K\x1b[J")
+                sys.stdout.flush()
+                shown = frame
+            ready, _, _ = select.select([fd, wake] if saved else [wake], [], [], max(0.0, due - time.monotonic()))
+            if wake in ready:
+                os.read(wake, 512)
+            if fd in ready:
+                data = os.read(fd, 4096)
+                if not data:
+                    return
+                top += scroll_by(data, max(1, size.lines - 3))
+    finally:
+        sys.stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def cmd_dashboard(args):
     sess = config()["tmux_session"]
     if args.action == "show":
-        show_dashboard(args.what or "both")
+        show_dashboard(args.what or "status")
         return
     if args.action in ("on", "off"):
         path = HOME / "config.json"
@@ -2550,7 +2741,7 @@ def main():
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
     s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
-    s.add_argument("what", nargs="?", choices=["queue", "status", "both"]); s.set_defaults(fn=cmd_dashboard)
+    s.add_argument("what", nargs="?", choices=["queue", "status"]); s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)

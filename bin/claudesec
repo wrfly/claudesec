@@ -13,6 +13,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec remind WHEN TARGET TEXT     wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO) with TEXT
                                     for TARGET (a worker or `secretary`); --list [--all], --cancel ID
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
+  claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
+  claudesec wait N                       the delegator waits for N's final report (background Bash)
   claudesec status                       one-screen table of workers
   claudesec log NAME [-n N]              last N report entries of a worker
   claudesec interrupt NAME               send Escape to a worker's window
@@ -33,6 +35,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import functools
+import io
 import json
 import os
 import re
@@ -71,9 +74,7 @@ DEFAULT_CONFIG = {
     "cursor_worker_model": "gemini-4-argon-high",  # best CursorBench 4.0 score this account can use
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
 }
-# DELEGATE: a worker handing a small self-contained job to the secretary for a Cursor worker; it may
-# end its turn there, waiting for the result.
-TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION", "DELEGATE"}
+TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
 LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}
@@ -516,7 +517,7 @@ def cmd_spawn(args):
         sys.exit(f"{name} is a shelved worker: `claudesec wake {name}` it, or `claudesec close {name}` to forget it")
     if old and old.get("window") in alive_windows():
         sys.exit(f"worker {name} is already running in window {old['window']}")
-    task = sys.stdin.read().strip()
+    task = getattr(args, "task", None) or sys.stdin.read().strip()
     if not task:
         sys.exit("empty task: pass the user's words on stdin")
     project = str(Path(args.dir).expanduser().resolve())
@@ -530,6 +531,8 @@ def cmd_spawn(args):
     if args.discuss:
         initial = (f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
                    "这是讨论模式：用户现在就在看你这个窗口，直接跟用户对话。规则见系统提示里的「讨论模式」。\n")
+    elif args.for_worker:
+        initial = f"worker {args.for_worker} 委托给你的任务（它写的任务书原文）：\n\n{task}\n"
     else:
         initial = f"秘书派给你的任务（用户原话）：\n\n{task}\n"
     d = prepare_worker(name, cfg, initial, agent=args.agent)
@@ -546,7 +549,8 @@ def cmd_spawn(args):
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
         }
-        reg["focus"] = name
+        if not args.for_worker:  # a delegated one is its delegator's business, not the user's focus
+            reg["focus"] = name
     append_log(name, "task", task)
     if args.discuss:
         # The user talks to a discussion worker directly, so take them there now.
@@ -566,7 +570,7 @@ def prepare_worker(name, cfg, initial, fresh_log=True, agent="claude"):
     (d / "reported").unlink(missing_ok=True)
     prompt = (PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text()
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
-              .replace("{{CLAUDESEC}}", str(SELF)))
+              .replace("{{CLAUDESEC}}", hook_cmd()))
     (d / "prompt.md").write_text(prompt)
     (d / "initial.md").write_text(initial)
     (d / "waiting-permission").unlink(missing_ok=True)
@@ -1638,8 +1642,7 @@ def record_report(name, text):
         if w is not None:
             w["status"] = typ
             w["last_report_at"] = now()
-            w["last_summary"] = (r.get("DID") or (typ == "DELEGATE" and "委托：" + r.get("TASK", "")) or text
-                                 ).splitlines()[0][:200]
+            w["last_summary"] = (r.get("DID") or text).splitlines()[0][:200]
             w["pending_ask"] = r.get("ASK") if typ == "NEED_DECISION" else None
         if typ in TERMINAL:
             reg["focus"] = name
@@ -1654,18 +1657,38 @@ def record_report(name, text):
 
 def cmd_report(args):
     """A Cursor worker's report (it has no SendMessage): recorded like a Claude Code worker's,
-    then delivered to the secretary through the alert channel, which wakes it."""
+    then delivered to the secretary through the alert channel, which wakes it; a delegated
+    worker's goes to its delegator instead (see cmd_wait)."""
     if args.name not in read_registry()[1]:
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
     record_report(args.name, text)
     boss = read_registry()[1][args.name].get("delegated_by")
-    via = (f"（委托人 {boss}：除 PROGRESS 外，用 SendMessage(to: \"{boss}\") 把下面原文转给它）" if boss else "")
-    if secretary_alive():
-        raise_alert(f"{CURSOR_REPORT}「{args.name}」{via}：\n{text}")
+    if boss:
+        # Straight back to the delegator, whose `claudesec wait` reads it off the log. The
+        # secretary sees the status; it is woken only for what may need it or the user.
+        r = parse_report(text)
+        typ = r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
+        if typ in ("FAILED", "BLOCKED"):
+            why = (r.get("ISSUE") or r.get("DID") or text).splitlines()[0][:120]
+            receipt(f"{args.name}（为 {boss}）{typ}：{why}")
+        if typ == "DONE":
+            (worker_dir(args.name) / "finish").write_text(now())  # archived and closed when the turn ends
+        print(f"reported to {boss}")
+    elif secretary_alive():
+        raise_alert(f"{CURSOR_REPORT}「{args.name}」：\n{text}")
         print(f"reported to {config()['secretary_name']}")
     else:
         print("recorded; the secretary is not running and will see it in `claudesec log`")
+
+
+def send_text(name, w, text, by="secretary"):
+    """Paste text into a Cursor worker's window as one message."""
+    subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=text, text=True, check=True)
+    tmux("paste-buffer", "-p", "-d", "-b", "claudesec-send", "-t", w["window"])
+    time.sleep(0.5)  # Enter apart from the paste, as when typed by hand
+    tmux("send-keys", "-t", w["window"], "Enter")
+    append_log(name, f"{by}→worker", text)
 
 
 def cmd_send(args):
@@ -1677,14 +1700,154 @@ def cmd_send(args):
     if not cursor_running(w):
         sys.exit(f"{args.name} has no running agent (status {w['status']}); `claudesec wake {args.name}` it first")
     text = sys.stdin.read().strip() or sys.exit("empty message: pass it on stdin")
-    subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=text, text=True, check=True)
-    tmux("paste-buffer", "-p", "-d", "-b", "claudesec-send", "-t", w["window"])
-    time.sleep(0.5)  # Enter apart from the paste, as when typed by hand
-    tmux("send-keys", "-t", w["window"], "Enter")
+    send_text(args.name, w, text)
     with registry() as reg:
         reg["focus"] = args.name
-    append_log(args.name, "secretary→worker", text)
     print(f"sent to {args.name}" + (" (it is busy: queued until its turn ends)" if worker_busy(args.name, w) else ""))
+
+
+# ---------- delegation: a worker hands a small job to a Cursor worker ----------
+# All by script, so neither the task nor the result passes through the secretary's context:
+# `claudesec delegate` spawns (or messages) the Cursor worker on the spot, the Cursor worker's
+# reports land in its log, and the delegator's `claudesec wait` reads them from there. The
+# secretary sees it all in `claudesec status` and is woken only for what may need it: FAILED,
+# BLOCKED, a dialog, a guard overridden. A task that looks like it goes beyond a small job is
+# refused back to the delegator, who either does it itself or says why it's fine (--ack).
+
+DELEGATE_GUARD = [
+    ("push / merge", r"\bgit\s+push\b|\bpush\b|\bmerge\b|合入|合并到|\bMR\b|\bPR\b"),
+    ("部署 / 发版", r"部署|发版|上线|发布|\bdeploy|\brelease\b|\brollout\b|回滚|\brollback\b"),
+    ("凭据", r"凭据|凭证|密码|私钥|\bcredential|\bpassword|\bsecret|\btoken|\bAK\b|\bSK\b|access[ _-]?key"
+           r"|\.ssh\b|\.pem\b|\bcookie"),
+    ("对外发消息", r"发消息|发送消息|发到群|群里|通知.{0,6}(用户|群|人)|邮件|\bemail|\bslack|\bwebhook|\blark-cli\s+im"
+                   r"|send[ _-]?message"),
+    ("删除 / 改线上数据", r"\brm\s+-rf\b|\bdrop\s+table\b|\bdelete\s+from\b|\btruncate\b|删库|删表"),
+]
+
+
+def delegate_guard(task):
+    """The categories a task's words hit; a hit is refused back to the delegator."""
+    return [what for what, pat in DELEGATE_GUARD if re.search(pat, task, re.IGNORECASE)]
+
+
+def receipt(line):
+    """One line waking the secretary, about delegated work that may need it."""
+    if secretary_alive():
+        raise_alert(f"[委托回执] {line}")
+
+
+def cmd_delegate(args):
+    workers = read_registry()[1]
+    boss = args.boss
+    if boss not in workers:
+        sys.exit(f"no worker {boss}: the first argument is your own worker name")
+    task = sys.stdin.read().strip() or sys.exit("empty task: pass the task brief on stdin")
+    name = args.name
+    if not NAME_RE.match(name):
+        sys.exit(f"bad name {name!r}: lowercase letters, digits, dashes")
+    hits = delegate_guard(task)
+    if hits and not args.ack:
+        append_log(boss, "delegate-refused", f"{name}: hits {', '.join(hits)}\n{task}")
+        sys.exit(f"NOT DELEGATED: the task mentions {' / '.join(hits)}. Cursor workers only get small jobs "
+                 f"with none of that. If the task really does that, do it yourself (or report to the "
+                 f"secretary). If the words are innocent (e.g. counting tokens, reading a deploy log), "
+                 f"run again with --ack \"<why it's fine>\".")
+    ack = f"（越界检查命中 {' / '.join(hits)}，{boss} 确认：{args.ack}）" if hits else ""
+    # What `wait` reads from: log entries from here on, and turn ends after this moment. A fresh
+    # spawn starts a fresh log; a message to a running one counts from its current length.
+    since, start = time.time(), 0
+    w = workers.get(name)
+    if w:
+        if w.get("delegated_by") != boss or not is_cursor(w):
+            sys.exit(f"{name} is taken and isn't a Cursor worker you delegated to; pick another --name")
+        if not cursor_running(w):
+            sys.exit(f"{name} has no running agent any more (status {w['status']}); delegate under a new --name")
+        if ack:
+            append_log(name, "ack", ack)
+        (worker_dir(name) / "finish").unlink(missing_ok=True)
+        start = len(read_log(name))
+        send_text(name, w, task, by=boss)
+        verb = "sent to"
+    else:
+        project = str(Path(args.dir or workers[boss]["dir"]).expanduser().resolve())
+        if not Path(project).is_dir():
+            sys.exit(f"--dir {project}: no such directory")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            err = quietly(cmd_spawn, name=name, dir=project, model=args.model, discuss=False, agent="cursor",
+                          for_worker=boss, task=task)
+        if err:
+            sys.exit(f"NOT DELEGATED: spawning {name} failed: {err}\n{out.getvalue()}")
+        if ack:
+            append_log(name, "ack", ack)
+        if "STUCK ON A DIALOG" in out.getvalue():
+            receipt(f"{boss} 委托 {name} 时 Cursor 卡在对话框上，要用户切到窗口 {name} 处理")
+        print(out.getvalue().rstrip())
+        verb = "spawned"
+    (worker_dir(name) / "delegation.json").write_text(json.dumps({"by": boss, "since": since, "log_start": start}))
+    append_log(boss, "delegated", f"{name}{ack}\n{task}")
+    if ack:
+        receipt(f"{boss} 委托了 {name}：{task.splitlines()[0][:80]}{ack}")
+    print(f"{verb} Cursor worker {name}. To get its result, run in a background Bash:\n"
+          f"  {hook_cmd()} wait {name}\n"
+          f"It prints the report when {name} sends DONE / FAILED / BLOCKED / NEED_DECISION, or why it stopped.")
+
+
+def cmd_wait(args):
+    """Block until a delegated Cursor worker sends a final report after its latest task, and
+    print it. Also returns (exit 1) when it can't come: the turn errored or ended without a
+    report (marked by its stop hook), or the agent is gone. For the delegator's background Bash."""
+    name, d = args.name, HOME / "workers" / args.name
+    try:
+        mark = json.loads((d / "delegation.json").read_text())
+        since, start = mark["since"], mark["log_start"]
+    except (OSError, ValueError, KeyError):
+        sys.exit(f"{name} has no delegation to wait for")
+
+    def after(f):
+        return f.exists() and f.stat().st_mtime > since
+
+    deadline = time.time() + args.timeout
+    while True:
+        for header, body in read_log(name)[start:]:
+            if header.endswith(" worker→secretary"):
+                typ = (parse_report(body).get("TYPE") or "").split()[:1]
+                if typ and typ[0] in TERMINAL:
+                    print(f"Cursor worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}")
+                    return
+        w = read_registry()[1].get(name)
+        if w is None:
+            sys.exit(f"{name} was closed without a final report; `claudesec log {name}` has what it said")
+        if after(d / "ended-error"):
+            sys.exit(f"{name}: its turn ended with an error. Tell it to carry on: "
+                     f"`claudesec delegate <you> --name {name}` with a short note, then wait again")
+        if after(d / "ended-unreported"):
+            sys.exit(f"{name} stopped without a final report; `claudesec peek {name}` to see where it is")
+        if not cursor_running(w):
+            sys.exit(f"{name}: its agent is no longer running (status {w['status']})")
+        if time.time() > deadline:
+            sys.exit(f"gave up after {args.timeout}s: {name} is still going; wait again, or peek")
+        time.sleep(3)
+
+
+def finish_later(name):
+    """A delegated worker that reported DONE is archived and closed once its turn is over, from
+    outside: this runs in its own stop hook, inside the window that gets killed."""
+    subprocess.Popen([str(SELF), "hook", "cursor-finish", name], env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def hook_cursor_finish(name):
+    time.sleep(2)
+    w = read_registry()[1].get(name)
+    if not w or not (worker_dir(name) / "finish").exists():
+        return  # given more work in the meantime, or already gone
+    did = next((parse_report(b).get("DID", "") for h, b in reversed(read_log(name))
+                if h.endswith("worker→secretary")), "")
+    quietly(cmd_archive, name=name, summary=f"为 {w.get('delegated_by')}：{did.splitlines()[0][:100] if did else ''}",
+            tags="delegated,cursor", files=None, subagent=False, task=None, dir=None)
+    quietly(cmd_close, name=name)
 
 
 def cursor_worker():
@@ -1733,17 +1896,19 @@ def hook_cursor_stop():
     if interrupted.exists():
         if data.get("status") != "completed" and time.time() - interrupted.stat().st_mtime < 30:
             idle()
+            (d / "ended-unreported").write_text(now())
             return
         interrupted.unlink(missing_ok=True)
     if data.get("status") == "error":
         idle()
+        (d / "ended-error").write_text(now())
         with registry() as reg:
             w = reg["workers"][name]
             if w["status"] not in ("API_ERROR", "WAITING_PERMISSION"):
                 w["status_before"] = w["status"]
             w.update(status="API_ERROR", pending_ask="Cursor: turn ended with status error", last_report_at=now())
         append_log(name, "api-error", "Cursor: turn ended with status error")
-        if w.get("mode") != "discuss":
+        if not w.get("delegated_by") and w.get("mode") != "discuss":  # a delegator's wait reports it
             raise_alert(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报。"
                         f"用 `claudesec send {name}` 让它从中断处继续。")
         return
@@ -1753,13 +1918,20 @@ def hook_cursor_stop():
             w["status"] = w.pop("status_before", None) or "PROGRESS"
             w["pending_ask"] = None
     marker = d / "reported"
-    if data.get("status") != "completed" or w.get("mode") == "discuss" or not secretary_alive() or marker.exists():
+    nobody = not w.get("delegated_by") and not secretary_alive()
+    if data.get("status") != "completed" or w.get("mode") == "discuss" or nobody or marker.exists():
+        if not marker.exists():
+            (d / "ended-unreported").write_text(now())
         marker.unlink(missing_ok=True)  # aborted by the user, a discussion turn, nobody to tell, or reported
         idle()
+        if (d / "finish").exists() and data.get("status") == "completed":
+            finish_later(name)
         return
     if data.get("loop_count", 0) >= CURSOR_NAGS:
         idle()
-        raise_alert(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。")
+        (d / "ended-unreported").write_text(now())
+        if not w.get("delegated_by"):  # a delegator's wait reports it
+            raise_alert(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。")
         return
     print(json.dumps({"followup_message":
         f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
@@ -1789,7 +1961,7 @@ def hook_worker_stop(name):
     sec = config()["secretary_name"]
     print(json.dumps({"decision": "block", "reason":
         f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
-        "DONE / FAILED / BLOCKED / NEED_DECISION / DELEGATE 之一（PROGRESS 不算）。"
+        "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
         "若用户刚在你的窗口直接跟你说过话，汇报里注明。"}, ensure_ascii=False))
 
 
@@ -1983,6 +2155,7 @@ HOOKS = {
     "cursor-session-start": hook_cursor_session_start,
     "cursor-prompt": hook_cursor_prompt,
     "cursor-stop": hook_cursor_stop,
+    "cursor-finish": hook_cursor_finish,
 }
 
 
@@ -2025,6 +2198,10 @@ def main():
     s.add_argument("--cancel"); s.set_defaults(fn=cmd_remind)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
+    s = sub.add_parser("delegate"); s.add_argument("boss"); s.add_argument("--name", required=True)
+    s.add_argument("--dir"); s.add_argument("--model"); s.add_argument("--ack"); s.set_defaults(fn=cmd_delegate)
+    s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--timeout", type=int, default=4 * 3600)
+    s.set_defaults(fn=cmd_wait)
     s = sub.add_parser("lifecycle"); s.add_argument("job", choices=["shelve-all", "wake-all", "reminders"])
     s.add_argument("run_pid", type=int, nargs="?"); s.set_defaults(fn=cmd_lifecycle)
     s = sub.add_parser("archive"); s.add_argument("name"); s.add_argument("--summary")

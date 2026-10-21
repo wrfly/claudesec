@@ -403,6 +403,8 @@ claudesec                       切到/附着 tmux session "claudesec"（不存�
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
 claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] [--for WORKER] <<< 任务原文
+claudesec delegate ME --name N [--dir D] [--ack 理由] <<< 任务书   worker 把小活交给 Cursor worker
+claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
 claudesec remind WHEN TARGET 内容   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
@@ -463,20 +465,33 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - 真机：`claudesec -d` 起独立 session 里的秘书 → 模拟用户输入派单 → 秘书给收据、开 worker（进同一 session）
   → worker DONE 唤醒秘书 → 秘书推送一行并自行归档 → 「进展」一屏回答。
 
-### worker 把小活委托给 Cursor（TYPE: DELEGATE）
+### worker 把小活委托给 Cursor（`claudesec delegate` / `wait`）
 
-用户定了「独立、小任务尽量派 cursor 做」。原先 worker 不知道有这条路，Cursor 的结果也要秘书手动转回去。现在：
-- worker 规则（worker.md「把小活交给 Cursor」）写了够格的标准，以及 DELEGATE 汇报的字段：NAME、DIR、TASK（自包含任务书）。
-  worker 不自己 spawn，秘书要看得见、管得住所有 worker。DELEGATE 算终结类型，交出去后可以直接结束本轮等结果。
-- 秘书 `spawn --agent cursor --for <委托人>`，注册表记 `delegated_by`，status 的摘要前标「[为 X]」。
-- Cursor worker 的 `claudesec report` 告警里写明委托人，以及「除 PROGRESS 外用 SendMessage(to: X) 原样转」。
-  转发由秘书做，claudesec 不往委托人窗口里粘：Claude Code worker 的窗口可能正开着确认框（粘进去的回车会答掉它），
-  也可能用户正在里面打字；而且用户定过的原则是秘书居中。秘书的成本是每份汇报一次 SendMessage。
-- 委托人回答 Cursor worker 的问题，也用 DELEGATE，NAME 写已有的 Cursor worker 名，秘书 send 过去。
+用户定了「独立、小任务尽量派 cursor 做」。第一版让 worker 发 TYPE: DELEGATE 给秘书、秘书 spawn、Cursor 的汇报
+经秘书转回：一次委托的任务书和结果各过秘书上下文两遍（约 1–2 万 token），每一步还要秘书推理。现在全由脚本做：
+- worker 在 Bash 里跑 `claudesec delegate <自己> --name N [--dir D] <<< 任务书`：当场 `spawn --agent cursor --for <自己>`
+  （N 已经是它委托的、还在跑的 Cursor worker 就 send 过去，用来回答问题或追加）。spawn 的首条消息写明「worker X 委托」，
+  不抢秘书的焦点。
+- 越界检查是关键词规则（push / merge / MR、部署 / 发版 / 上线、凭据 / token / secret / .ssh、对外发消息、rm -rf / drop table），
+  命中就拒绝，并告诉委托人命中了什么。由委托人判断（用户定的，不经秘书）：真越界就自己做；字面误伤就加 `--ack "理由"` 重跑，
+  理由记日志，并叫醒秘书看一眼。规则宁可误伤：误伤的代价是委托人多跑一次。
+- 结果：Cursor 的 `claudesec report` 照常写日志和注册表；委托来的不再发告警。委托人在后台 Bash 跑 `claudesec wait N`：
+  从委托那一刻的日志位置往后找第一条 DONE / FAILED / BLOCKED / NEED_DECISION，打印原文后退出。Cursor 的 stop hook
+  在出错时写 `ended-error`、没汇报就停下（催够次数、被打断、中止）时写 `ended-unreported`，比委托时间新的就让 wait
+  带说明退出；窗口没了、worker 被 close 也退出。按日志位置而不是时间戳判断，是因为追加消息时上一轮可能还没结束，
+  它的 stop 晚于委托时间（实测踩过）。
+- 不往委托人窗口里粘：Claude Code worker 的窗口可能正开着确认框，也可能用户正在里面打字。后台 Bash 结束会把 worker 叫醒，
+  Claude Code 自带的机制，可靠。
+- 秘书：只看 `claudesec status`（「[为 X]」）。只为可能要它或用户处理的事叫醒它，即「[委托回执]」一行：FAILED、BLOCKED、
+  Cursor 卡在对话框上、`--ack` 放行。用户的取舍：「你只需要知道状态」；也不让委托人另外汇报一句，那要多花一轮，还得靠 LLM 记得发。
+- 收尾：Cursor 汇报 DONE 时写 `finish` 标记，这一轮结束（stop hook）后由一个脱离的进程归档（tag delegated）并 close。
+  在 stop hook 里直接 close 会杀掉自己所在的窗口。FAILED / BLOCKED / NEED_DECISION 不关，留给委托人追加或放弃。
 
-已验证（临时 CLAUDESEC_HOME）：DELEGATE 汇报记为终结状态、写 reported 标记、摘要取 TASK；`--for` 不存在的 worker 被拒；
-`--for boss` 开的 Cursor worker 真跑一轮，PROGRESS 和 DONE 的告警都带「委托人 boss」，status 显示「[为 boss]」。
-未验证：Claude Code worker 拿到新规则后，会不会在合适的时候主动发 DELEGATE（要真用时观察）。
+已验证（临时 CLAUDESEC_HOME，真 Cursor worker）：关键词拒绝；--ack 放行并叫醒秘书；DONE → wait 返回原文 → 自动归档、关窗口、
+秘书零告警；NEED_DECISION → wait 返回 → 同名追加答复 → wait 等到第二轮的 DONE（修正前这里会被上一轮的 stop 误判）；
+不汇报的一轮被 stop hook 催出 DONE；FAILED → wait 返回、秘书收到一行回执；interrupt 打断 → wait 报「停下没汇报」。
+16 个样例句子的关键词命中符合预期（「token 数」「release notes」「merge sort」会误伤，靠 --ack）。
+未验证：Claude Code worker 在真实任务里会不会用、后台 wait 结束后能不能顺利接着干（要真用时观察）。
 
 ### 定时提醒（`claudesec remind`）
 

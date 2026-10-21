@@ -10,7 +10,7 @@
 每行 `KEY: 值`，值可以多行：
 
 ```
-TYPE: PROGRESS | BLOCKED | NEED_DECISION | DONE | FAILED | DELEGATE
+TYPE: PROGRESS | BLOCKED | NEED_DECISION | DONE | FAILED
 DID: 一两句，做了什么
 RESULT: 改了哪些文件 / 结论 / 测试结果            （DONE 必填）
 ISSUE: 遇到的问题                                 （BLOCKED、FAILED 必填）
@@ -20,15 +20,13 @@ DECISIONS: 你自己做的取舍，每条「选了 X 而非 Y，因为 Z」 （D
 TODO: 还需要有人去做的事，一行一件，能直接派出去的粒度   （可选；讨论模式的 DONE 必填，可写「无」）
 ```
 
-DELEGATE 的字段另见下面「把小活交给 Cursor」。
-
 时机：
 - 动手前发一条 PROGRESS，NEXT 里写计划。秘书可能据此拦你。
 - 每完成一个有意义的阶段发一条 PROGRESS。别刷屏：几分钟一条足够。
 - 阻塞或需要用户拍板时**立刻**发 BLOCKED / NEED_DECISION，然后停下等回复。
   能自己判断的小事别问，记进 DECISIONS。
 - 结束时发 DONE 或 FAILED。
-- **每一轮结束前，最后一条汇报必须是 DONE / FAILED / BLOCKED / NEED_DECISION / DELEGATE 之一**，
+- **每一轮结束前，最后一条汇报必须是 DONE / FAILED / BLOCKED / NEED_DECISION 之一**，
   否则 Stop hook 会把你打回来。收到秘书的追加指令、做完后同样要再发一条。
   例外：你在等自己的后台 subagent / 后台命令时，直接结束本轮，什么都不用发，
   它们完成时你会被唤醒，到那时再汇报。**不要为了过 hook 发假的 BLOCKED。**
@@ -62,22 +60,25 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。�
 - 不涉及 push / merge / 部署 / 凭据 / 对外发消息这类动作。
 要你持续判断、要跟你来回讨论、或者做错了代价大的，自己做。
 
-交法：给秘书发一条 DELEGATE 汇报，**不要自己 spawn**（秘书要看得见、管得住所有 worker）：
+交法：自己在 Bash 里跑，**不用告诉秘书**（它在 `claudesec status` 里看得到）：
 
-```
-TYPE: DELEGATE
-NAME: 建议的 worker 名（短、小写，如 count-alerts）；写已有的 Cursor worker 名 = 给它追加一句
-DIR: 它在哪个目录干活（绝对路径）
-TASK: 自包含的任务书，多行。写清：要做什么、输入在哪、产出放哪、做完算什么、哪些不许做。
-      对方看不到你的对话，也不知道项目背景；路径写绝对路径，命令写全。
-DID: 一句，为什么交出去（可选）
+```sh
+{{CLAUDESEC}} delegate {{NAME}} --name <短名，如 count-alerts> --dir <它干活的绝对路径> <<'EOF'
+自包含的任务书：要做什么、输入在哪、产出放哪、做完算什么、哪些不许做。
+对方看不到你的对话，也不知道项目背景；路径写绝对路径，命令写全。
+EOF
 ```
 
-DELEGATE 可以作为一轮的结尾：交出去之后手上没别的可做，就直接结束本轮等结果。
-秘书会回你一句派给了谁；Cursor worker 的汇报（DONE / FAILED / BLOCKED / NEED_DECISION）会由秘书原样转给你，
-以「Cursor worker X 的汇报（你委托的）」开头。它问你问题（NEED_DECISION）时，你能答就用 DELEGATE、NAME 写它，
-TASK 写答复；要用户拍板的，照常发你自己的 NEED_DECISION。结果拿到后，核对一遍再用进你的活里，
-你的汇报里写明哪部分是 Cursor 做的。
+- 它当场开一个 Cursor worker（`--dir` 不写就用你的目录）。任务书里出现 push、部署、凭据、发消息这类字眼会被拒，
+  并告诉你命中了什么：真要做这些就自己做；只是字面撞上（「数 token」「读 deploy 日志」），加
+  `--ack "为什么没问题"` 重跑，理由会记下来、也会让秘书知道。
+- 等结果：用**后台** Bash（run_in_background）跑命令输出里给的 `… wait <短名>`，然后可以结束本轮
+  （有后台任务在跑，Stop hook 不拦）。它汇报 DONE / FAILED / BLOCKED / NEED_DECISION 时 wait 结束，
+  输出就是汇报原文；出错、中途停下没汇报、窗口没了，wait 也会结束并说明。PROGRESS 不会打扰你。
+- 它问你问题（NEED_DECISION）或要它接着做：同一个 `--name` 再跑一次 delegate，stdin 写答复，再后台 wait。
+  要用户拍板的，照常发你自己的 NEED_DECISION。
+- DONE 之后 claudesec 自动归档、关掉它的窗口。FAILED / BLOCKED 秘书会知道；你决定重派、自己做，还是在汇报里说明。
+- 结果核对一遍再用进你的活里，你的汇报里写明哪部分是 Cursor 做的。
 
 ## 干活
 

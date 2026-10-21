@@ -335,6 +335,7 @@ def cmd_run(args):
             "Stop": [{"hooks": [watch]}],
             "PostToolUse": [{"matcher": "SendMessage",
                              "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-prompt"}]}],
         },
     }, indent=2) + "\n")
     argv = ["claude", "-n", cfg["secretary_name"],
@@ -2060,6 +2061,30 @@ def hook_secretary_session_start():
     print("\n".join(out)[:9500])
 
 
+# Not the user's own words: peer messages, background-task notices, claudesec's alerts.
+NOT_USER = ("<cross-session-message", "<task-notification", "[claudesec", "<system-reminder")
+
+
+def hook_secretary_prompt():
+    """The first thing the user says on a given day starts that day's review. Tied to the user
+    showing up, not to a clock: no review on days off, and one, not several, after a break."""
+    data = hook_input()
+    if str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
+        return
+    today = dt.date.today().isoformat()
+    seen = HOME / "user-seen.date"
+    try:
+        last = seen.read_text().strip()
+    except OSError:
+        last = ""
+    if last == today:
+        return
+    seen.write_text(today + "\n")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext":
+        f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
+        "收据一行，再回应用户这条消息。"}}, ensure_ascii=False))
+
+
 def open_part(path):
     """A lessons or queue file up to its 「已处理」 section."""
     return path.read_text().split("\n## 已处理")[0]
@@ -2215,6 +2240,7 @@ HOOKS = {
     "worker-stop-failure": hook_worker_stop_failure,
     "secretary-session-start": hook_secretary_session_start,
     "secretary-send": hook_secretary_send,
+    "secretary-prompt": hook_secretary_prompt,
     "cursor-session-start": hook_cursor_session_start,
     "cursor-prompt": hook_cursor_prompt,
     "cursor-stop": hook_cursor_stop,

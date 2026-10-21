@@ -329,9 +329,10 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 
 `lessons.md` 格式：日期 · 信号类型 · 当时情况一句话 · 用户纠正原话。
 每日复盘（`claudesec review`，任务书在 prompts/review.md）：
-- 触发：秘书登记一条周期提醒 `claudesec remind 08:30 secretary "每日复盘：跑 claudesec review" --every 1d`。
-  08:30 在用户上班前，diff 等用户一来就能批；机器夜里关着的话，claudesec 下次启动时补发一次。
-  用户说「复盘」时随时跑。
+- 触发：用户当天第一次给秘书发消息时。秘书的 UserPromptSubmit hook 把日期记在 `~/.claudesec/user-seen.date`，
+  日期变了就给这一条注入「今天第一次见用户：先跑 claudesec review」。跟着用户出现走，不跟时钟：
+  周末、请假没人发消息就不复盘，隔几天回来也只跑一次（用户定的，原先的每日 08:30 定时提醒因此撤掉）。
+  跨会话消息、后台任务通知、claudesec 告警不算用户的消息。用户说「复盘」时随时跑。
 - 每天开一个新 worker（`review-MMDD`，在 claudesec 仓库目录），不 wake 长期的 `claudesec` worker：
   复盘用不到昨天的上下文，长期 worker 会把每天的复盘都背在上下文里。
 - 记忆（经验层）直接整理落盘，落盘前把目录拷到 `~/.claudesec/reviews/<日期>-memory-before/`。

@@ -177,6 +177,7 @@ tmux pane id，`SendMessage` 可互发。
   reports/<worker>.log       双向全部消息：task / worker→secretary / secretary→worker
   workers/<name>/            每个 worker 的 prompt.md、task.md、settings.json（hooks、autoMemoryDirectory）
   history/                   3.5
+  usage.json                 token 计数的缓存：每个 transcript 读到哪、累计多少（见「主窗口面板」）
   lessons.md                 3.6
   queue.md                   决策队列：要用户定的事按重要程度排队，秘书一次只问一件（首次启动时建）。
                              每条 `- #编号 [worker] 问题（中）`；编号由 `claudesec queue add` 给，跟着条目走
@@ -556,7 +557,13 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   `claudesec queue number` 给没编号的未定条目补号（老格式 `1.`、`0d.` 也认，补完改成 `- #N`）。没编号的条目面板上显示 `·`。
   不做成面板自己补号：面板是只读的，跟秘书的 Edit 同时写 queue.md 会互相覆盖。
 - 进展：按「等你（要你拍板 / 卡住了 / 等你批权限）→ 出错 → 在做（启动中 / 进行中 / 讨论中）→ 做完」排，同组新的在前；
-  每个 worker 折叠时一行：标记、名字、状态、距今；展开加上最后一次汇报（等你的显示它问的问题）。标题栏是各组计数。
+  每个 worker 折叠时一行：标记、名字、状态、距今、token；展开加上最后一次汇报（等你的显示它问的问题）和 token 明细。标题栏是各组计数。
+- token（面板和 `claudesec status`，含搁置表）：worker 会话 transcript 加它的 subagents 里每次回复的 usage 之和，
+  输入 + 缓存写 + 缓存读 + 输出合成一个数（1.2K / 3.4M）。合成一个数是因为表里放不下四列；大头是缓存读（这台机器上
+  通常占九成以上，单价是输入的十分之一），所以展开那行给四项明细。一次回复分几块流式写成几行、usage 相同，按 message id 只算一次。
+  Cursor worker 没有能读的 transcript，显示「-」；还没拿到 session id 的也是「-」。transcript 动辄上百 MB，
+  `usage.json` 按文件记着读到的位置和累计值，面板每 3 秒只读新追加的部分；没写完的半行留到下次。文件变短（被重写）就从头读。
+  history 归档不带 token：归档时会话可能还在继续，数会过时。
 - 两块各自能上下滚：鼠标滚轮（tmux `mouse on` 时；面板开了鼠标上报，tmux 把滚轮转给它，不进 copy mode）、
   焦点在面板上时（用 tmux 的切 pane 键切过去；点击会把焦点还给秘书）↑↓ / j k、PgUp PgDn / b 空格、Home End / g G。标题栏不动，上下有「还有 N 行」。
   内容刷新不重置滚动位置。面板用自己的屏幕（alternate screen），重画不会堆进 tmux 的历史。

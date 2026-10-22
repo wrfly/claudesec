@@ -305,7 +305,7 @@ class Dashboard(unittest.TestCase):
         # one line a worker, a blank line between groups, then the shelved
         self.assertEqual([h.split()[1] if h else "" for h in heads[:9]],
                          ["asks", "", "broke", "", "busy", "talk", "", "done", ""])
-        self.assertTrue(heads[0].endswith("1h") and heads[2].endswith("2d"), heads)
+        self.assertTrue(heads[0].endswith(" 1h  -") and heads[2].endswith(" 2d  -"), heads)  # no session: no tokens
         self.assertIn("窗口关了", heads[4])
         self.assertIn("讨论中", heads[5])
         self.assertTrue(heads[9].startswith("搁置 1"))

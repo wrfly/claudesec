@@ -2374,6 +2374,7 @@ def cmd_send(args):
         sys.exit(f"{args.name} has no running agent (status {w['status']}); `claudesec wake {args.name}` it first")
     text = sys.stdin.read().strip() or sys.exit("empty message: pass it on stdin")
     send_text(args.name, w, text)
+    mark_answered(args.name, text)
     with registry() as reg:
         reg["focus"] = args.name
     print(f"sent to {args.name}" + (" (it is busy: queued until its turn ends)" if worker_busy(args.name, w) else ""))
@@ -2712,6 +2713,20 @@ def hook_secretary_send():
             return
         reg["focus"] = to
     append_log(to, "secretary→worker", str(inp.get("message", "")))
+    mark_answered(to, str(inp.get("message", "")))
+
+
+def mark_answered(name, text):
+    """The secretary passed on the user's answer (「用户决策：…」): the worker no longer waits on
+    the user, though it reports again only once it has acted on it."""
+    if not text.lstrip().startswith("用户决策"):
+        return
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is None or w["status"] not in ("NEED_DECISION", "BLOCKED"):
+            return
+        line = text.lstrip().splitlines()[0]
+        w.update(status="PROGRESS", pending_ask=None, last_summary=f"已答，在处理：{line}"[:200])
 
 
 # ---------- dialogs: a worker waiting on the user ----------

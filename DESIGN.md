@@ -616,6 +616,8 @@ status 列出未到点的提醒。
 - 忙/闲：beforeSubmitPrompt 写 busy 标记，stop 清掉。没汇报就停下：stop 返回 `followup_message` 让它补发，
   最多 3 次，再不发就告警。stop 的 status 为 error 时记「API 出错」并告警；但 `claudesec interrupt`（Ctrl+C）
   打断的那一轮也报 error，所以 interrupt 先写标记，30 秒内的非 completed 结束都当作打断。
+  已经发过最终汇报（DONE / FAILED / BLOCKED / NEED_DECISION）之后这一轮才以 error 结束的，算正常结束：不改状态、不告警，
+  委托来的 DONE 照常归档关窗（实际发生过：开完 MR、报完 DONE，收尾那几句话撞上「Server error」，worker 被标成 API 出错留着没关）。
 - shelve / wake：会话在 `~/.cursor/chats/*/<chatId>` 就算还在；wake 用 `agent --resume <chatId>`，
   因为不触发 sessionStart，确认方式是 agent 画出界面并且活过 5 秒。没有 adopt。
 - 传输：agent 默认用 HTTP/2 连 agentn.us.api5.cursor.sh，本机（疑似 CorpLink 网关）会卡在「Connection stalled」，
@@ -623,7 +625,10 @@ status 列出未到点的提醒。
   `~/.cursor/hooks.json`，hook 全部失效。spawn / wake Cursor worker 时会检查这一项，没开就打 WARNING，
   说明后果和改法，但不替用户改文件，worker 照样开。
 - 模型：HTTP/1 下 Grok 4.7 仍每轮以「Server error」结束（交互、-p 都复现），stop 拿到 status=error；Auto 落到 Grok 4.7
-  时也一样。默认 `cursor_worker_model: "gpt-5.6-sol-high"`（GPT-5.6 Sol 1M High，用户 10-22 指定；HTTP/1 下交互 worker 和 -p 都跑通过一轮）。
+  时也一样。默认 `cursor_worker_model: "gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High，用户 10-22 指定；HTTP/1 下交互 worker 和 -p 都跑通过一轮）。
+  不能写 `gpt-5.6-sol-high`：`--list-models` 把它标成「1M High」，实际跑的是 272K（窗口底栏「GPT-5.6 Sol 272K High」）。
+  完整的 variant 串才是 1M，参数顺序也得照这个写，换顺序或多加参数会报「Cannot use this model」。agent 每次启动都会把选中的
+  模型和参数写回 `~/.cursor/cli-config.json` 的 `model` / `modelParameters`，这是 Cursor 自己的行为，不是 claudesec 改的。
   之前默认 gemini-4-argon-high（本账号可用模型里 CursorBench 4.0 分最高），也能用。
 
 已验证（真机，Cursor agent 2026.10.19-6bbf2c4，临时 CLAUDESEC_HOME）：spawn → PROGRESS、DONE 经告警送达、注册表更新；

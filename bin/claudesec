@@ -79,7 +79,10 @@ DEFAULT_CONFIG = {
     "secretary_model": None,          # None = whatever claude defaults to
     "worker_model": "claude-opus-5-5",
     "worker_permission_mode": "auto",
-    "cursor_worker_model": "gpt-5.6-sol-high",  # GPT-5.6 Sol 1M High, the user's pick
+    # GPT-5.6 Sol 1M High, the user's pick. Not "gpt-5.6-sol-high": --list-models labels that slug
+    # 1M High, but it runs with a 272K context. Only the full variant string, parameters in this
+    # order, gets 1M.
+    "cursor_worker_model": "gpt-5.6-sol[context=1m,reasoning=high,fast=false]",
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
@@ -2577,6 +2580,15 @@ def hook_cursor_stop():
             (d / "ended-unreported").write_text(now())
             return
         interrupted.unlink(missing_ok=True)
+    if data.get("status") == "error" and (d / "reported").exists():
+        # It had sent its final report when the turn errored (in its closing words, say): the work
+        # is delivered, so this is an ordinary end, and a delegated worker's DONE is wrapped up.
+        (d / "reported").unlink(missing_ok=True)
+        idle()
+        append_log(name, "api-error", "Cursor: turn ended with status error after its final report; taken as the end")
+        if (d / "finish").exists():
+            finish_later(name)
+        return
     if data.get("status") == "error":
         idle()
         (d / "ended-error").write_text(now())

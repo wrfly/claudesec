@@ -56,6 +56,9 @@ import tty
 import unicodedata
 from pathlib import Path
 
+if sys.version_info < (3, 8):  # Path.unlink(missing_ok=), among others; Debian 10's python3 is 3.7
+    sys.exit(f"claudesec needs Python 3.8 or later; {sys.executable} is {sys.version.split()[0]}")
+
 HOME = Path(os.environ.get("CLAUDESEC_HOME", Path.home() / ".claudesec"))
 SELF = Path(__file__).resolve()
 REPO = SELF.parent.parent
@@ -1228,8 +1231,11 @@ def render_prompt(text):
 
 
 def check_cursor_http1():
-    """Over HTTP/2 the agent stalls on agentn.us.api5.cursor.sh here, whatever the model; say so
-    rather than leave a worker that never answers. Only a warning: the file is the user's."""
+    """Over HTTP/2 the agent stalls on agentn.us.api5.cursor.sh on the Mac's network, whatever the
+    model; say so rather than leave a worker that never answers. Only a warning: the file is the
+    user's. The devbox (Linux) talks HTTP/2 fine (two long tool-using runs, 2026-10-22)."""
+    if sys.platform != "darwin":
+        return
     path = Path.home() / ".cursor" / "cli-config.json"
     try:
         on = (json.loads(path.read_text()).get("network") or {}).get("useHttp1ForAgent") is True
@@ -2236,10 +2242,11 @@ def memory_settings(cwd):
     and subdirectories share one), else by cwd."""
     root = Path(cwd).resolve()
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        # Relative to root or absolute, either way; --path-format=absolute needs git 2.31; the devbox has 2.30.
+        out = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"],
                              capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10)
         if out.returncode == 0 and out.stdout.strip():
-            common = Path(out.stdout.strip()).resolve()
+            common = (root / out.stdout.strip()).resolve()
             if common.name != ".git":  # a submodule, a bare repo
                 return {}
             root = common.parent

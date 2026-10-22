@@ -623,7 +623,11 @@ status 列出未到点的提醒。
 - 传输：agent 默认用 HTTP/2 连 agentn.us.api5.cursor.sh，本机（疑似 CorpLink 网关）会卡在「Connection stalled」，
   所以 `~/.cursor/cli-config.json` 要开 `network.useHttp1ForAgent`。不要改用 CURSOR_CONFIG_DIR：那样读不到
   `~/.cursor/hooks.json`，hook 全部失效。spawn / wake Cursor worker 时会检查这一项，没开就打 WARNING，
-  说明后果和改法，但不替用户改文件，worker 照样开。
+  说明后果和改法，但不替用户改文件，worker 照样开。只在 macOS 上检查：devbox（Linux）走 HTTP/2 正常。
+- Linux（devbox，10-22 试跑）：要 tmux ≥ 3.1（`set-option -p`、`split-window -l N%`；Debian 10 的 apt 只有 2.8，
+  devbox 上自编 3.5a 装在 `~/.local`）、Python ≥ 3.8（系统 python3 是 3.7，claudesec 开头就拒绝并说明）。
+  git 2.30 没有 `rev-parse --path-format`，所以 `--git-common-dir` 自己按 cwd 解析。Cursor 的
+  `approvalMode` 是用户的设置：不是 unrestricted 时，worker 运行 `claudesec report` 会停在「Not in allowlist」上。
 - 模型：HTTP/1 下 Grok 4.7 仍每轮以「Server error」结束（交互、-p 都复现），stop 拿到 status=error；Auto 落到 Grok 4.7
   时也一样。默认 `cursor_worker_model: "gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High，用户 10-22 指定；HTTP/1 下交互 worker 和 -p 都跑通过一轮）。
   不能写 `gpt-5.6-sol-high`：`--list-models` 把它标成「1M High」，实际跑的是 272K（窗口底栏「GPT-5.6 Sol 272K High」）。

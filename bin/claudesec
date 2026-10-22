@@ -634,7 +634,7 @@ def status_blocks(cols, now=None):
         lines = wrap(segs, cols, cols - 2)
         blocks += [fixed([]), foldable(("shelved",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
                                        fit(segs, cols))]
-    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
+    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
     if pending:
         blocks += [fixed([]), fixed(heading(f"提醒 {len(pending)}", cols))]
         for r in pending:
@@ -2086,6 +2086,14 @@ def read_reminders():
     return json.loads(path.read_text()).get("items", []) if path.exists() else []
 
 
+def by_due(r):
+    """Sort key: the moment a reminder is due, then its number. Not the due string: those carry
+    whatever offset they were written with (+00:00 from a Z time, +08:00 from a local one), and
+    as strings 05:00+00:00 sorts after 02:50+08:00 the next day."""
+    n = r["id"][1:]
+    return dt.datetime.fromisoformat(r["due"]), int(n) if n.isdigit() else 0, r["id"]
+
+
 def parse_when(when, at=None):
     """+30m / +2h / +1d / +90s; HH:MM (the next one); MM-DD HH:MM; YYYY-MM-DD HH:MM; full ISO.
     A trailing Z means UTC, otherwise local time. Returns an aware datetime."""
@@ -2148,7 +2156,7 @@ def cmd_remind(args):
             print("没有提醒。" if args.all else "没有未到点的提醒。")
             return
         rows = [("id", "时间", "重复", "给", "状态", "内容")]
-        for r in sorted(items, key=lambda r: r["due"]):
+        for r in sorted(items, key=by_due):
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
                          r["target"], {"pending": "未到点", "fired": "已发", "cancelled": "已取消"}[r["status"]],
                          r["text"][:60]))
@@ -2230,7 +2238,7 @@ def check_reminders(run_pid):
 
 
 def print_reminders():
-    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=lambda r: r["due"])
+    pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
     if pending:
         print("\n提醒（未到点；claudesec remind --cancel ID 取消）：")
         rows = [("id", "时间", "重复", "给", "内容")]

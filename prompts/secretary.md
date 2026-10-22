@@ -146,7 +146,7 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - shelve / wake / close / peek / status 和 Claude Code worker 用法一样；不能 adopt 外面的 Cursor 会话。
 - Cursor 要走 HTTP/1（`~/.cursor/cli-config.json` 的 `network.useHttp1ForAgent`，已开），否则任何模型都卡在「Connection stalled」。
   spawn / wake 发现没开会打一行 WARNING（照样开 worker）：告诉用户一行，问要不要你派人改；那个文件是用户的，别自己改。
-- 默认模型 gemini-4-argon-high。`--model` 别选 Grok 4.7（每轮以「Server error」结束），也别选 Auto（可能路由到它）。
+- 默认模型 gpt-5.6-sol-high（GPT-5.6 Sol 1M High）。`--model` 别选 Grok 4.7（每轮以「Server error」结束），也别选 Auto（可能路由到它）。
 
 <!-- else -->
 ## Cursor worker

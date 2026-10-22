@@ -620,7 +620,8 @@ status 列出未到点的提醒。
   `~/.cursor/hooks.json`，hook 全部失效。spawn / wake Cursor worker 时会检查这一项，没开就打 WARNING，
   说明后果和改法，但不替用户改文件，worker 照样开。
 - 模型：HTTP/1 下 Grok 4.7 仍每轮以「Server error」结束（交互、-p 都复现），stop 拿到 status=error；Auto 落到 Grok 4.7
-  时也一样。默认 `cursor_worker_model: "gemini-4-argon-high"`，它在本账号可用的模型里 CursorBench 4.0 分最高。
+  时也一样。默认 `cursor_worker_model: "gpt-5.6-sol-high"`（GPT-5.6 Sol 1M High，用户 10-22 指定；HTTP/1 下交互 worker 和 -p 都跑通过一轮）。
+  之前默认 gemini-4-argon-high（本账号可用模型里 CursorBench 4.0 分最高），也能用。
 
 已验证（真机，Cursor agent 2026.10.19-6bbf2c4，临时 CLAUDESEC_HOME）：spawn → PROGRESS、DONE 经告警送达、注册表更新；
 send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，闲时 shelve → wake 带指令 → 同一个会话 id

@@ -564,6 +564,11 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   Cursor worker 没有能读的 transcript，显示「-」；还没拿到 session id 的也是「-」。transcript 动辄上百 MB，
   `usage.json` 按文件记着读到的位置和累计值，面板每 3 秒只读新追加的部分；没写完的半行留到下次。文件变短（被重写）就从头读。
   history 归档不带 token：归档时会话可能还在继续，数会过时。
+- 语言：面板、`claudesec status`、`claudesec queue` 的文字按 `lang()` 走：config `language`（zh / en），不设时看 Claude Code
+  settings.json 的 `language` 是否英语，否则中文。不看 LANG：中文用户跑 en_US.UTF-8 的很多（这台机器就是）。字符串就地写
+  `tr("中文", "English")`，不另建翻译表。queue.md 读的时候中英文标题都认（`## To ask`、`## Waiting`、`## Backlog`、`## Done`，
+  日期标记「已问：」/「asked:」，优先级（高 / high）），补标题按文件已有标题的语言，新建文件按 `lang()`。
+  提示词（secretary.md、worker.md）、给秘书的告警和 hook 注入仍是中文：那是给模型看的，不在这次范围里。
 - 两块各自能上下滚：鼠标滚轮（tmux `mouse on` 时；面板开了鼠标上报，tmux 把滚轮转给它，不进 copy mode）、
   焦点在面板上时（用 tmux 的切 pane 键切过去；点击会把焦点还给秘书）↑↓ / j k、PgUp PgDn / b 空格、Home End / g G。标题栏不动，上下有「还有 N 行」。
   内容刷新不重置滚动位置。面板用自己的屏幕（alternate screen），重画不会堆进 tmux 的历史。

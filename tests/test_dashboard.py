@@ -47,6 +47,7 @@ class Dashboard(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.cs = load(self.home)
+        (self.home / "config.json").write_text(json.dumps({"language": getattr(self, "LANG", "zh")}))
         self.calls = []
         self.cs.tmux = self.fake_tmux
         self.window_width = 126
@@ -172,7 +173,7 @@ class Dashboard(unittest.TestCase):
         text = (self.home / "queue.md").read_text()
         self.assertIn("- #16 [telegram] 接 Telegram", text)
         self.assertIn("- [older] 更早，没编号。", text)  # 已处理 is left as it is
-        self.assertEqual(self.queue("number"), "every open item has a number")
+        self.assertEqual(self.queue("number"), "未定的条目都有编号了")
         self.assertEqual((self.home / "queue.md").read_text(), text)
 
     def test_add_never_hands_out_a_number_twice(self):
@@ -343,6 +344,69 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(di(b"\t"), (0, [], True))
         self.assertLess(di(b"g")[0], -1000)
         self.assertGreater(di(b"\x1b[F")[0], 1000)
+
+
+class English(Dashboard):
+    """The same panes and commands with "language": "en"; Chinese queue files still read."""
+    LANG = "en"
+
+    def test_number_gives_open_items_one_past_any_in_the_file(self):
+        self.write_queue()
+        self.queue("number")
+        self.assertEqual(self.queue("number"), "every open item has a number")
+
+    def test_queue_pane_folded_and_unfolded(self):
+        self.write_queue()  # a Chinese file
+        title, blocks = self.cs.queue_blocks(40)
+        self.assertIn("To ask 4  Waiting 1", plain(title))
+        full = [plain(l) for l in self.cs.unfold(blocks, {k for k, *_ in blocks if k})[0]]
+        self.assertTrue(any(l.endswith("(asked 2 days ago)") for l in full), full)
+        self.assertTrue(any(l.startswith("To ask 4") for l in full), full)
+
+    def test_add_to_a_new_queue(self):
+        today = dt.date.today().isoformat()
+        self.queue("add", "[a] first (high)")
+        self.queue("add", "[b] asked one", asked=True)
+        self.queue("add", "[c] some day", later=True)
+        text = (self.home / "queue.md").read_text()
+        self.assertTrue(text.startswith("# Decision queue"))
+        self.assertIn("## Backlog\n\n- #3 [c] some day\n\n## To ask (by priority)\n\n- #1 [a] first (high)\n\n"
+                      f"## Waiting\n\n- #2 [b] {today} asked: asked one\n\n## Done", text)
+        items = self.cs.queue_items(text)
+        self.assertEqual([(sec, n, note) for sec, n, _, _, note in items],
+                         [("backlog", 3, None), ("todo", 1, "high"), ("doing", 2, today)])
+        self.assertEqual(self.queue("move", "2", to="done", note="answered: A"), "#2 Waiting → Done")
+        title, blocks = self.cs.queue_blocks(40)
+        body = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
+        self.assertEqual(body[-1][:9], "Backlog 1")
+        self.assertEqual(blocks[1][1][0][0][0], f"{self.cs.BOLD};{self.cs.RED}")  # (high) is red
+
+    def test_a_chinese_file_gets_chinese_headings(self):
+        self.write_queue()
+        self.queue("add", "x", later=True)
+        heads = [l for l in (self.home / "queue.md").read_text().splitlines() if l.startswith("## ")]
+        self.assertEqual(heads, ["## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
+
+    def test_progress_pane_lists_what_needs_the_user_first(self):
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "asks": {"status": "NEED_DECISION", "task": "t", "pending_ask": "A or B?", "window": "@1"},
+            "zz": {"status": "SHELVED", "task": "t"}}}))
+        title, blocks = self.cs.status_blocks(48)
+        self.assertEqual(plain(title).split(), ["Workers", "you", "1", "shelved", "1"])
+        body = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
+        self.assertIn("needs your call", body[0])
+        self.assertTrue(body[-1].startswith("shelved 1"))
+
+    def test_view_fits_and_scrolls(self):
+        body = [[("", str(i))] for i in range(30)]
+        self.assertIn("↓ 22 more", plain(self.cs.dash_view([("", "T")], body, 10, 0)[0][-1]))
+        self.assertIn("↑ 22 more", plain(self.cs.dash_view([("", "T")], body, 10, 999)[0][1]))
+
+    # Chinese text throughout; covered by the base class
+    test_queue_items_with_any_numbering = test_add_never_hands_out_a_number_twice = None
+    test_an_old_file_gets_the_new_sections_and_keeps_every_item = test_move_through_the_flow = None
+    test_the_pane_keeps_the_backlog_to_one_line = test_only_the_backlog_left = None
+    test_empty_queue = test_add_asked_dates_it_once = test_an_asked_item_without_a_date_doesnt_break_the_pane = None
 
 
 if __name__ == "__main__":

@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
+    "language": None,                 # what the panes, status and queue say: "zh", "en"; None = see lang()
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
@@ -114,6 +115,22 @@ def config():
         tmp.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n")
         tmp.replace(path)
     return {**DEFAULT_CONFIG, **json.loads(path.read_text())}
+
+
+@functools.lru_cache(maxsize=None)
+def lang():
+    """"en" or "zh", for the dashboard, `status` and `queue`: config "language", else Claude Code's
+    own `language` setting when it names English, else Chinese, which the prompts are written in.
+    Not the locale: plenty of Chinese users run en_US.UTF-8."""
+    want = str(config().get("language") or "").lower()
+    if not want:
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            want = str(json.loads((claude_dir() / "settings.json").read_text()).get("language") or "").lower()
+    return "en" if want.startswith("en") else "zh"
+
+
+def tr(zh, en):
+    return en if lang() == "en" else zh
 
 
 @contextlib.contextmanager
@@ -493,7 +510,12 @@ def ago(stamp, now=None):
         else f"{int(secs // 86400)}d"
 
 
-PRIORITY = {"高": RED, "中": YELLOW, "低": DIM}
+PRIORITY = {"高": RED, "中": YELLOW, "低": DIM, "high": RED, "medium": YELLOW, "med": YELLOW, "low": DIM}
+
+
+def priority_color(note):
+    word = re.match(r"[^\s,，;；]+", note or "")
+    return PRIORITY.get(word[0].lower() if word else "", "")
 
 
 # A queue.md item: "- #12 [web] question（中）". The number is the item's for good (the user
@@ -504,14 +526,21 @@ QUEUE_ITEM = re.compile(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(?:#(\d+)\s+)?(\S.*)"
 # queue.md's sections, a backlog -> todo -> doing -> done flow: 搁置 the user put off (not asked
 # until they bring it up), 待问 to ask one by one, 待答 asked and waiting for the answer,
 # 已处理 decided. Files from before 搁置 called 待答 「已问未答」.
-QUEUE_SECTIONS = {"backlog": "搁置", "todo": "待问", "doing": "待答", "done": "已处理"}
+QUEUE_SECTIONS = {"backlog": ("搁置", "Backlog"), "todo": ("待问", "To ask"), "doing": ("待答", "Waiting"),
+                  "done": ("已处理", "Done")}
+QUEUE_ALIASES = {"backlog": ("later",), "todo": ("todo",), "doing": ("已问未答", "doing", "asked"), "done": ()}
+
+
+def section_name(key):
+    return tr(*QUEUE_SECTIONS[key])
 
 
 def queue_section(heading):
-    """The section a "## …" line starts: backlog, todo, doing, done, or None."""
-    if "已问未答" in heading:
-        return "doing"
-    return next((key for key, word in QUEUE_SECTIONS.items() if word in heading), None)
+    """The section a "## …" line starts: backlog, todo, doing, done, or None. Chinese and English
+    headings both, whichever language wrote the file."""
+    low = heading.lower()
+    return next((key for key, words in QUEUE_SECTIONS.items()
+                 if any(w.lower() in low for w in (*words, *QUEUE_ALIASES[key]))), None)
 
 
 def queue_items(text):
@@ -531,17 +560,21 @@ def queue_items(text):
         tag = re.match(r"\[([^\]]+)\]\s*", body)
         if tag:
             tag, body = tag[1], body[tag.end():]
-        note = re.match(r"(\d{4}-\d{2}-\d{2})\s*已问[:：]\s*", body)
+        note = re.match(r"(\d{4}-\d{2}-\d{2})\s*(?:已问|asked)[:：]\s*", body, re.I)
         if note:
             note, body = note[1], body[note.end():]
         else:
-            note = re.search(r"\s*（([^（）]*)）\s*$", body)
-            if note and note[1][:1] in PRIORITY:
+            note = re.search(r"\s*[（(]([^（）()]*)[）)]\s*$", body)
+            if note and priority_color(note[1]):
                 note, body = note[1], body[:note.start()]
             else:
                 note = None
         items.append((section, num, tag, body, note))
     return items
+
+
+def paren(text):
+    return tr(f"（{text}）", f" ({text})")
 
 
 # A pane's body is a list of blocks (key, folded, unfolded): the lines of one item folded to one
@@ -564,12 +597,13 @@ def queue_blocks(cols):
     ask = [i for i in items if i[0] == "todo"]
     asked = [i for i in items if i[0] == "doing"]
     later = [i for i in items if i[0] == "backlog"]
-    title = bar(" 决策队列", f"待问 {len(ask)}  待答 {len(asked)} ", cols)
+    title = bar(tr(" 决策队列", " Decisions"),
+                f"{section_name('todo')} {len(ask)}  {section_name('doing')} {len(asked)} ", cols)
     if not ask and not asked:
-        blocks = [fixed([(DIM, "没有要你定的事。")])]
+        blocks = [fixed([(DIM, tr("没有要你定的事。", "Nothing for you to decide."))])]
     else:
         blocks, num_w = [], max(len(str(i[1] or "·")) for i in ask + asked)
-    for label, group in (("待问", ask), ("待答", asked)) if ask or asked else ():
+    for label, group in ((section_name("todo"), ask), (section_name("doing"), asked)) if ask or asked else ():
         if not group:  # the title bar says it's 0
             continue
         blocks += [fixed([])] if blocks else []
@@ -580,19 +614,21 @@ def queue_blocks(cols):
                     days = (dt.date.today() - dt.date.fromisoformat(note)).days
                 except (TypeError, ValueError):
                     days = None
-                color, tail = DIM, (f"（{note}）" if note else "") if days is None else \
-                    "（今天问的）" if days < 1 else "（昨天问的）" if days == 1 else f"（{days} 天前问的）"
+                color, tail = DIM, (paren(note) if note else "") if days is None else \
+                    paren(tr("今天问的", "asked today")) if days < 1 else \
+                    paren(tr("昨天问的", "asked yesterday")) if days == 1 else \
+                    paren(tr(f"{days} 天前问的", f"asked {days} days ago"))
             else:
-                color, tail = PRIORITY.get((note or "")[:1], ""), f"（{note}）" if note else ""
+                color, tail = priority_color(note), paren(note) if note else ""
             head = [(BOLD + ";" + color if color else BOLD, str(num or "·").rjust(num_w)), ("", " ")]
             name = [(CYAN, tag), ("", " ")] if tag else []
             lines = wrap(name + [("", text), (DIM, tail)], cols - num_w - 1)
             full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
             blocks.append(foldable(("q", num, tag, text), full, fit(head + name + [("", text)], cols)))
     if later:  # put off by the user: out of the way, one line until clicked open
-        names = "；".join(f"{f'#{n} ' if n else ''}{f'[{tag}] ' if tag else ''}{text}"
-                         for _, n, tag, text, _ in later)
-        segs = [(BOLD, f"搁置 {len(later)}"), ("", "  "), (DIM, names)]
+        names = tr("；", "; ").join(f"{f'#{n} ' if n else ''}{f'[{tag}] ' if tag else ''}{text}"
+                                   for _, n, tag, text, _ in later)
+        segs = [(BOLD, f"{section_name('backlog')} {len(later)}"), ("", "  "), (DIM, names)]
         lines = wrap(segs, cols, cols - 2)
         blocks += [fixed([]), foldable(("backlog",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
                                        fit(segs, cols))]
@@ -601,14 +637,14 @@ def queue_blocks(cols):
 
 # How each status shows in the progress pane: group (the order they're listed in), mark, word, color
 STATUS_LOOK = {
-    "NEED_DECISION": (0, "!", "要你拍板", YELLOW),
-    "BLOCKED": (0, "!", "卡住了", YELLOW),
-    "WAITING_PERMISSION": (0, "!", "等你批权限", YELLOW),
-    "API_ERROR": (1, "✗", "API 出错", RED),
-    "FAILED": (1, "✗", "失败了", RED),
-    "STARTING": (2, "▸", "启动中", CYAN),
-    "PROGRESS": (2, "▸", "进行中", GREEN),
-    "DONE": (3, "✓", "做完了", DIM),
+    "NEED_DECISION": (0, "!", ("要你拍板", "needs your call"), YELLOW),
+    "BLOCKED": (0, "!", ("卡住了", "blocked"), YELLOW),
+    "WAITING_PERMISSION": (0, "!", ("等你批权限", "needs permission"), YELLOW),
+    "API_ERROR": (1, "✗", ("API 出错", "API error"), RED),
+    "FAILED": (1, "✗", ("失败了", "failed"), RED),
+    "STARTING": (2, "▸", ("启动中", "starting"), CYAN),
+    "PROGRESS": (2, "▸", ("进行中", "working"), GREEN),
+    "DONE": (3, "✓", ("做完了", "done"), DIM),
 }
 
 
@@ -622,25 +658,27 @@ def status_blocks(cols, now=None):
     usage = worker_usage(active)
     rows = []
     for name, w in active.items():
-        group, mark, word, color = STATUS_LOOK.get(w["status"], (2, "▸", w["status"], ""))
+        group, mark, word, color = STATUS_LOOK.get(w["status"], (2, "▸", (w["status"],) * 2, ""))
+        word = tr(*word)
         if w.get("mode") == "discuss" and group == 2:
-            word, color = "讨论中", CYAN
+            word, color = tr("讨论中", "discussing"), CYAN
         if w.get("window") not in alive and group < 3 and w["status"] != "FAILED":
-            word += " · 窗口关了"
+            word += tr(" · 窗口关了", " · window closed")
         if group == 0 or w["status"] == "API_ERROR":
             summary = w.get("pending_ask") or w.get("last_summary") or w["task"]
         else:
             summary = w.get("last_summary") or w["task"]
         summary = " ".join(summary.split())
         if w.get("delegated_by"):
-            summary = f"为 {w['delegated_by']}：{summary}"
+            summary = tr(f"为 {w['delegated_by']}：", f"for {w['delegated_by']}: ") + summary
         rows.append((group, -(dt.datetime.fromisoformat(w["last_report_at"]).timestamp()
                               if w.get("last_report_at") else 0), name, mark, word, color, summary,
                      ago(w["last_report_at"], now) if w.get("last_report_at") else "", usage[name]))
     rows.sort(key=lambda r: r[:3])
     counts = [sum(1 for r in rows if r[0] == g) for g in range(4)]
-    right = "".join(f"{label} {n}  " for label, n in zip(("等你", "出错", "在做", "做完"), counts) if n)
-    title = bar(" 任务进展", right + f"搁置 {len(shelved)} ", cols)
+    labels = tr(("等你", "出错", "在做", "做完", "搁置"), ("you", "errors", "working", "done", "shelved"))
+    right = "".join(f"{label} {n}  " for label, n in zip(labels, counts) if n)
+    title = bar(tr(" 任务进展", " Workers"), right + f"{labels[4]} {len(shelved)} ", cols)
     blocks = []
     name_w = min(max((width(r[2]) for r in rows), default=0), 16)
     tok_w = max((len(usage_word(r[-1])) for r in rows), default=0)
@@ -658,15 +696,15 @@ def status_blocks(cols, now=None):
             more += [[("", "  ")] + line for line in wrap([(DIM, usage_detail(use))], cols - 2)]
         blocks.append((("s", name), [head], [head] + more))
     if not rows:
-        blocks.append(fixed([(DIM, "没有在跑的 worker。")]))
+        blocks.append(fixed([(DIM, tr("没有在跑的 worker。", "No workers running."))]))
     if shelved:
-        segs = [(BOLD, f"搁置 {len(shelved)}"), ("", "  "), (DIM, "、".join(shelved))]
+        segs = [(BOLD, f"{labels[4]} {len(shelved)}"), ("", "  "), (DIM, tr("、", ", ").join(shelved))]
         lines = wrap(segs, cols, cols - 2)
         blocks += [fixed([]), foldable(("shelved",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
                                        fit(segs, cols))]
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
     if pending:
-        blocks += [fixed([]), fixed(heading(f"提醒 {len(pending)}", cols))]
+        blocks += [fixed([]), fixed(heading(tr(f"提醒 {len(pending)}", f"Reminders {len(pending)}"), cols))]
         for r in pending:
             t = dt.datetime.fromisoformat(r["due"]).astimezone()
             segs = [(DIM, f"{t:%m-%d %H:%M}"), ("", " "), (CYAN, r["target"]), ("", "  "),
@@ -695,12 +733,13 @@ def dash_view(title, body, rows, top):
     if len(body) <= room or room < 3:
         return [title] + body[:room], 0, [None] + list(range(min(room, len(body))))
     top = max(0, min(top, len(body) - room + 1))
-    above = [[(DIM, f"  ↑ 还有 {top} 行")]] if top else []
+    above = [[(DIM, tr(f"  ↑ 还有 {top} 行", f"  ↑ {top} more"))]] if top else []
     shown = room - len(above)
     below = []
     if top + shown < len(body):
         shown -= 1
-        below = [[(DIM, f"  ↓ 还有 {len(body) - top - shown} 行 · 滚轮翻 · 点一条展开")]]
+        n = len(body) - top - shown
+        below = [[(DIM, tr(f"  ↓ 还有 {n} 行 · 滚轮翻 · 点一条展开", f"  ↓ {n} more · scroll · click to open"))]]
     rowmap = [None] * (1 + len(above)) + list(range(top, top + shown)) + [None] * len(below)
     return [title] + above + body[top:top + shown] + below, top, rowmap
 
@@ -761,7 +800,9 @@ def show_dashboard(what):
                 try:
                     content = (size, *(queue_blocks if what == "queue" else status_blocks)(size.columns - 1))
                 except Exception as e:  # a half-written file, a bad entry: show it, try again
-                    content = (size, [(REV, f" 读状态出错，{DASH_REFRESH} 秒后重试 ")], [fixed([("", repr(e))])])
+                    content = (size, [(REV, tr(f" 读状态出错，{DASH_REFRESH} 秒后重试 ",
+                                                f" Can't read the state; again in {DASH_REFRESH}s "))],
+                               [fixed([("", repr(e))])])
                 due = time.monotonic() + DASH_REFRESH
             body, keys = unfold(content[2], opened)
             lines, top, rowmap = dash_view(content[1], body, size.lines, top)
@@ -848,8 +889,25 @@ QUEUE_INTRO = """# 决策队列
 每条一行 `- #编号 [worker] 问题（高|中|低）`。编号用 `claudesec queue add` 拿，跟着条目走，不改、不复用；
 在块之间挪用 `claudesec queue move 编号 backlog|todo|doing|done`。用户看着面板用编号回答。
 """
-QUEUE = QUEUE_INTRO + "".join(f"\n## {word}{'（按优先级）' if key == 'todo' else ''}\n"
-                              for key, word in QUEUE_SECTIONS.items())
+QUEUE_INTRO_EN = """# Decision queue
+
+Kept by the secretary. Workers' NEED_DECISIONs and TODOs the user has to decide land here, most
+important first; the user is asked one at a time.
+Four sections, like backlog -> todo -> doing -> done: Backlog, what the user put off (not asked
+about); To ask, asked next, one by one; Waiting, asked and waiting for the answer; Done, decided,
+newest first.
+One line an item: `- #number [worker] question (high|medium|low)`. Numbers come from
+`claudesec queue add` and stay with the item; `claudesec queue move N backlog|todo|doing|done`
+moves one. The user answers by number from the panel.
+"""
+
+
+def section_heading(key):
+    return f"## {section_name(key)}" + (tr("（按优先级）", " (by priority)") if key == "todo" else "")
+
+
+def queue_template():
+    return tr(QUEUE_INTRO, QUEUE_INTRO_EN) + "".join(f"\n{section_heading(key)}\n" for key in QUEUE_SECTIONS)
 
 
 def normalize_queue(lines):
@@ -863,6 +921,7 @@ def normalize_queue(lines):
         title = next((i for i, line in enumerate(lines[:heads[0]]) if line.startswith("# ")), None)
         if title is not None:
             lines[title:heads[0]] = QUEUE_INTRO.splitlines() + [""]
+    zh = any(re.search(r"[一-龥]", lines[i]) for i in heads) if heads else lang() == "zh"
     order = list(QUEUE_SECTIONS)
     for key in order:
         have = {queue_section(line): i for i, line in enumerate(lines) if line.startswith("## ")}
@@ -870,7 +929,7 @@ def normalize_queue(lines):
             continue
         later = [have[k] for k in order[order.index(key) + 1:] if k in have]
         at = min(later) if later else len(lines)
-        head = f"## {QUEUE_SECTIONS[key]}{'（按优先级）' if key == 'todo' else ''}"
+        head = f"## {QUEUE_SECTIONS[key][0 if zh else 1]}"  # in the file's own language
         lines[at:at] = [head, ""] if later else ["", head]
     return [line for i, line in enumerate(lines) if line.strip() or i == 0 or lines[i - 1].strip()]
 
@@ -893,7 +952,7 @@ def queue_append(lines, key, item):
     lines[end:end] = ([""] if end == at + 1 else []) + [item]
 
 
-ASKED_ON = re.compile(r"\d{4}-\d{2}-\d{2}\s*已问[:：]\s*")
+ASKED_ON = re.compile(r"\d{4}-\d{2}-\d{2}\s*(?:已问|asked)[:：]\s*", re.I)
 
 
 def with_asked_date(text):
@@ -903,7 +962,7 @@ def with_asked_date(text):
         return text
     tag = re.match(r"\[[^\]]+\]\s*", text)
     at = tag.end() if tag else 0
-    return f"{text[:at]}{dt.date.today().isoformat()} 已问：{text[at:]}"
+    return f"{text[:at]}{dt.date.today().isoformat()} {tr('已问：', 'asked: ')}{text[at:]}"
 
 
 def without_asked_date(text):
@@ -936,7 +995,7 @@ def cmd_queue(args):
     to date first."""
     path = HOME / "queue.md"
     HOME.mkdir(parents=True, exist_ok=True)
-    lines = normalize_queue((path.read_text() if path.exists() else QUEUE).splitlines())
+    lines = normalize_queue((path.read_text() if path.exists() else queue_template()).splitlines())
     if args.action == "add":
         text = " ".join(args.words).strip()
         if not text:
@@ -948,7 +1007,7 @@ def cmd_queue(args):
         queue_append(lines, key, f"- #{n} {with_asked_date(text) if key == 'doing' else text}")
         print(f"#{n}")
     elif args.action == "move":
-        key = {**{k: k for k in QUEUE_SECTIONS}, **{w: k for k, w in QUEUE_SECTIONS.items()}}.get(args.to)
+        key = {**{k: k for k in QUEUE_SECTIONS}, **{w: k for k, ws in QUEUE_SECTIONS.items() for w in ws}}.get(args.to)
         num = args.number.lstrip("#")
         found = [i for i, line in enumerate(lines)
                  if (m := QUEUE_ITEM.match(line)) and m[1] == num and not line.startswith("## ")]
@@ -972,7 +1031,7 @@ def cmd_queue(args):
         if i < len(lines) and not lines[i].strip() and i > 0 and not lines[i - 1].strip():
             del lines[i]  # the blank line that separated it in 已处理
         queue_append(lines, key, f"- #{num} {text}")
-        print(f"#{num} {QUEUE_SECTIONS[frm]} → {QUEUE_SECTIONS[key]}")
+        print(f"#{num} {section_name(frm)} → {section_name(key)}")
     else:
         section, done = False, []
         for i, line in enumerate(lines):
@@ -983,7 +1042,7 @@ def cmd_queue(args):
             if section and m and not m[1]:
                 lines[i] = f"- #{take_queue_number(chr(10).join(lines))} {m[2].strip()}"
                 done.append(lines[i])
-        print("\n".join(done) or "every open item has a number")
+        print("\n".join(done) or tr("未定的条目都有编号了", "every open item has a number"))
     tmp = path.with_name(".queue.md.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, path)
@@ -994,7 +1053,7 @@ def cmd_run(args):
     cfg = config()
     HOME.mkdir(parents=True, exist_ok=True)
     if not (HOME / "queue.md").exists():
-        (HOME / "queue.md").write_text(QUEUE)
+        (HOME / "queue.md").write_text(queue_template())
     settings = HOME / "secretary-settings.json"
     cmd = hook_cmd()
     # A worker stuck on a dialog can't SendMessage, so alerts reach the secretary through a
@@ -1358,11 +1417,12 @@ def cursor_available():
     """(usable, why): whether Cursor workers can be started on this machine."""
     setting = config().get("cursor", "auto")
     if setting is False or str(setting).lower() in ("false", "off", "no", "0"):
-        return False, "已关（config.json 里 \"cursor\": false）"
+        return False, tr("已关（config.json 里 \"cursor\": false）", "off (\"cursor\": false in config.json)")
     path = shutil.which("agent")
     if path:
-        return True, f"可用（{path}）"
-    return False, ("config.json 里开着，但" if setting is True else "") + "这台机器上没有 `agent` 命令（Cursor CLI）"
+        return True, tr(f"可用（{path}）", f"available ({path})")
+    return False, (tr("config.json 里开着，但", "on in config.json, but ") if setting is True else "") + \
+        tr("这台机器上没有 `agent` 命令（Cursor CLI）", "no `agent` command (Cursor CLI) on this machine")
 
 
 def require_cursor(what):
@@ -1548,7 +1608,7 @@ def session_status(conv):
 
 def status_label(conv):
     status, tasks = session_status(conv)
-    return f"后台任务×{len(tasks)}" if tasks else status
+    return tr(f"后台任务×{len(tasks)}", f"bg tasks ×{len(tasks)}") if tasks else status
 
 
 def external_sessions():
@@ -1590,18 +1650,18 @@ def external_sessions():
 
 def session_kind(s):
     if s.get("bg"):
-        return f"前台挂在后台 {s['bg'].get('jobId')}"
+        return tr(f"前台挂在后台 {s['bg'].get('jobId')}", f"attached to bg {s['bg'].get('jobId')}")
     if s.get("kind") == "bg":
-        return f"后台 {s.get('jobId')}"
-    return "前台"
+        return tr(f"后台 {s.get('jobId')}", f"bg {s.get('jobId')}")
+    return tr("前台", "interactive")
 
 
 def session_rows(sessions):
-    rows = [("会话", "类型", "状态", "tmux", "目录")]
+    rows = [tr(("会话", "类型", "状态", "tmux", "目录"), ("session", "kind", "state", "tmux", "dir"))]
     for s in sessions:
         conv = s.get("bg") or s
         rows.append((s.get("name", "?"), session_kind(s), status_label(conv),
-                     s.get("tmux") or "（不在 tmux）", Path(conv.get("cwd", "")).name))
+                     s.get("tmux") or tr("（不在 tmux）", "(not in tmux)"), Path(conv.get("cwd", "")).name))
     return rows
 
 
@@ -1711,7 +1771,9 @@ def usage_word(use):
 
 
 def usage_detail(use):
-    return "" if use is None else "token：输入 {} · 缓存写 {} · 缓存读 {} · 输出 {}".format(*map(short_count, use))
+    return "" if use is None else tr("token：输入 {} · 缓存写 {} · 缓存读 {} · 输出 {}",
+                                     "tokens: input {} · cache write {} · cache read {} · output {}").format(
+        *map(short_count, use))
 
 
 def exited_session(key):
@@ -2109,35 +2171,37 @@ def cmd_status(args):
     if active:
         print_workers(focus, active)
     else:
-        print("没有 worker。")
+        print(tr("没有 worker。", "No workers."))
     if shelved:
-        print("\n搁置（没有进程在跑；claudesec wake 唤醒）：")
-        rows = [("名字", "目录", "搁置于", "token", "备注 / 最后一轮")]
+        print(tr("\n搁置（没有进程在跑；claudesec wake 唤醒）：", "\nShelved (no process running; claudesec wake brings one back):"))
+        rows = [tr(("名字", "目录", "搁置于", "token", "备注 / 最后一轮"), ("name", "dir", "shelved", "tokens", "note / last turn"))]
         usage = worker_usage(shelved)
         for n, w in shelved.items():
             rows.append((n, Path(w["dir"]).name, (w.get("shelved_at") or "")[:16].replace("T", " "), usage_word(usage[n]),
                          (w.get("shelf_summary") or w.get("last_summary") or "").replace("\n", " ")[:60]))
         print_rows(rows)
     print_reminders()
-    print(f"\nCursor worker：{cursor_available()[1]}")
+    print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1])
     sessions = external_sessions()
     if sessions:
-        print(f"\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：")
+        print(tr("\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：",
+                 "\nClaude sessions claudesec doesn't manage (an idle one can be taken over with claudesec adopt):"))
         print_rows(session_rows(sessions))
 
 
 def print_workers(focus, workers):
     alive = alive_windows()
-    rows = [("", "worker", "模型", "状态", "距今", "token", "最近", "等你？")]
+    rows = [("", "worker", *tr(("模型", "状态", "距今", "token", "最近", "等你？"),
+                               ("model", "status", "ago", "tokens", "latest", "you?")))]
     usage = worker_usage(workers)
     for name, w in workers.items():
         status = w["status"]
         if status in LABELS:
-            status = LABELS[status]
+            status = tr(LABELS[status], tr(*STATUS_LOOK[status][2]))
         elif w.get("mode") == "discuss" and status not in ("DONE", "FAILED"):
-            status = "讨论中"
+            status = tr("讨论中", "discussing")
         if w.get("window") not in alive and status not in ("DONE", "FAILED"):
-            status += "(窗口已关)"
+            status += tr("(窗口已关)", " (window closed)")
         age = ""
         if w.get("last_report_at"):
             secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
@@ -2145,9 +2209,9 @@ def print_workers(focus, workers):
         summary = (w.get("pending_ask") if w["status"] in LABELS else
                    w.get("last_summary") or w["task"]).replace("\n", " ")
         if w.get("delegated_by"):
-            summary = f"[为 {w['delegated_by']}] {summary}"
+            summary = tr(f"[为 {w['delegated_by']}] ", f"[for {w['delegated_by']}] ") + summary
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
-                     status, age, usage_word(usage[name]), summary[:48], "← 是" if w["status"] in WAITING else ""))
+                     status, age, usage_word(usage[name]), summary[:48], tr("← 是", "← yes") if w["status"] in WAITING else ""))
     print_rows(rows)
 
 
@@ -2359,13 +2423,13 @@ def parse_every(every):
 def show_every(secs):
     for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
         if secs % n == 0:
-            return f"每 {secs // n}{unit}"
-    return f"每 {secs}s"
+            return tr(f"每 {secs // n}{unit}", f"every {secs // n}{unit}")
+    return tr(f"每 {secs}s", f"every {secs}s")
 
 
 def show_time(iso):
     t = dt.datetime.fromisoformat(iso)
-    return f"{t.astimezone():%m-%d %H:%M}（{t.astimezone(dt.timezone.utc):%H:%MZ}）"
+    return f"{t.astimezone():%m-%d %H:%M}" + paren(f"{t.astimezone(dt.timezone.utc):%H:%MZ}").rstrip()
 
 
 def cmd_remind(args):
@@ -2467,8 +2531,9 @@ def check_reminders(run_pid):
 def print_reminders():
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
     if pending:
-        print("\n提醒（未到点；claudesec remind --cancel ID 取消）：")
-        rows = [("id", "时间", "重复", "给", "内容")]
+        print(tr("\n提醒（未到点；claudesec remind --cancel ID 取消）：",
+                 "\nReminders (not due yet; claudesec remind --cancel ID drops one):"))
+        rows = [("id", *tr(("时间", "重复", "给", "内容"), ("when", "repeat", "for", "text")))]
         for r in pending:
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
                          r["target"], r["text"][:60]))
@@ -3265,7 +3330,8 @@ def main():
     s = queue.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--asked", action="store_true")
     s.add_argument("--later", action="store_true")
     s = queue.add_parser("move"); s.add_argument("number")
-    s.add_argument("to", choices=[*QUEUE_SECTIONS, *QUEUE_SECTIONS.values()]); s.add_argument("--note")
+    s.add_argument("to", choices=[*QUEUE_SECTIONS, *(w for ws in QUEUE_SECTIONS.values() for w in ws)])
+    s.add_argument("--note")
     s = queue.add_parser("number")
     s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
     s.add_argument("what", nargs="?", choices=["queue", "status"]); s.set_defaults(fn=cmd_dashboard)

@@ -125,8 +125,8 @@ class Dashboard(unittest.TestCase):
         self.write_queue()
         items = self.cs.queue_items((self.home / "queue.md").read_text())
         self.assertEqual([(s, n, tag) for s, n, tag, _, _ in items],
-                         [("ask", 12, "web"), ("ask", None, "web"), ("ask", 3, "sshpw"),
-                          ("ask", None, "telegram"), ("asked", 9, "projmerge")])
+                         [("todo", 12, "web"), ("todo", None, "web"), ("todo", 3, "sshpw"),
+                          ("todo", None, "telegram"), ("doing", 9, "projmerge")])
         self.assertEqual([note for *_, note in items][:4], ["中", "低，可选", "高", None])
         self.assertTrue(items[0][3].startswith("landing-private"))
         self.assertTrue(items[0][3].endswith("等闲鱼链接一起。"))
@@ -134,7 +134,7 @@ class Dashboard(unittest.TestCase):
     def test_queue_pane_folded_and_unfolded(self):
         self.write_queue()
         title, blocks = self.cs.queue_blocks(40)
-        self.assertIn("待问 4  已问未答 1", plain(title))
+        self.assertIn("待问 4  待答 1", plain(title))
         self.assertEqual(self.cs.width(plain(title)), 40)
         body, keys = self.cs.unfold(blocks, set())
         text = [plain(l) for l in body]
@@ -154,10 +154,11 @@ class Dashboard(unittest.TestCase):
 
     # ---- item numbers
 
-    def queue(self, action, *words, asked=False):
+    def queue(self, action, *words, asked=False, later=False, to=None, note=None):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.cs.cmd_queue(SimpleNamespace(action=action, words=list(words), asked=asked))
+            self.cs.cmd_queue(SimpleNamespace(action=action, words=list(words), asked=asked, later=later,
+                                              number=words[0] if words else None, to=to, note=note))
         return out.getvalue().strip()
 
     def numbers(self):
@@ -167,7 +168,7 @@ class Dashboard(unittest.TestCase):
         self.write_queue()
         out = self.queue("number")
         self.assertEqual([l.split()[1] for l in out.splitlines()], ["#15", "#16"])
-        self.assertEqual(self.numbers(), [("ask", 12), ("ask", 15), ("ask", 3), ("ask", 16), ("asked", 9)])
+        self.assertEqual(self.numbers(), [("todo", 12), ("todo", 15), ("todo", 3), ("todo", 16), ("doing", 9)])
         text = (self.home / "queue.md").read_text()
         self.assertIn("- #16 [telegram] 接 Telegram", text)
         self.assertIn("- [older] 更早，没编号。", text)  # 已处理 is left as it is
@@ -177,7 +178,7 @@ class Dashboard(unittest.TestCase):
     def test_add_never_hands_out_a_number_twice(self):
         self.write_queue()
         self.assertEqual(self.queue("add", "[web]", "再问一件（低）"), "#15")
-        self.assertEqual(self.numbers()[-2:], [("ask", 15), ("asked", 9)])  # end of 待问
+        self.assertEqual(self.numbers()[-2:], [("todo", 15), ("doing", 9)])  # end of 待问
         # the item is dealt with and 已处理 cleared out: its number still isn't reused
         path = self.home / "queue.md"
         path.write_text(path.read_text().split("## 已处理")[0].replace("- #15 [web] 再问一件（低）\n", ""))
@@ -189,8 +190,63 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.queue("add", "[c] 第二件"), "#3")
         text = (self.home / "queue.md").read_text()
         today = dt.date.today().isoformat()
-        self.assertIn("## 待问（按优先级）\n\n- #1 [a] 第一件\n- #3 [c] 第二件\n\n## 已问未答\n\n"
+        self.assertIn("## 搁置\n\n## 待问（按优先级）\n\n- #1 [a] 第一件\n- #3 [c] 第二件\n\n## 待答\n\n"
                       f"- #2 [b] {today} 已问：问过了\n\n## 已处理", text)
+
+    def test_an_old_file_gets_the_new_sections_and_keeps_every_item(self):
+        self.write_queue()
+        before = (self.home / "queue.md").read_text()
+        self.assertEqual(self.queue("add", "[t] 以后再聊", later=True), "#15")
+        text = (self.home / "queue.md").read_text()
+        heads = [l for l in text.splitlines() if l.startswith("## ")]
+        self.assertEqual(heads, ["## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
+        self.assertNotIn("已问未答", text)
+        self.assertEqual(self.numbers(), [("backlog", 15), ("todo", 12), ("todo", None), ("todo", 3),
+                                          ("todo", None), ("doing", 9)])
+        for line in before.split("## 已处理")[1].splitlines():  # 已处理 untouched
+            self.assertIn(line, text)
+        self.queue("add", "再加一件")  # once is enough: nothing changes a second time
+        self.assertEqual(text.replace("\n\n## 待答", "\n- #16 再加一件\n\n## 待答"),
+                         (self.home / "queue.md").read_text())
+
+    def test_move_through_the_flow(self):
+        today = dt.date.today().isoformat()
+        self.queue("add", "[w] 要不要做（中）")
+        self.assertEqual(self.queue("move", "1", to="backlog"), "#1 待问 → 搁置")
+        self.assertEqual(self.numbers(), [("backlog", 1)])
+        self.queue("move", "#1", to="todo")
+        self.queue("move", "1", to="doing")
+        text = (self.home / "queue.md").read_text()
+        self.assertIn(f"- #1 [w] {today} 已问：要不要做（中）", text)
+        self.queue("move", "1", to="todo")  # not asked after all: the date goes
+        self.assertIn("- #1 [w] 要不要做（中）", (self.home / "queue.md").read_text())
+        self.queue("move", "1", to="doing")
+        self.queue("add", "[v] 早先定的")
+        self.queue("move", "2", to="done")
+        self.assertEqual(self.queue("move", "1", to="done", note="用户答：A"), "#1 待答 → 已处理")
+        done = (self.home / "queue.md").read_text().split("## 已处理")[1]
+        self.assertEqual(done.strip().splitlines(),  # newest first, the answer in place of the question
+                         [f"- #1 [w] {today} 用户答：A", "", f"- #2 [v] {today} 早先定的"])
+        self.assertEqual(self.numbers(), [])
+        with self.assertRaises(SystemExit):
+            self.queue("move", "9", to="todo")
+
+    def test_the_pane_keeps_the_backlog_to_one_line(self):
+        self.queue("add", "[a] 现在问")
+        for i in range(3):
+            self.queue("add", f"[t] 以后再说 {i}", later=True)
+        title, blocks = self.cs.queue_blocks(40)
+        self.assertIn("待问 1  待答 0", plain(title))
+        text = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
+        self.assertEqual(text[-1][:4], "搁置 3")
+        self.assertEqual(len([l for l in text if "以后再说" in l]), 1)
+        self.assertFalse([l for l in text if l.startswith("待答") or "（无）" in l], text)  # an empty group isn't shown
+
+    def test_only_the_backlog_left(self):
+        self.queue("add", "[t] 以后再说", later=True)
+        body = [plain(l) for l in self.cs.unfold(self.cs.queue_blocks(40)[1], set())[0]]
+        self.assertEqual(body[0], "没有要你定的事。")
+        self.assertTrue(body[-1].startswith("搁置 1"))
 
     def test_add_asked_dates_it_once(self):
         today = dt.date.today().isoformat()
@@ -205,7 +261,7 @@ class Dashboard(unittest.TestCase):
             out = subprocess.run([sys.executable, str(BIN), *argv], capture_output=True, text=True,
                                  env=dict(os.environ, CLAUDESEC_HOME=str(self.home)))
             self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(self.numbers(), [("asked", 1), ("asked", 2)])
+        self.assertEqual(self.numbers(), [("doing", 1), ("doing", 2)])
 
     def test_an_asked_item_without_a_date_doesnt_break_the_pane(self):
         # written by hand, or by an older `queue add --asked`: the （中） is taken for the note

@@ -1083,10 +1083,9 @@ def cmd_spawn(args):
     d = prepare_worker(name, cfg, initial, project, agent=args.agent, memory=memory)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
-    # A Cursor agent that fails (a model it won't take, a login gone) says so and exits, often after
-    # stuck_on_dialog has stopped looking; the hook after it records that instead of a STARTING
-    # that never ends.
-    cmd = (cursor_command(name, model, d=d) + f"; CLAUDESEC_RC=$? {hook_cmd()} hook cursor-exit {shlex.quote(name)}"
+    # A Cursor worker's window runs `hook cursor-launch`, which runs the agent: it retries or falls
+    # back when the model is refused, and records a failure instead of a STARTING that never ends.
+    cmd = (f"CLAUDESEC_MODEL={shlex.quote(model)} {hook_cmd()} hook cursor-launch {shlex.quote(name)}"
            if cursor else worker_command(name, d, cfg, model))
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project, cmd).strip()
 
@@ -2550,9 +2549,51 @@ def finish_later(name):
                      start_new_session=True)
 
 
+CURSOR_FALLBACK_MODEL = "gpt-5.6-sol-high"
+AGENT_START = "[claudesec] Cursor agent, model "
+
+
+def hook_cursor_launch(name):
+    """What a spawned Cursor worker's window runs: its agent, in the foreground. Cursor now and
+    then answers a model variant string with "Cannot use this model" and exits, though the same
+    string works a minute later (devbox, 2026-10-22). Refused, the model is tried once more; refused
+    again, CURSOR_FALLBACK_MODEL stands in for it, which the worker's summary and log say. Any
+    other failure is left to hook_cursor_exit."""
+    model = os.environ.get("CLAUDESEC_MODEL") or config()["cursor_worker_model"]
+    first = (worker_dir(name) / "initial.md").read_text()
+    pane = os.environ.get("TMUX_PANE", "")
+    env = {**os.environ, "CLAUDESEC_WORKER": name, "CLAUDESEC_HOME": str(HOME)}
+    env.pop("CLAUDESEC_MODEL", None)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C (`claudesec interrupt`) is the agent's
+
+    def run(m):
+        print(AGENT_START + m, flush=True)
+        return subprocess.run(["agent", "--model", m, "--trust", first], env=env,
+                              preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)).returncode
+
+    def refused():  # only what the last run printed
+        screen = pane_text(pane, suggestion="drop") if pane else ""
+        return "Cannot use this model" in screen.rsplit(AGENT_START, 1)[-1]
+
+    rc = run(model)
+    if rc and refused():
+        time.sleep(5)
+        rc = run(model)
+        if rc and refused() and model != CURSOR_FALLBACK_MODEL:
+            note = f"模型兜底：{model} 被拒两次，改用 {CURSOR_FALLBACK_MODEL}"
+            with registry() as reg:
+                w = reg["workers"].get(name)
+                if w is not None:
+                    w.update(model=CURSOR_FALLBACK_MODEL, last_summary=note)
+            append_log(name, "model-fallback", note)
+            rc = run(CURSOR_FALLBACK_MODEL)
+    os.environ["CLAUDESEC_RC"] = str(rc)
+    hook_cursor_exit(name)
+
+
 def hook_cursor_exit(name):
-    """Runs in a spawned Cursor worker's window right after its agent exits. A clean exit (the
-    user quit it) is left alone; any other is a failure nobody would otherwise hear of."""
+    """After a spawned Cursor worker's agent exits for good. A clean exit (the user quit it) is
+    left alone; any other is a failure nobody would otherwise hear of."""
     rc = os.environ.get("CLAUDESEC_RC", "")
     if rc in ("0", ""):
         return
@@ -2941,6 +2982,7 @@ HOOKS = {
     "cursor-stop": hook_cursor_stop,
     "cursor-finish": hook_cursor_finish,
     "cursor-exit": hook_cursor_exit,
+    "cursor-launch": hook_cursor_launch,
 }
 
 

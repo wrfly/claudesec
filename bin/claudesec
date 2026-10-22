@@ -1083,8 +1083,12 @@ def cmd_spawn(args):
     d = prepare_worker(name, cfg, initial, project, agent=args.agent, memory=memory)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
-    window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project,
-                  cursor_command(name, model, d=d) if cursor else worker_command(name, d, cfg, model)).strip()
+    # A Cursor agent that fails (a model it won't take, a login gone) says so and exits, often after
+    # stuck_on_dialog has stopped looking; the hook after it records that instead of a STARTING
+    # that never ends.
+    cmd = (cursor_command(name, model, d=d) + f"; CLAUDESEC_RC=$? {hook_cmd()} hook cursor-exit {shlex.quote(name)}"
+           if cursor else worker_command(name, d, cfg, model))
+    window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project, cmd).strip()
 
     with registry() as reg:
         reg["workers"][name] = {
@@ -2538,6 +2542,30 @@ def finish_later(name):
                      start_new_session=True)
 
 
+def hook_cursor_exit(name):
+    """Runs in a spawned Cursor worker's window right after its agent exits. A clean exit (the
+    user quit it) is left alone; any other is a failure nobody would otherwise hear of."""
+    rc = os.environ.get("CLAUDESEC_RC", "")
+    if rc in ("0", ""):
+        return
+    screen = pane_text(os.environ.get("TMUX_PANE", ""), suggestion="drop") if os.environ.get("TMUX_PANE") else ""
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    why = next((l for l in lines if "Cannot use this model" in l), None)
+    why = (why.split(". Available models")[0] if why else (lines[-1] if lines else f"exit {rc}"))[:200]
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is None:
+            return
+        w.update(status="FAILED", last_report_at=now(), pending_ask=None,
+                 last_summary=f"Cursor agent 退出（rc {rc}）：{why}"[:200])
+        boss = w.get("delegated_by")
+    append_log(name, "agent-exit", f"rc {rc}\n" + "\n".join(lines[-15:]))
+    if boss:
+        receipt(f"{name}（为 {boss}）的 Cursor agent 退出了（rc {rc}）：{why}")
+    elif secretary_alive():
+        raise_alert(f"Cursor worker {name} 的 agent 退出了（rc {rc}）：{why}。`claudesec close {name}` 后换个模型重开。")
+
+
 def hook_cursor_finish(name):
     time.sleep(2)
     w = read_registry()[1].get(name)
@@ -2904,6 +2932,7 @@ HOOKS = {
     "cursor-prompt": hook_cursor_prompt,
     "cursor-stop": hook_cursor_stop,
     "cursor-finish": hook_cursor_finish,
+    "cursor-exit": hook_cursor_exit,
 }
 
 

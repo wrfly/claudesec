@@ -716,9 +716,13 @@ def show_dashboard(what):
     # own screen (nothing piles up in tmux's history), no cursor, clicks and the wheel as SGR reports
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
     top, opened, shown, content, due, sec = 0, set(), None, None, 0, None
+    code, reload = code_stamp(), False
     try:
         while True:
             size = shutil.get_terminal_size()
+            if time.monotonic() >= due and code_changed(code):
+                reload = True  # claudesec was updated: run the new code, not this process's copy
+                break
             if time.monotonic() >= due or content is None or content[0] != size:
                 panes = window_panes(me) if me else [("", "secretary", "0")]
                 sec = next((p for p, role, _ in panes if role == "secretary"), None)
@@ -761,6 +765,33 @@ def show_dashboard(what):
         sys.stdout.flush()
         if saved:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    if reload:
+        os.execv(sys.executable, [sys.executable, str(SELF), "dashboard", "show", what])
+
+
+def code_stamp():
+    """When claudesec's file last changed (a git pull replaces it). It imports nothing of its own."""
+    with contextlib.suppress(OSError):
+        return SELF.stat().st_mtime_ns
+    return None
+
+
+def code_changed(stamp):
+    """True once the file changed and the new version compiles: a dashboard pane is a long-lived
+    process that would otherwise show an update only after `dashboard off` / `on`. A file that
+    doesn't compile (written half-way, a broken edit) keeps the running copy going."""
+    now_stamp = code_stamp()
+    if now_stamp is None or now_stamp == stamp or now_stamp in BROKEN_CODE:
+        return False
+    try:
+        compile(SELF.read_text(), str(SELF), "exec")
+    except (OSError, SyntaxError, ValueError):
+        BROKEN_CODE.add(now_stamp)  # not compiled again every refresh; the next change is tried
+        return False
+    return True
+
+
+BROKEN_CODE = set()
 
 
 def cmd_dashboard(args):

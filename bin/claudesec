@@ -107,7 +107,10 @@ def config():
     path = HOME / "config.json"
     if not path.exists():
         HOME.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n")
+        # Whole or not at all: another claudesec reading it mid-write got an empty file.
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n")
+        tmp.replace(path)
     return {**DEFAULT_CONFIG, **json.loads(path.read_text())}
 
 
@@ -358,18 +361,27 @@ def secretary_pane(sess):
 
 
 def arrange_dashboard(sess):
-    """Make the secretary window's panes match its width and the `dashboard` setting."""
+    """Make the secretary window's panes match its width and the `dashboard` setting. One at a
+    time: `claudesec start` arranges, and the client-attached hook it sets fires `dashboard layout`
+    in the background as the terminal attaches; both saw no panes and each split the window."""
+    with open(HOME / "dashboard.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        arrange_dashboard_locked(sess)
+
+
+def arrange_dashboard_locked(sess):
     sec = secretary_pane(sess)
     if not sec:
         return
     tmux("set-option", "-p", "-t", sec, "@claudesec-role", "secretary", check=False)
     width = int(tmux("display", "-p", "-t", sec, "#{window_width}", check=False).strip() or 0)
     want = ["queue", "status"] if config().get("dashboard", True) and width >= DASH_MIN else []
-    # "both" is the combined pane earlier versions put in a narrower window
-    have = {role: p for p, role, _ in window_panes(sec) if role in ("queue", "status", "both")}
-    if sorted(have) == sorted(want):
+    # "both" is the combined pane earlier versions put in a narrower window. A list, not a dict
+    # by role: a doubled dashboard must not pass for the wanted one.
+    have = [(role, p) for p, role, _ in window_panes(sec) if role in ("queue", "status", "both")]
+    if sorted(role for role, _ in have) == sorted(want):
         return
-    for p in have.values():
+    for _, p in have:
         tmux("kill-pane", "-t", p, check=False)
     if not want:
         return

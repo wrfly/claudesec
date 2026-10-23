@@ -79,6 +79,7 @@ EOF
   （有后台任务在跑，Stop hook 不拦）。它汇报 DONE / FAILED / BLOCKED / NEED_DECISION 时 wait 结束，
   输出就是汇报原文；出错、中途停下没汇报、窗口没了，wait 也会结束并说明。PROGRESS 不会打扰你。
 - 它问你问题（NEED_DECISION）或要它接着做：同一个 `--name` 再跑一次 delegate，stdin 写答复，再后台 wait。
+  它已经交差、被归档关窗了也一样：claudesec 会在它原来的目录恢复它原来的对话接着做；对话或目录没了会拒绝并告诉你怎么另起。
   要用户拍板的，照常发你自己的 NEED_DECISION。
 - DONE 之后 claudesec 自动归档、关掉它的窗口。FAILED / BLOCKED 秘书会知道；你决定重派、自己做，还是在汇报里说明。
 - 结果核对一遍再用进你的活里，你的汇报里写明哪部分是 Cursor 做的。

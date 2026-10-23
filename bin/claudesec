@@ -2300,9 +2300,11 @@ def cmd_wake(args):
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
                  f"someone resumed it outside claudesec")
     quiet = getattr(args, "quiet", False)
-    instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
-    initial = WAKE_PROMPT + (f"\n秘书转来用户的新指令（原话），照做并按规则汇报：\n\n{instruction}\n"
-                             if instruction else "\n" + WAKE_REPORT)
+    instruction = getattr(args, "instruction", None)
+    if instruction is None:
+        instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
+    intro = getattr(args, "intro", None) or "秘书转来用户的新指令（原话），照做并按规则汇报："
+    initial = WAKE_PROMPT + (f"\n{intro}\n\n{instruction}\n" if instruction else "\n" + WAKE_REPORT)
     model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=w.get("agent", "claude"),
                        memory=w.get("memory"))
@@ -2319,7 +2321,7 @@ def cmd_wake(args):
         reg["workers"][name].update(window=window, model=model, status="STARTING", session=sid if cursor else None)
     tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, cmd)
     if instruction:
-        append_log(name, "secretary→worker", instruction)
+        append_log(name, f"{w.get('delegated_by') or 'secretary'}→worker", instruction)
 
     verdict, screen = confirm_cursor_start(pane, d) if cursor else confirm_resume(name, pane, d, sid)
     tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
@@ -2329,7 +2331,7 @@ def cmd_wake(args):
             w = reg["workers"][name]
             if quiet:
                 w["status"] = w.get("status_before") or "PROGRESS"
-            else:
+            elif not w.get("delegated_by"):  # a delegated one is its delegator's business
                 reg["focus"] = name
             w.pop("shelved_by", None)
         append_log(name, "task", f"woken{' quietly' if quiet else ''} (session {sid}, {cwd})")
@@ -2545,7 +2547,8 @@ def cmd_archive(args):
         trace = "\n".join(f"=== {h}\n{b}" for h, b in entries)
         path.write_text(
             frontmatter(date=w["started_at"][:10], project=w["dir"], worker=args.name, model=w["model"],
-                        session=w.get("session"), status=status, files=files, tags=tags) +
+                        session=w.get("session"), status=status, files=files, tags=tags,
+                        **({"delegated_by": w["delegated_by"]} if w.get("delegated_by") else {})) +
             f"## 任务\n{w['task']}\n\n"
             f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
             f"## 结果\n{final.get('RESULT') or args.summary or '（worker 未给出 RESULT）'}\n\n"
@@ -2968,6 +2971,34 @@ def receipt(line):
         raise_alert(f"[委托回执] {line}")
 
 
+def archived_delegation(name):
+    """The newest archive of a delegated Cursor worker called name, or None: its frontmatter
+    (project, session, model, delegated_by) plus path. Older archives didn't record who
+    delegated it; their index line starts the summary with 为 <worker>：."""
+    found = []
+    for path in (HOME / "history").glob("*/*.md"):
+        with contextlib.suppress(OSError, ValueError):
+            text = path.read_text()
+            if not text.startswith("---\n"):
+                continue
+            meta = {}
+            for line in text.split("\n---\n", 1)[0].splitlines()[1:]:
+                key, _, value = line.partition(": ")
+                meta[key] = json.loads(value)
+            if meta.get("worker") == name and "delegated" in (meta.get("tags") or []):
+                found.append((path.stat().st_mtime, path, meta))
+    if not found:
+        return None
+    _, path, meta = max(found, key=lambda f: f[0])
+    if not meta.get("delegated_by"):
+        index = HOME / "history" / "INDEX.md"
+        rel = str(path.relative_to(HOME / "history"))
+        line = next((l for l in (index.read_text().splitlines() if index.exists() else []) if rel in l), "")
+        m = re.search(rf"· {re.escape(name)} · \w+ · 为 ([a-z0-9-]+)：", line)
+        meta["delegated_by"] = m[1] if m else None
+    return {**meta, "path": path}
+
+
 def cmd_delegate(args):
     workers = read_registry()[1]
     boss = args.boss
@@ -3004,6 +3035,41 @@ def cmd_delegate(args):
         start = len(read_log(name))
         send_text(name, w, task, by=boss)
         verb = "sent to"
+    elif (past := archived_delegation(name)):
+        # Done, archived and closed: its window is gone and so is its registry entry, but the
+        # Cursor chat and its directory may still be there. Resumed with the new task, it keeps
+        # what it knew; a fresh spawn under the same name would start blind in the wrong place.
+        by = past.get("delegated_by")
+        if by and by != boss:
+            sys.exit(f"NOT DELEGATED: {name} was {by}'s delegation (archived {past['path']}); pick another --name")
+        if not (past.get("session") and cursor_chat_exists(past["session"]) and Path(past["project"]).is_dir()):
+            sys.exit(f"NOT DELEGATED: {name} already finished and was closed, and its chat or its directory "
+                     f"({past['project']}) is gone, so it can't pick this up. Delegate under a new --name with "
+                     f"--dir {past['project']}, and put in the task what it needs from the first round "
+                     f"(its archive: {past['path']}).")
+        with registry() as reg:
+            reg["workers"][name] = {
+                "window": None, "dir": past["project"], "model": past.get("model"), "task": task,
+                "agent": "cursor", "delegated_by": boss, "mode": "task", "status": "SHELVED",
+                "shelved_by": "archived", "session": past["session"], "started_at": now(),
+                "last_report_at": now(), "last_summary": "", "pending_ask": None,
+                "archived": str(past["path"].relative_to(HOME / "history")),
+            }
+        if ack:
+            append_log(name, "ack", ack)
+        (worker_dir(name) / "finish").unlink(missing_ok=True)
+        start = len(read_log(name))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            err = quietly(cmd_wake, name=name, model=args.model, quiet=False, instruction=task,
+                          intro=f"worker {boss} 追加给你的任务（它写的原文），接着上一轮做，照做并按规则汇报：")
+        if err:
+            with registry() as reg:
+                reg["workers"].pop(name, None)
+            sys.exit(f"NOT DELEGATED: {name} had finished and been closed; resuming its chat failed: {err}\n"
+                     f"{out.getvalue()}Delegate under a new --name with --dir {past['project']} instead.")
+        print(out.getvalue().rstrip())
+        verb = "resumed (it had finished and been closed; same chat, same directory)"
     else:
         project = str(Path(args.dir or workers[boss]["dir"]).expanduser().resolve())
         if not Path(project).is_dir():

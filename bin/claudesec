@@ -2713,8 +2713,9 @@ def print_reminders():
 # ---------- daily review: tidy the secretary's memory, propose prompt changes ----------
 
 def secretary_memory_dir():
-    """Claude Code keys auto memory by cwd, and the secretary's cwd is HOME."""
-    return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HOME)) / "memory"
+    """Claude Code keys auto memory by cwd, and the secretary's cwd is HOME. By the resolved cwd:
+    with HOME under a linked /home, an unresolved name is a dir nobody writes to."""
+    return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HOME.resolve())) / "memory"
 
 
 def memory_settings(cwd):

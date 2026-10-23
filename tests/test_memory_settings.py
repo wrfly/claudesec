@@ -95,6 +95,12 @@ class MemorySettings(unittest.TestCase):
         s = settings(self.cs.prepare_worker("r", cfg, "hi", cwd, memory="/elsewhere/memory"))
         self.assertEqual(s["autoMemoryDirectory"], "/elsewhere/memory")
 
+    def test_secretary_memory_by_the_resolved_home(self):
+        real = self.dir("data", "state")
+        (self.root / "home").symlink_to(self.root / "data")
+        cs = load(self.root / "home" / "state")
+        self.assertEqual(cs.secretary_memory_dir(), self.config / "projects" / mangle(real) / "memory")
+
 
 if __name__ == "__main__":
     unittest.main()

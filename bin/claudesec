@@ -16,6 +16,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     --asked: in 待答 (asked, waiting), --later: in 搁置 (put off)
   claudesec queue move N backlog|todo|doing|done [--note T]   item #N to 搁置 / 待问 / 待答 / 已处理
   claudesec queue number                 number the open queue items written without one
+  claudesec notice add [--from W] TEXT   something for the user to do (not decide); notice done N, notice list
+  claudesec show N                       the whole of queue item or notice #N
   claudesec dashboard on|off              queue and progress panes beside the secretary (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
@@ -654,6 +656,44 @@ STATUS_LOOK = {
 }
 
 
+def short_model(model):
+    """A model id as the progress pane shows it, short: claude-opus-5-5 → opus-5-5,
+    gpt-5.6-sol-high → 5.6-sol-high, a Cursor variant gpt-5.6-sol[context=1m,...] → 5.6-sol 1m."""
+    model = re.sub(r"^(claude|gpt)-", "", model or "")
+    m = re.match(r"([^\[]+)\[(.*)\]$", model)
+    if not m:
+        return model
+    ctx = re.search(r"context=([^,\]]+)", m[2])
+    return m[1] + (f" {ctx[1]}" if ctx else "")
+
+
+def status_line(cols, focused, name, mark, word, color, summary, age, tokens, model, widths):
+    """A worker's folded line: name (summary) status age tokens model, the last four in columns
+    at the right. Short of room, the tokens go first (the unfolded lines have them), then the
+    model; then the summary shrinks to nothing. The name and status stay."""
+    name_w, word_w, tok_w, model_w = widths
+    head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "),
+            (BOLD + (";4" if focused else ""), cut(name, name_w).ljust(name_w))]
+    status = [("", "  "), (color, word + " " * (word_w - width(word)))]
+    tails = [[("", "  "), (DIM, f"{age:>3}")], [("", "  "), (DIM, f"{tokens:>{tok_w}}")]]
+    if model_w:
+        tails.append([("", "  "), (DIM, model + " " * (model_w - width(model)))])
+    while True:
+        right = status + [seg for t in tails for seg in t]
+        room = cols - sum(width(t) for _, t in head + right)
+        if room >= 12 or len(tails) == 1:
+            break
+        tails.pop(1)  # tokens, then the model
+    if room >= 8:  # " (" + at least a few characters + ")"
+        text = cut(summary, room - 3)
+        text = text if text == summary else cut(summary, room - 4) + "…"
+        mid = [("", " "), (DIM, f"({text})")]
+        mid.append(("", " " * (room - sum(width(t) for _, t in mid))))
+    else:
+        mid = [("", " " * max(0, room))]
+    return fit(head + mid + right, cols)
+
+
 def status_blocks(cols, now=None):
     """The progress pane: (title bar, blocks). A worker folds to its status line; unfolded it
     adds its last report (the question, for those waiting on the user)."""
@@ -679,7 +719,8 @@ def status_blocks(cols, now=None):
             summary = tr(f"为 {w['delegated_by']}：", f"for {w['delegated_by']}: ") + summary
         rows.append((group, -(dt.datetime.fromisoformat(w["last_report_at"]).timestamp()
                               if w.get("last_report_at") else 0), name, mark, word, color, summary,
-                     ago(w["last_report_at"], now) if w.get("last_report_at") else "", usage[name]))
+                     ago(w["last_report_at"], now) if w.get("last_report_at") else "", usage[name],
+                     short_model(w.get("model"))))
     rows.sort(key=lambda r: r[:3])
     counts = [sum(1 for r in rows if r[0] == g) for g in range(4)]
     labels = tr(("等你", "出错", "在做", "做完", "搁置"), ("you", "errors", "working", "done", "shelved"))
@@ -687,17 +728,17 @@ def status_blocks(cols, now=None):
     title = bar(tr(" 任务进展", " Workers"), right + f"{labels[4]} {len(shelved)} ", cols)
     blocks = []
     name_w = min(max((width(r[2]) for r in rows), default=0), 16)
-    tok_w = max((len(usage_word(r[-1])) for r in rows), default=0)
-    for i, (group, _, name, mark, word, color, summary, age, use) in enumerate(rows):
+    word_w = max((width(r[4]) for r in rows), default=0)
+    tok_w = max((len(usage_word(r[8])) for r in rows), default=0)
+    model_w = max((width(r[9]) for r in rows), default=0)
+    for i, (group, _, name, mark, word, color, summary, age, use, model) in enumerate(rows):
         if i and group != rows[i - 1][0]:
             blocks.append(fixed([]))
-        name_style = BOLD + (";4" if name == focus else "")
-        head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "),
-                (name_style, cut(name, name_w).ljust(name_w)), ("", "  "), (color, word)]
-        right = f"{age:>3}  {usage_word(use):>{tok_w}}"  # how long ago, then tokens used
-        gap = cols - sum(width(t) for _, t in head) - width(right)
-        head = head + [("", " " * gap), (DIM, right)] if gap >= 1 else fit(head, cols)
+        head = status_line(cols, name == focus, name, mark, word, color, summary, age, usage_word(use), model,
+                           (name_w, word_w, tok_w, model_w))
         more = [[("", "  ")] + line for line in wrap([(DIM, summary)], cols - 2)]
+        if model:
+            more.append([("", "  "), (DIM, tr(f"模型 {model}", f"model {model}"))])
         if use is not None:
             more += [[("", "  ")] + line for line in wrap([(DIM, usage_detail(use))], cols - 2)]
         blocks.append((("s", name), [head], [head] + more))
@@ -1149,6 +1190,26 @@ def cmd_notice(args):
     tmp = path.with_name(".notices.md.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, path)
+
+
+def cmd_show(args):
+    """The whole of item #N, from queue.md or notices.md, with the section it is in: the
+    panes show one line of each, and the user asks for the rest by its number."""
+    num = args.number.lstrip("#")
+    for path, section_of, names in ((HOME / "queue.md", queue_section, QUEUE_SECTIONS),
+                                    (HOME / "notices.md", notice_section, NOTICE_SECTIONS)):
+        section = None
+        for line in (path.read_text() if path.exists() else "").splitlines():
+            if line.startswith("## "):
+                section = section_of(line)
+                continue
+            m = QUEUE_ITEM.match(line)
+            if m and m[1] == num:
+                where = names.get(section, ("?", "?"))[0 if lang() == "zh" else 1]
+                kind = tr("决策队列", "decision queue") if path.name == "queue.md" else tr("通知", "notices")
+                print(f"#{num}（{kind} · {where}）\n{m[2].strip()}")
+                return
+    sys.exit(tr(f"没有 #{num}：queue.md 和 notices.md 里都找不到", f"no #{num} in queue.md or notices.md"))
 
 
 def notices_blocks(cols):
@@ -3515,6 +3576,7 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("show"); s.add_argument("number"); s.set_defaults(fn=cmd_show)
     s = sub.add_parser("notice"); s.set_defaults(fn=cmd_notice)
     notice = s.add_subparsers(dest="action", required=True)
     s = notice.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--from", dest="source")

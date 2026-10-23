@@ -111,6 +111,26 @@ class Dashboard(unittest.TestCase):
         self.cs.arrange_dashboard("claudesec")
         self.assertFalse([a for a in self.calls if a[0] in ("kill-pane", "split-window")])
 
+    def test_short_model_names(self):
+        self.assertEqual(self.cs.short_model("claude-opus-5-5"), "opus-5-5")
+        self.assertEqual(self.cs.short_model("gpt-5.6-sol-high"), "5.6-sol-high")
+        self.assertEqual(self.cs.short_model("gpt-5.6-sol[context=1m,reasoning=high,fast=false]"), "5.6-sol 1m")
+        self.assertEqual(self.cs.short_model(None), "")
+
+    def test_status_line_gives_up_tokens_then_model_before_the_name_and_status(self):
+        args = (False, "plan-scale", "!", "卡住了", "", "等用户定 v1 去掉 runEvery", " 1m", "357M", "opus-5-5", (10, 6, 4, 8))
+        wide = plain(self.cs.status_line(80, *args))
+        self.assertIn("(等用户定 v1 去掉 runEvery)", wide)
+        self.assertTrue(wide.rstrip().endswith("357M  opus-5-5"), wide)
+        mid = plain(self.cs.status_line(52, *args))
+        self.assertNotIn("357M", mid)
+        self.assertIn("opus-5-5", mid)
+        narrow = plain(self.cs.status_line(30, *args))
+        self.assertIn("plan-scale", narrow)
+        self.assertIn("卡住了", narrow)
+        for line in (wide, mid, narrow):
+            self.assertLessEqual(self.cs.width(line), 80)
+
     # ---- line breaking
 
     def test_wrap_keeps_latin_words_whole(self):
@@ -322,6 +342,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual([h.split()[1] if h else "" for h in heads[:9]],
                          ["asks", "", "broke", "", "busy", "talk", "", "done", ""])
         self.assertTrue(heads[0].endswith(" 1h  -") and heads[2].endswith(" 2d  -"), heads)  # no session: no tokens
+        self.assertIn("(A or B?)", heads[0])  # the question, in brackets after the name
         self.assertIn("窗口关了", heads[4])
         self.assertIn("讨论中", heads[5])
         self.assertTrue(heads[9].startswith("搁置 1"))

@@ -52,6 +52,13 @@ class Notices(unittest.TestCase):
         self.assertIn("VNC 里装 Claude 扩展", shown)
         self.assertIn("1", title[0][1])
 
+    def test_show_prints_the_whole_item_from_either_file(self):
+        self.run_cli("notice", "add", "--from", "c", "一条很长的通知" * 10)
+        self.assertEqual(self.run_cli("show", "52"), "#52（通知 · 待办）\n[c] " + "一条很长的通知" * 10)
+        self.assertEqual(self.run_cli("show", "#51"), "#51（决策队列 · 待问）\n[w] 问题（中）")
+        with self.assertRaises(SystemExit):
+            self.run_cli("show", "77")
+
     def test_done_of_a_missing_number_says_so(self):
         with self.assertRaises(SystemExit) as e:
             self.run_cli("notice", "done", "99")

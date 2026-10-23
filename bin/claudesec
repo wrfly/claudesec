@@ -97,8 +97,9 @@ DEFAULT_CONFIG = {
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送达，按普通汇报处理"
+CURSOR_REPORT_EN = "(not an alert) Cursor worker report, come by the alert channel; handle it as an ordinary report"
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
-LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}
+LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}  # English: STATUS_LOOK
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -254,7 +255,8 @@ def pane_text(target, suggestion="mark"):
             typed = "".join(t for t, d in rest if not d)
             ghost = "".join(t for t, d in rest if d).strip()
             if ghost and not typed.strip():
-                plain = f"❯ 【CC 建议，不是用户输入】{ghost}" if suggestion == "mark" else "❯"
+                plain = tr(f"❯ 【CC 建议，不是用户输入】{ghost}", f"❯ [CC suggestion, not user input] {ghost}") \
+                    if suggestion == "mark" else "❯"
             else:
                 plain = "❯" + typed
         out.append(plain)
@@ -1049,7 +1051,7 @@ def without_asked_date(text):
 def secretary_prompt():
     """secretary.md with the Cursor parts kept or dropped for this machine, as a file for claude."""
     path = HOME / "secretary-prompt.md"
-    path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()))
+    path.write_text(render_prompt(prompt_file("secretary.md").read_text()))
     return path
 
 
@@ -1452,7 +1454,9 @@ def wake_orphans():
     for t in threads:
         t.join()
     if failed:
-        raise_alert("秘书启动时这些 worker 没能自动恢复（仍是搁置状态，可以再试 claudesec wake）：\n"
+        raise_alert(tr("秘书启动时这些 worker 没能自动恢复（仍是搁置状态，可以再试 claudesec wake）：\n",
+                       "When the secretary started, these workers couldn't be brought back automatically (still "
+                       "shelved; claudesec wake can try again):\n")
                     + "\n".join(f"- {n}: {e.splitlines()[0][:200]}" for n, e in failed.items()))
 
 
@@ -1480,12 +1484,17 @@ def cmd_spawn(args):
         check_cursor_http1()
 
     if args.discuss:
-        initial = (f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
-                   "这是讨论模式：用户现在就在看你这个窗口，直接跟用户对话。规则见系统提示里的「讨论模式」。\n")
+        initial = tr(f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
+                     "这是讨论模式：用户现在就在看你这个窗口，直接跟用户对话。规则见系统提示里的「讨论模式」。\n",
+                     f"The user wants to talk this over with you; the secretary passes on their words:\n\n{task}\n\n"
+                     "This is discussion mode: the user is looking at this window now; talk to them directly. "
+                     "The rules are under \"Discussion mode\" in your system prompt.\n")
     elif args.for_worker:
-        initial = f"worker {args.for_worker} 委托给你的任务（它写的任务书原文）：\n\n{task}\n"
+        initial = tr(f"worker {args.for_worker} 委托给你的任务（它写的任务书原文）：\n\n{task}\n",
+                     f"A task delegated to you by worker {args.for_worker} (its brief as written):\n\n{task}\n")
     else:
-        initial = getattr(args, "intro", None) or "秘书派给你的任务（用户原话）：\n\n"
+        initial = getattr(args, "intro", None) or tr("秘书派给你的任务（用户原话）：\n\n",
+                                                     "A task from the secretary (the user's own words):\n\n")
         initial += f"{task}\n"
     memory = getattr(args, "memory", None)
     d = prepare_worker(name, cfg, initial, project, agent=args.agent, memory=memory)
@@ -1526,7 +1535,7 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     d = worker_dir(name)
     for mark in ("reported", "finish", AFTER_REPORT):
         (d / mark).unlink(missing_ok=True)
-    prompt = render_prompt((PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text())
+    prompt = render_prompt(prompt_file("worker-cursor.md" if agent == "cursor" else "worker.md").read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
               .replace("{{CLAUDESEC}}", hook_cmd()))
     (d / "prompt.md").write_text(prompt)
@@ -1647,6 +1656,11 @@ def require_cursor(what):
         sys.exit(f"{what}: Cursor workers are not available here — {why}.")
 
 
+def prompt_file(name):
+    """prompts/NAME, or its English twin prompts/en/NAME (same rules, see tests/test_prompt_parity.py)."""
+    return PROMPTS / "en" / name if lang() == "en" else PROMPTS / name
+
+
 def render_prompt(text):
     """Keep or drop the prompt's Cursor parts: <!-- if cursor --> A [<!-- else --> B] <!-- end cursor -->."""
     on = cursor_available()[0]
@@ -1736,6 +1750,15 @@ ADOPT_PROMPT = """你刚被 claudesec 秘书接管：会话历史都在，从现
 - 其他情况 → TYPE: BLOCKED，ISSUE 写「等秘书确认下一步」。
 发完就停，不要自己开始新的工作。
 """
+ADOPT_PROMPT_EN = """The claudesec secretary has just taken you over: your conversation history is all here; from now on
+you work by the worker rules in your system prompt.
+First send the secretary a report with SendMessage, so it knows where you stand:
+- DID: what you were doing before and how far you got.
+- If your last task is finished: TYPE: DONE, with RESULT and DECISIONS as the format says.
+- If you stopped waiting for the user's answer: TYPE: NEED_DECISION, and ask the question again in ASK.
+- Otherwise: TYPE: BLOCKED, with ISSUE "waiting for the secretary to confirm the next step".
+Then stop; don't start any new work on your own.
+"""
 
 
 def claude_sessions():
@@ -1766,7 +1789,7 @@ def background_tasks(conv):
             flight = state.get("inFlight") or {}
             n = flight.get("tasks", 0) + flight.get("queued", 0)
             labels = [f"{f.get('kind')}「{f.get('label')}」" for f in state.get("fan") or []][:n]
-            return labels + ["后台任务"] * (n - len(labels))
+            return labels + [tr("后台任务", "bg task")] * (n - len(labels))
 
     def stamp(e):
         with contextlib.suppress(ValueError, TypeError, AttributeError, KeyError):
@@ -1808,7 +1831,7 @@ def background_tasks(conv):
         elif r.get("resumedAgentId"):
             running[r["resumedAgentId"]] = (described.get(r["resumedAgentId"], "subagent"), None)
         elif r.get("backgroundTaskId"):
-            running[r["backgroundTaskId"]] = ("后台命令", None)
+            running[r["backgroundTaskId"]] = (tr("后台命令", "bg command"), None)
         elif r.get("taskId") and r.get("timeoutMs"):
             running[r["taskId"]] = ("monitor", None if r.get("persistent") else stamp(e) + r["timeoutMs"] / 1000)
     return [what for what, until in running.values() if until is None or until > time.time()]
@@ -1890,7 +1913,7 @@ def print_rows(rows):
 def cmd_sessions(args):
     sessions = external_sessions()
     if not sessions:
-        print("没有 claudesec 之外的 Claude 会话。")
+        print(tr("没有 claudesec 之外的 Claude 会话。", "No Claude sessions outside claudesec."))
         return
     print_rows(session_rows(sessions))
 
@@ -2109,7 +2132,7 @@ def cmd_adopt(args):
     label = s.get("name") or conv.get("jobId") or sid[:8]
     name = worker_name_for(s, conv, args.as_name)
     model = args.model or cfg["worker_model"]
-    d = prepare_worker(name, cfg, ADOPT_PROMPT, cwd)
+    d = prepare_worker(name, cfg, tr(ADOPT_PROMPT, ADOPT_PROMPT_EN), cwd)
     (d / "exit").unlink(missing_ok=True)
     # No trailing shell: when claude exits the pane dies, and remain-on-exit keeps it (with the
     # error on screen) until resume is confirmed.
@@ -2134,7 +2157,7 @@ def cmd_adopt(args):
     with registry() as reg:
         reg["workers"][name] = {
             "window": window, "dir": cwd, "model": model,
-            "task": f"接管的会话 {label}（原任务见其汇报）",
+            "task": tr(f"接管的会话 {label}（原任务见其汇报）", f"adopted session {label} (its task: see its report)"),
             "status": "STARTING", "started_at": now(), "last_report_at": None,
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
             "adopted_from": label,
@@ -2177,6 +2200,11 @@ WAKE_PROMPT = "你刚被 claudesec 秘书从搁置中唤醒：会话历史都在
 WAKE_REPORT = """先用 SendMessage 给秘书发一条汇报：DID 写你之前在做什么、做到了哪里；
 TYPE: BLOCKED，ISSUE 写「等秘书给下一步」。发完就停，不要自己开始新的工作。
 """
+WAKE_PROMPT_EN = ("The claudesec secretary has just woken you from the shelf: your conversation history is all here; "
+                  "carry on by the worker rules in your system prompt.\n")
+WAKE_REPORT_EN = """First send the secretary a report with SendMessage: DID, what you were doing before and how far you
+got; TYPE: BLOCKED, with ISSUE "waiting for the secretary's next step". Then stop; don't start any new work on your own.
+"""
 
 
 def last_turn(sid):
@@ -2201,7 +2229,7 @@ def last_turn(sid):
             user = text
         elif e.get("type") == "assistant":
             reply = text
-    return f"最后：{user[:80]} → {reply[:120]}" if user or reply else ""
+    return tr("最后：", "last: ") + f"{user[:80]} → {reply[:120]}" if user or reply else ""
 
 
 def live_holder(sid):
@@ -2296,9 +2324,9 @@ def cmd_shelve(args):
             stop_bg_job(conv)
         if s.get("kind") == "interactive":
             stop_foreground(s)
-        entry = {"dir": cwd, "model": config()["worker_model"], "task": f"搁置的会话 {label}",
+        entry = {"dir": cwd, "model": config()["worker_model"], "task": tr(f"搁置的会话 {label}", f"shelved session {label}"),
                  "started_at": now(), "archived": None, "adopted_from": label}
-    summary = args.note or last_turn(sid) or "（无记录）"
+    summary = args.note or last_turn(sid) or tr("（无记录）", "(no record)")
     with registry() as reg:
         reg["workers"][name] = {**entry, "status": "SHELVED", "window": None, "session": sid,
                                 "status_before": entry.get("status"),
@@ -2338,8 +2366,11 @@ def cmd_wake(args):
     instruction = getattr(args, "instruction", None)
     if instruction is None:
         instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
-    intro = getattr(args, "intro", None) or "秘书转来用户的新指令（原话），照做并按规则汇报："
-    initial = WAKE_PROMPT + (f"\n{intro}\n\n{instruction}\n" if instruction else "\n" + WAKE_REPORT)
+    intro = getattr(args, "intro", None) or tr("秘书转来用户的新指令（原话），照做并按规则汇报：",
+                                               "The secretary passes on the user's new instruction, in their own words. "
+                                               "Do it and report by the rules:")
+    initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
+                                                 "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
     model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=w.get("agent", "claude"),
                        memory=w.get("memory"))
@@ -2522,7 +2553,7 @@ def cmd_close(args):
             reg["focus"] = None
     if w.get("window"):
         tmux("kill-window", "-t", w["window"], check=False)
-    note = "" if w.get("archived") else "（注意：未归档）"
+    note = "" if w.get("archived") else tr("（注意：未归档）", " (note: not archived)")
     print(f"closed {args.name}{note}")
 
 
@@ -2530,7 +2561,7 @@ def cmd_close(args):
 
 def index_add(rel, line):
     index = HOME / "history" / "INDEX.md"
-    lines = index.read_text().splitlines() if index.exists() else ["# claudesec 历史索引", ""]
+    lines = index.read_text().splitlines() if index.exists() else [tr("# claudesec 历史索引", "# claudesec history index"), ""]
     lines = [l for l in lines if f"→ {rel}" not in l] + [f"{line} → {rel}"]
     index.write_text("\n".join(lines) + "\n")
 
@@ -2563,7 +2594,8 @@ def cmd_archive(args):
         project = str(Path(args.dir).expanduser().resolve()) if args.dir else ""
         path.write_text(frontmatter(date=date, project=project, worker="subagent", session=None,
                                     status="DONE", files=files, tags=tags) +
-                        f"## 任务\n{args.task or ''}\n\n## 结果\n{args.summary or ''}\n\n## 过程\n{body}\n")
+                        tr(f"## 任务\n{args.task or ''}\n\n## 结果\n{args.summary or ''}\n\n## 过程\n{body}\n",
+                           f"## Task\n{args.task or ''}\n\n## Result\n{args.summary or ''}\n\n## Process\n{body}\n"))
         status = "DONE"
     else:
         _, workers = read_registry()
@@ -2576,7 +2608,7 @@ def cmd_archive(args):
                 if r.get("TYPE") in ("DONE", "FAILED"):
                     final = r
         user_decisions = [f"- {h.split()[0]} {b.strip()}" for h, b in entries
-                          if h.endswith("secretary→worker") and b.lstrip().startswith("用户决策")]
+                          if h.endswith("secretary→worker") and is_user_decision(b)]
         path = history_file(date, args.name, w.get("archived"))
         status = final.get("TYPE", w["status"])
         trace = "\n".join(f"=== {h}\n{b}" for h, b in entries)
@@ -2584,13 +2616,20 @@ def cmd_archive(args):
             frontmatter(date=w["started_at"][:10], project=w["dir"], worker=args.name, model=w["model"],
                         session=w.get("session"), status=status, files=files, tags=tags,
                         **({"delegated_by": w["delegated_by"]} if w.get("delegated_by") else {})) +
-            f"## 任务\n{w['task']}\n\n"
-            f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
-            f"## 结果\n{final.get('RESULT') or args.summary or '（worker 未给出 RESULT）'}\n\n"
-            f"## worker 决策\n{final.get('DECISIONS') or '（worker 未给出）'}\n\n"
-            + (f"## 待办\n{final['TODO']}\n\n" if final.get("TODO") else "") +
-            f"## 过程\n```\n{trace}\n```\n"
-            f"\n完整 transcript：`claude --resume {w.get('session')}`\n")
+            tr(f"## 任务\n{w['task']}\n\n"
+               f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
+               f"## 结果\n{final.get('RESULT') or args.summary or '（worker 未给出 RESULT）'}\n\n"
+               f"## worker 决策\n{final.get('DECISIONS') or '（worker 未给出）'}\n\n"
+               + (f"## 待办\n{final['TODO']}\n\n" if final.get("TODO") else "") +
+               f"## 过程\n```\n{trace}\n```\n"
+               f"\n完整 transcript：`claude --resume {w.get('session')}`\n",
+               f"## Task\n{w['task']}\n\n"
+               f"## User decisions\n{chr(10).join(user_decisions) or 'none'}\n\n"
+               f"## Result\n{final.get('RESULT') or args.summary or '(the worker gave no RESULT)'}\n\n"
+               f"## Worker decisions\n{final.get('DECISIONS') or '(the worker gave none)'}\n\n"
+               + (f"## To do\n{final['TODO']}\n\n" if final.get("TODO") else "") +
+               f"## Process\n```\n{trace}\n```\n"
+               f"\nFull transcript: `claude --resume {w.get('session')}`\n"))
         with registry() as reg:
             reg["workers"][args.name]["archived"] = str(path.relative_to(HOME / "history"))
     rel = str(path.relative_to(HOME / "history"))
@@ -2601,13 +2640,15 @@ def cmd_archive(args):
 
 
 LESSONS = "# 秘书的教训（用户说「复盘」时交给 claudesec worker 归类，处理过的移到「已处理」）\n\n"
+LESSONS_EN = "# The secretary's lessons (sorted by a claudesec worker at the daily review; reviewed ones move to Done)\n\n"
 
 
 def cmd_lesson(args):
     path = HOME / "lessons.md"
-    text = path.read_text() if path.exists() else LESSONS
-    entry = f"- {dt.date.today().isoformat()} · {args.type} · {args.situation} · 「{args.correction}」\n"
-    pending, mark, done = text.partition("\n## 已处理")  # new ones go above the reviewed ones
+    text = path.read_text() if path.exists() else tr(LESSONS, LESSONS_EN)
+    entry = f"- {dt.date.today().isoformat()} · {args.type} · {args.situation} · " + tr(f"「{args.correction}」\n",
+                                                                                     f"\"{args.correction}\"\n")
+    pending, mark, done = text.partition(done_heading(text))  # new ones go above the reviewed ones
     path.write_text(pending.rstrip("\n") + "\n" + entry + (mark and "\n" + mark.lstrip("\n") + done))
     print("noted")
 
@@ -2713,12 +2754,13 @@ def cmd_remind(args):
     if args.list or not args.words:
         items = read_reminders() if args.all else [r for r in read_reminders() if r["status"] == "pending"]
         if not items:
-            print("没有提醒。" if args.all else "没有未到点的提醒。")
+            print(tr("没有提醒。", "No reminders.") if args.all else tr("没有未到点的提醒。", "No reminders due."))
             return
-        rows = [("id", "时间", "重复", "给", "状态", "内容")]
+        rows = [("id", *tr(("时间", "重复", "给", "状态", "内容"), ("when", "repeat", "for", "status", "text")))]
         for r in sorted(items, key=by_due):
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
-                         r["target"], {"pending": "未到点", "fired": "已发", "cancelled": "已取消"}[r["status"]],
+                         r["target"], tr({"pending": "未到点", "fired": "已发", "cancelled": "已取消"},
+                                        {"pending": "pending", "fired": "fired", "cancelled": "cancelled"})[r["status"]],
                          r["text"][:60]))
         print_rows(rows)
         return
@@ -2738,17 +2780,21 @@ def cmd_remind(args):
         data["next_id"] += 1
         data["items"].append({"id": rid, "due": due.isoformat(timespec="seconds"), "target": target, "text": text,
                               "every": every, "status": "pending", "created_at": now()})
-    note = "" if target in workers or target == "secretary" else f"（注意：{target} 现在不是 worker）"
-    repeat = f"起，{show_every(every)}" if every else ""
-    print(f"{rid}: {show_time(due.isoformat())}{repeat} 叫醒秘书，给 {target}：{text}{note}")
+    note = "" if target in workers or target == "secretary" else tr(f"（注意：{target} 现在不是 worker）",
+                                                                     f" (note: {target} is not a worker now)")
+    repeat = tr(f"起，{show_every(every)}", f" on, {show_every(every)}") if every else ""
+    print(tr(f"{rid}: {show_time(due.isoformat())}{repeat} 叫醒秘书，给 {target}：{text}{note}",
+             f"{rid}: {show_time(due.isoformat())}{repeat} wakes the secretary, for {target}: {text}{note}"))
 
 
 def deliver_reminder(r):
     """Wake the secretary with a due reminder, through the alert channel."""
     due = dt.datetime.fromisoformat(r["due"])
     late = (dt.datetime.now().astimezone() - due).total_seconds()
-    late_note = f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）" if late > 3 * REMINDER_CHECK_SECS + 60 else ""
-    raise_alert(f"[提醒 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}")
+    late_note = tr(f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）", f", {int(late // 60)} minutes late (the "
+                   "secretary wasn't running then)") if late > 3 * REMINDER_CHECK_SECS + 60 else ""
+    raise_alert(tr(f"[提醒 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}",
+                   f"[reminder {r['id']}] due {show_time(r['due'])}{late_note}, for {r['target']}: {r['text']}"))
     if r["target"] in read_registry()[1]:
         append_log(r["target"], "reminder", r["text"])
     return "secretary alerted"
@@ -2779,7 +2825,8 @@ def fire_due_reminders():
             how = deliver_reminder(r)
         except Exception as e:  # keep checking the others; tell the secretary this one went wrong
             how = f"failed: {e}"
-            raise_alert(f"[提醒 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}")
+            raise_alert(tr(f"[提醒 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}",
+                           f"[reminder {r['id']}] couldn't be delivered ({e}); for {r['target']}: {r['text']}"))
         with reminders() as data:
             for x in data["items"]:
                 if x["id"] == r["id"]:
@@ -2847,7 +2894,7 @@ def cmd_review(args):
     """A fresh worker each day: the review needs none of yesterday's context, and a long-lived
     one would carry every past review along."""
     date = dt.date.today().isoformat()
-    brief = (PROMPTS / "review.md").read_text()
+    brief = prompt_file("review.md").read_text()
     # Resolved: through a symlink every write would ask (see memory_settings). The worker gets it
     # as its own auto memory dir, where Write and Edit don't ask either.
     memory = secretary_memory_dir().resolve()
@@ -2868,7 +2915,7 @@ def cmd_review(args):
     if w:
         quietly(cmd_close, name=name)
     cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=None, discuss=False, agent="claude",
-                                 for_worker=None, task=brief, intro="claudesec 每日例行派给你的任务：\n\n",
+                                 for_worker=None, task=brief, intro=tr("claudesec 每日例行派给你的任务：\n\n", "claudesec's daily routine task for you:\n\n"),
                                  memory=str(memory)))
 
 
@@ -2945,12 +2992,12 @@ def cmd_report(args):
         typ = r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
         if typ in ("FAILED", "BLOCKED"):
             why = (r.get("ISSUE") or r.get("DID") or text).splitlines()[0][:120]
-            receipt(f"{args.name}（为 {boss}）{typ}：{why}")
+            receipt(tr(f"{args.name}（为 {boss}）{typ}：{why}", f"{args.name} (for {boss}) {typ}: {why}"))
         if typ == "DONE":
             (worker_dir(args.name) / "finish").write_text(now())  # archived and closed when the turn ends
         print(f"reported to {boss}")
     elif secretary_alive():
-        raise_alert(f"{CURSOR_REPORT}「{args.name}」：\n{text}")
+        raise_alert(tr(f"{CURSOR_REPORT}「{args.name}」：\n{text}", f"{CURSOR_REPORT_EN} \"{args.name}\":\n{text}"))
         print(f"reported to {config()['secretary_name']}")
     else:
         print("recorded; the secretary is not running and will see it in `claudesec log`")
@@ -2990,25 +3037,25 @@ def cmd_send(args):
 # refused back to the delegator, who either does it itself or says why it's fine (--ack).
 
 DELEGATE_GUARD = [
-    ("push / merge", r"\bgit\s+push\b|\bpush\b|\bmerge\b|合入|合并到|\bMR\b|\bPR\b"),
-    ("部署 / 发版", r"部署|发版|上线|发布|\bdeploy|\brelease\b|\brollout\b|回滚|\brollback\b"),
-    ("凭据", r"凭据|凭证|密码|私钥|\bcredential|\bpassword|\bsecret|\btoken|\bAK\b|\bSK\b|access[ _-]?key"
+    (("push / merge",) * 2, r"\bgit\s+push\b|\bpush\b|\bmerge\b|合入|合并到|\bMR\b|\bPR\b"),
+    (("部署 / 发版", "deploy / release"), r"部署|发版|上线|发布|\bdeploy|\brelease\b|\brollout\b|回滚|\brollback\b"),
+    (("凭据", "credentials"), r"凭据|凭证|密码|私钥|\bcredential|\bpassword|\bsecret|\btoken|\bAK\b|\bSK\b|access[ _-]?key"
            r"|\.ssh\b|\.pem\b|\bcookie"),
-    ("对外发消息", r"发消息|发送消息|发到群|群里|通知.{0,6}(用户|群|人)|邮件|\bemail|\bslack|\bwebhook|\blark-cli\s+im"
+    (("对外发消息", "messages to others"), r"发消息|发送消息|发到群|群里|通知.{0,6}(用户|群|人)|邮件|\bemail|\bslack|\bwebhook|\blark-cli\s+im"
                    r"|send[ _-]?message"),
-    ("删除 / 改线上数据", r"\brm\s+-rf\b|\bdrop\s+table\b|\bdelete\s+from\b|\btruncate\b|删库|删表"),
+    (("删除 / 改线上数据", "deleting / changing live data"), r"\brm\s+-rf\b|\bdrop\s+table\b|\bdelete\s+from\b|\btruncate\b|删库|删表"),
 ]
 
 
 def delegate_guard(task):
     """The categories a task's words hit; a hit is refused back to the delegator."""
-    return [what for what, pat in DELEGATE_GUARD if re.search(pat, task, re.IGNORECASE)]
+    return [tr(*what) for what, pat in DELEGATE_GUARD if re.search(pat, task, re.IGNORECASE)]
 
 
 def receipt(line):
     """One line waking the secretary, about delegated work that may need it."""
     if secretary_alive():
-        raise_alert(f"[委托回执] {line}")
+        raise_alert(tr(f"[委托回执] {line}", f"[delegation receipt] {line}"))
 
 
 def archived_delegation(name):
@@ -3034,8 +3081,8 @@ def archived_delegation(name):
         index = HOME / "history" / "INDEX.md"
         rel = str(path.relative_to(HOME / "history"))
         line = next((l for l in (index.read_text().splitlines() if index.exists() else []) if rel in l), "")
-        m = re.search(rf"· {re.escape(name)} · \w+ · 为 ([a-z0-9-]+)：", line)
-        meta["delegated_by"] = m[1] if m else None
+        m = re.search(rf"· {re.escape(name)} · \w+ · (?:为 ([a-z0-9-]+)：|for ([a-z0-9-]+): )", line)
+        meta["delegated_by"] = (m[1] or m[2]) if m else None
     return {**meta, "path": path}
 
 
@@ -3059,7 +3106,8 @@ def cmd_delegate(args):
                  f"with none of that. If the task really does that, do it yourself (or report to the "
                  f"secretary). If the words are innocent (e.g. counting tokens, reading a deploy log), "
                  f"run again with --ack \"<why it's fine>\".")
-    ack = f"（越界检查命中 {' / '.join(hits)}，{boss} 确认：{args.ack}）" if hits else ""
+    ack = tr(f"（越界检查命中 {' / '.join(hits)}，{boss} 确认：{args.ack}）",
+             f" (the scope check hit {' / '.join(hits)}; {boss} says: {args.ack})") if hits else ""
     # What `wait` reads from: log entries from here on, and turn ends after this moment. A fresh
     # spawn starts a fresh log; a message to a running one counts from its current length.
     since, start = time.time(), 0
@@ -3102,7 +3150,9 @@ def cmd_delegate(args):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             err = quietly(cmd_wake, name=name, model=args.model, quiet=False, instruction=task,
-                          intro=f"worker {boss} 追加给你的任务（它写的原文），接着上一轮做，照做并按规则汇报：")
+                          intro=tr(f"worker {boss} 追加给你的任务（它写的原文），接着上一轮做，照做并按规则汇报：",
+                                   f"More work from worker {boss} (as it wrote it); carry on from your last turn, "
+                                   "do it and report by the rules:"))
         if err:
             with registry() as reg:
                 reg["workers"].pop(name, None)
@@ -3123,13 +3173,14 @@ def cmd_delegate(args):
         if ack:
             append_log(name, "ack", ack)
         if "STUCK ON A DIALOG" in out.getvalue():
-            receipt(f"{boss} 委托 {name} 时 Cursor 卡在对话框上，要用户切到窗口 {name} 处理")
+            receipt(tr(f"{boss} 委托 {name} 时 Cursor 卡在对话框上，要用户切到窗口 {name} 处理",
+                       f"{boss} delegated {name}, and Cursor is stuck on a dialog: the user has to handle it in window {name}"))
         print(out.getvalue().rstrip())
         verb = "spawned"
     (worker_dir(name) / "delegation.json").write_text(json.dumps({"by": boss, "since": since, "log_start": start}))
     append_log(boss, "delegated", f"{name}{ack}\n{task}")
     if ack:
-        receipt(f"{boss} 委托了 {name}：{task.splitlines()[0][:80]}{ack}")
+        receipt(tr(f"{boss} 委托了 {name}：{task.splitlines()[0][:80]}{ack}", f"{boss} delegated {name}: {task.splitlines()[0][:80]}{ack}"))
     print(f"{verb} Cursor worker {name}. To get its result, run in a background Bash:\n"
           f"  {hook_cmd()} wait {name}\n"
           f"It prints the report when {name} sends DONE / FAILED / BLOCKED / NEED_DECISION, or why it stopped.")
@@ -3155,7 +3206,8 @@ def cmd_wait(args):
             if header.endswith(" worker→secretary"):
                 typ = (parse_report(body).get("TYPE") or "").split()[:1]
                 if typ and typ[0] in TERMINAL:
-                    print(f"Cursor worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}")
+                    print(tr(f"Cursor worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}",
+                             f"Report from Cursor worker {name} (delegated by you, {header[11:16]}):\n{body}"))
                     return
         w = read_registry()[1].get(name)
         if w is None:
@@ -3211,7 +3263,8 @@ def hook_cursor_launch(name):
         time.sleep(5)
         rc = run(model)
         if rc and refused() and model != CURSOR_FALLBACK_MODEL:
-            note = f"模型兜底：{model} 被拒两次，改用 {CURSOR_FALLBACK_MODEL}"
+            note = tr(f"模型兜底：{model} 被拒两次，改用 {CURSOR_FALLBACK_MODEL}",
+                      f"model fallback: {model} refused twice, using {CURSOR_FALLBACK_MODEL}")
             with registry() as reg:
                 w = reg["workers"].get(name)
                 if w is not None:
@@ -3237,13 +3290,16 @@ def hook_cursor_exit(name):
         if w is None:
             return
         w.update(status="FAILED", last_report_at=now(), pending_ask=None,
-                 last_summary=f"Cursor agent 退出（rc {rc}）：{why}"[:200])
+                 last_summary=tr(f"Cursor agent 退出（rc {rc}）：{why}", f"Cursor agent exited (rc {rc}): {why}")[:200])
         boss = w.get("delegated_by")
     append_log(name, "agent-exit", f"rc {rc}\n" + "\n".join(lines[-15:]))
     if boss:
-        receipt(f"{name}（为 {boss}）的 Cursor agent 退出了（rc {rc}）：{why}")
+        receipt(tr(f"{name}（为 {boss}）的 Cursor agent 退出了（rc {rc}）：{why}",
+                   f"{name}'s (for {boss}) Cursor agent exited (rc {rc}): {why}"))
     elif secretary_alive():
-        raise_alert(f"Cursor worker {name} 的 agent 退出了（rc {rc}）：{why}。`claudesec close {name}` 后换个模型重开。")
+        raise_alert(tr(f"Cursor worker {name} 的 agent 退出了（rc {rc}）：{why}。`claudesec close {name}` 后换个模型重开。",
+                       f"Cursor worker {name}'s agent exited (rc {rc}): {why}. `claudesec close {name}` and start it "
+                       "again with another model."))
 
 
 def hook_cursor_finish(name):
@@ -3253,7 +3309,8 @@ def hook_cursor_finish(name):
         return  # given more work in the meantime, or already gone
     did = next((parse_report(b).get("DID", "") for h, b in reversed(read_log(name))
                 if h.endswith("worker→secretary")), "")
-    quietly(cmd_archive, name=name, summary=f"为 {w.get('delegated_by')}：{did.splitlines()[0][:100] if did else ''}",
+    quietly(cmd_archive, name=name, summary=tr(f"为 {w.get('delegated_by')}：", f"for {w.get('delegated_by')}: ")
+            + (did.splitlines()[0][:100] if did else ""),
             tags="delegated,cursor", files=None, subagent=False, task=None, dir=None)
     quietly(cmd_close, name=name)
 
@@ -3327,8 +3384,10 @@ def hook_cursor_stop():
             w.update(status="API_ERROR", pending_ask="Cursor: turn ended with status error", last_report_at=now())
         append_log(name, "api-error", "Cursor: turn ended with status error")
         if not w.get("delegated_by") and w.get("mode") != "discuss":  # a delegator's wait reports it
-            raise_alert(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报。"
-                        f"用 `claudesec send {name}` 让它从中断处继续。")
+            raise_alert(tr(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报。"
+                           f"用 `claudesec send {name}` 让它从中断处继续。",
+                           f"Cursor worker {name}'s turn ended in an error; it sits at its prompt and won't report "
+                           f"on its own. Tell it to carry on from where it stopped with `claudesec send {name}`."))
         return
     if w["status"] == "API_ERROR":
         with registry() as reg:
@@ -3349,12 +3408,18 @@ def hook_cursor_stop():
         idle()
         (d / "ended-unreported").write_text(now())
         if not w.get("delegated_by"):  # a delegator's wait reports it
-            raise_alert(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。")
+            raise_alert(tr(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。",
+                           f"Cursor worker {name} stopped without reporting after {CURSOR_NAGS} reminders; have a look "
+                           f"with `claudesec peek {name}`."))
         return
     print(json.dumps({"followup_message":
-        f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
-        "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
-        "若用户刚在你的窗口直接跟你说过话，汇报里注明。"}, ensure_ascii=False))
+        tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
+           "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
+           "若用户刚在你的窗口直接跟你说过话，汇报里注明。",
+           f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send the "
+           "secretary a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
+           "the format is under \"Reporting\" in your rules. If the user just talked to you in your window, say so "
+           "in the report.")}, ensure_ascii=False))
 
 
 def hook_worker_stop(name):
@@ -3381,9 +3446,12 @@ def hook_worker_stop(name):
         return
     sec = config()["secretary_name"]
     print(json.dumps({"decision": "block", "reason":
-        f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
-        "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
-        "若用户刚在你的窗口直接跟你说过话，汇报里注明。"}, ensure_ascii=False))
+        tr(f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
+           "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
+           "若用户刚在你的窗口直接跟你说过话，汇报里注明。",
+           f"Before ending this turn, send a report with SendMessage(to: \"{sec}\") whose TYPE is "
+           "DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count). "
+           "If the user just talked to you in your window, say so in the report.")}, ensure_ascii=False))
 
 
 def hook_secretary_session_start():
@@ -3391,7 +3459,8 @@ def hook_secretary_session_start():
     if data.get("session_id"):
         (HOME / "secretary.session").write_text(data["session_id"] + "\n")
     focus, workers = read_registry()
-    out = [f"[claudesec] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}"]
+    out = [tr(f"[claudesec] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}",
+              f"[claudesec] State directory {HOME}; your constitution {prompt_file('secretary.md')}")]
     import io
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
@@ -3399,17 +3468,19 @@ def hook_secretary_session_start():
         cmd_status(None)
     finally:
         sys.stdout = old
-    out += ["", "当前状态（来自 registry，以此为准）：", buf.getvalue().rstrip()]
+    out += ["", tr("当前状态（来自 registry，以此为准）：", "Current state (from the registry; it is authoritative):"),
+            buf.getvalue().rstrip()]
     index = HOME / "history" / "INDEX.md"
     if index.exists():
         lines = [l for l in index.read_text().splitlines() if l.startswith("- ")]
         if lines:
-            out += ["", f"历史索引最近 {min(20, len(lines))} 条（全部见 {index}）：", *lines[-20:]]
+            out += ["", tr(f"历史索引最近 {min(20, len(lines))} 条（全部见 {index}）：",
+                           f"The last {min(20, len(lines))} lines of the history index (all of it: {index}):"), *lines[-20:]]
     lessons = HOME / "lessons.md"
     if lessons.exists():
         n = sum(1 for l in open_part(lessons).splitlines() if l.startswith("- "))
         if n:
-            out += ["", f"lessons.md 里有 {n} 条教训待复盘。"]
+            out += ["", tr(f"lessons.md 里有 {n} 条教训待复盘。", f"lessons.md has {n} lessons waiting for the review.")]
     queue = HOME / "queue.md"
     if queue.exists():
         open_items, section = {}, None
@@ -3420,13 +3491,18 @@ def hook_secretary_session_start():
                 open_items.setdefault(section, []).append(line)
         todo = open_items.get("todo", []) + open_items.get("doing", [])
         if todo:
-            out += ["", f"决策队列 {queue} 里还有 {len(todo)} 件没定（待问、待答；一次只问用户一件）：", *todo]
+            out += ["", tr(f"决策队列 {queue} 里还有 {len(todo)} 件没定（待问、待答；一次只问用户一件）：",
+                           f"The decision queue {queue} has {len(todo)} undecided (To ask, Waiting; ask the user one "
+                           "at a time):"), *todo]
         if open_items.get("backlog"):
-            out += [f"另有 {len(open_items['backlog'])} 件在「搁置」，用户提起前不问："
-                    + "；".join(l.strip()[2:] for l in open_items["backlog"])]
+            out += [tr(f"另有 {len(open_items['backlog'])} 件在「搁置」，用户提起前不问：",
+                       f"And {len(open_items['backlog'])} in Backlog, not to be asked about until the user brings them up: ")
+                    + tr("；", "; ").join(l.strip()[2:] for l in open_items["backlog"])]
     notices = open_notices()
     if notices:
-        out += ["", f"通知 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
+        out += ["", tr(f"通知 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
+                       f"Notices {HOME / 'notices.md'} has {len(notices)} things for the user to do (not decisions; "
+                       "when the user has done one, `claudesec notice done N`):"),
                 *(f"- #{n} " + (f"[{t}] " if t else "") + text for n, t, text in notices)]
     print("\n".join(out)[:9500])
 
@@ -3451,13 +3527,22 @@ def hook_secretary_prompt():
         return
     seen.write_text(today + "\n")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext":
-        f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
-        "收据一行，再回应用户这条消息。"}}, ensure_ascii=False))
+        tr(f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
+           "收据一行，再回应用户这条消息。",
+           f"[claudesec] This is the first time you see the user today (last time: {last or 'no record'}): first "
+           "run `claudesec review` to start today's review worker, give a one-line receipt, then answer the "
+           "user's message.")}}, ensure_ascii=False))
+
+
+def done_heading(text):
+    """The heading a lessons or queue file's reviewed / decided part starts with, in its language."""
+    return "\n## Done" if "\n## Done" in text and "\n## 已处理" not in text else "\n## 已处理"
 
 
 def open_part(path):
-    """A lessons or queue file up to its 「已处理」 section."""
-    return path.read_text().split("\n## 已处理")[0]
+    """A lessons or queue file up to its 「已处理」 (Done) section."""
+    text = path.read_text()
+    return text.split(done_heading(text))[0]
 
 
 def hook_secretary_send():
@@ -3472,17 +3557,22 @@ def hook_secretary_send():
     mark_answered(to, str(inp.get("message", "")))
 
 
+def is_user_decision(text):
+    """The secretary passing on the user's answer: 「用户决策：…」, or "User decision: …"."""
+    return text.lstrip().startswith(("用户决策", "User decision"))
+
+
 def mark_answered(name, text):
     """The secretary passed on the user's answer (「用户决策：…」): the worker no longer waits on
     the user, though it reports again only once it has acted on it."""
-    if not text.lstrip().startswith("用户决策"):
+    if not is_user_decision(text):
         return
     with registry() as reg:
         w = reg["workers"].get(name)
         if w is None or w["status"] not in ("NEED_DECISION", "BLOCKED"):
             return
         line = text.lstrip().splitlines()[0]
-        w.update(status="PROGRESS", pending_ask=None, last_summary=f"已答，在处理：{line}"[:200])
+        w.update(status="PROGRESS", pending_ask=None, last_summary=tr(f"已答，在处理：{line}", f"answered, working on it: {line}")[:200])
 
 
 # ---------- dialogs: a worker waiting on the user ----------
@@ -3509,7 +3599,7 @@ def hook_worker_permission(name):
     if data.get("hook_event_name") == "Notification":
         if marker.exists():
             return  # the same prompt, already being handled
-        detail = data.get("message") or data.get("title") or "需要用户确认"
+        detail = data.get("message") or data.get("title") or tr("需要用户确认", "needs the user's confirmation")
         delay = 0  # Claude Code only notifies after the prompt has waited ~6s
     else:
         detail = describe_request(data.get("tool_name", "?"), data.get("tool_input") or {})
@@ -3543,7 +3633,8 @@ def hook_worker_permission_alert(name):
         discuss = w.get("mode") == "discuss"
     append_log(name, "permission", m["detail"])
     if not discuss:  # in a discussion the user is already looking at the window
-        raise_alert(f"worker {name} 卡在一个确认对话框上，等用户在窗口 {name} 里处理：{m['detail']}")
+        raise_alert(tr(f"worker {name} 卡在一个确认对话框上，等用户在窗口 {name} 里处理：{m['detail']}",
+                       f"worker {name} is stuck on a confirmation dialog, waiting for the user in window {name}: {m['detail']}"))
 
 
 def hook_worker_stop_failure(name):
@@ -3564,7 +3655,8 @@ def hook_worker_stop_failure(name):
         discuss = w.get("mode") == "discuss"
     append_log(name, "api-error", err)
     if not discuss:  # in a discussion the user is in the window and sees it
-        raise_alert(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}")
+        raise_alert(tr(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}",
+                       f"worker {name}'s turn broke off on an API error; it sits at its prompt and won't report on its own: {err}"))
 
 
 def permission_answered(name):
@@ -3612,9 +3704,10 @@ def back_at_work(name, new_turn=False):
             return
         was, old = w["status"], " ".join((w.get("last_summary") or "").split())
         if was in ("NEED_DECISION", "BLOCKED"):
-            summary = old if old.startswith("已答，在处理") else f"收到回复，在处理：{old}"
+            summary = old if old.startswith(("已答，在处理", "answered, working")) else \
+                tr(f"收到回复，在处理：{old}", f"got an answer, working on it: {old}")
         else:
-            summary = f"在做新的一轮（上次 {was}：{old}）"
+            summary = tr(f"在做新的一轮（上次 {was}：{old}）", f"on a new turn (last {was}: {old})")
         w.update(status="PROGRESS", pending_ask=None, last_summary=summary[:200])
     append_log(name, "resumed", f"working again after its {was} report")
 
@@ -3626,6 +3719,8 @@ WATCH_TIMEOUT = 24 * 3600
 WATCH_MARGIN = 300
 WATCH_REARM = ("[claudesec] 告警监听到期重挂：没有新告警，这不是任务。什么都不用做、不用回复，"
                "直接结束这一轮（结束时会自动重新挂上监听）。")
+WATCH_REARM_EN = ("[claudesec] The alert watcher timed out and is being re-armed: there are no new alerts, and this "
+                  "is not a task. Do nothing and don't reply; just end this turn (ending it re-arms the watcher).")
 
 
 def hook_secretary_watch():
@@ -3646,14 +3741,14 @@ def hook_secretary_watch():
         if time.monotonic() > deadline:
             # Claude Code ends an async hook at its timeout, and nothing would arm another until
             # the secretary's next turn. Wake it with nothing to do; its turn end re-arms this.
-            print(WATCH_REARM, file=sys.stderr)
+            print(tr(WATCH_REARM, WATCH_REARM_EN), file=sys.stderr)
             sys.exit(2)
         files = sorted(alerts.glob("*.txt"))
         if files:
             msgs = [f.read_text().strip() for f in files]
             for f in files:
                 f.rename(done / f.name)
-            print("[claudesec 告警]\n" + "\n".join(msgs), file=sys.stderr)
+            print(tr("[claudesec 告警]\n", "[claudesec alert]\n") + "\n".join(msgs), file=sys.stderr)
             sys.exit(2)
         try:
             os.kill(owner, 0)

@@ -1058,7 +1058,8 @@ def cmd_run(args):
     cmd = hook_cmd()
     # A worker stuck on a dialog can't SendMessage, so alerts reach the secretary through a
     # background watcher whose exit code 2 wakes it (asyncRewake); every turn end re-arms it.
-    watch = {"type": "command", "command": f"{cmd} hook secretary-watch", "asyncRewake": True}
+    watch = {"type": "command", "command": f"{cmd} hook secretary-watch", "asyncRewake": True,
+             "timeout": WATCH_TIMEOUT}
     settings.write_text(json.dumps({
         # The user talks to the secretary in their own words; no Tab-completion guesses.
         "promptSuggestionEnabled": False,
@@ -3239,6 +3240,15 @@ def hook_worker_permission_done(name):
     permission_answered(name)
 
 
+# Claude Code sends SIGTERM to an async hook when its timeout runs out: 600 s if none is set
+# (2.1.309, measured). The watcher had none, so it died ten minutes into an idle stretch and the
+# night's alerts (10-23, devbox) waited in alerts/ until the user's next message.
+WATCH_TIMEOUT = 24 * 3600
+WATCH_MARGIN = 300
+WATCH_REARM = ("[claudesec] 告警监听到期重挂：没有新告警，这不是任务。什么都不用做、不用回复，"
+               "直接结束这一轮（结束时会自动重新挂上监听）。")
+
+
 def hook_secretary_watch():
     """Armed in the background at session start and every turn end; one instance at a time.
     Exits 2 with the pending alerts, which wakes the secretary (asyncRewake)."""
@@ -3252,7 +3262,13 @@ def hook_secretary_watch():
                  os.getppid())
     alerts, done = HOME / "alerts", HOME / "alerts" / "delivered"
     done.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + WATCH_TIMEOUT - WATCH_MARGIN
     while True:
+        if time.monotonic() > deadline:
+            # Claude Code ends an async hook at its timeout, and nothing would arm another until
+            # the secretary's next turn. Wake it with nothing to do; its turn end re-arms this.
+            print(WATCH_REARM, file=sys.stderr)
+            sys.exit(2)
         files = sorted(alerts.glob("*.txt"))
         if files:
             msgs = [f.read_text().strip() for f in files]

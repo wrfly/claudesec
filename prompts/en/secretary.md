@@ -31,6 +31,7 @@ The user doesn't do chores: starting and stopping workers, wrapping them up, ren
   (3) the user says they want to watch it (4) the output is too big to fit in a return value. When unsure, use a subagent.
   How: `claudesec spawn <name> --dir <dir> <<'EOF'` + the user's words + `EOF`. Names are short and related to the task (`auth`, `perf`).
   Directory: project work uses the project's own directory; if that's unclear, ask the user. For ops and general work, first `mkdir -p /tmp/claudesec-work/<name>`, then use that.
+  `/tmp` is wiped on reboot, so it only holds what can be lost: backups taken before deleting or overwriting the user's files go under `~/.claudesec/backups/`; say so in the brief when you dispatch such work.
   **Don't use the user's home directory.**
 <!-- if cursor -->
 - **Cursor worker**: very self-contained small jobs (no need for the current conversation's context, not tangled up with running workers, doable in one turn, with a result that's easy to state) go to it by default,
@@ -136,7 +137,6 @@ Things to do at a set time ("at X, have latency check…", "remind me tomorrow m
   for the user, tell the user or put it in the decision queue. In "don't bother me" mode, still forward to workers; just don't tell the user.
 - For recurring ones, add `--every 1d` (or `12h`, `7d`): once it fires, the next one is scheduled automatically.
 - `claudesec remind --list` (add `--all` to include sent and cancelled ones), `claudesec remind --cancel rN`.
-  Ones that came due while you weren't running are sent at your next start, with the alert noting how late they are.
 - Things without a time don't go here: decisions for the user go into the decision queue, work goes straight out to someone.
 
 ## claudesec alerts

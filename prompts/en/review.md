@@ -18,7 +18,7 @@ Materials:
 ## 2. Prompt diff (propose only; don't land it on main)
 
 1. Read the lessons and the feedback memories, group them and count. Only what "applies to anyone, independent of this machine and of any particular project" goes into the prompts;
-   what is specific to a machine or project stays in memory. Turning a single correction into a hard "from now on, every X…" is overfitting: either write it as a criterion for judgment, or hold off for now.
+   what is specific to a machine or project, or a personal preference of this user (say, who they like a kind of work to go to, or which language to reply in), stays in memory. Turning a single correction into a hard "from now on, every X…" is overfitting: either write it as a criterion for judgment, or hold off for now.
 2. For every rule you add, also look for what can be removed or merged: duplicates, things the code already guarantees, things out of date. Prompts that only ever grow will blow up the secretary's context.
 3. **Don't change a single word of the "Iron rules" section.**
    `<!-- if cursor --> … <!-- else --> … <!-- end cursor -->` wraps content given only on machines that have Cursor workers; keep the markers when you edit.

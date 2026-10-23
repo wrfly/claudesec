@@ -2000,6 +2000,51 @@ def refuse_if_working(name, conv):
     if tasks:
         sys.exit(f"{name} is at its prompt, but its background tasks are still running ({', '.join(tasks)}); "
                  f"shelving would kill them. Wait for them, or pass --force")
+    jobs = detached_jobs(conv.get("sessionId"), conv.get("pid"))
+    if jobs:
+        shown = "\n".join(f"  {pid}  {cmd[:120]}" for pid, cmd in jobs[:5])
+        sys.exit(f"{name} is at its prompt, but processes it started with nohup / setsid are still running:\n"
+                 f"{shown}\nThey are its work too (a sweep, a download): shelving may stop them, and a woken "
+                 f"{name} would not know of them. Wait for them, or pass --force")
+
+
+def detached_jobs(sid, claude_pid):
+    """Processes a session left running on their own (nohup, setsid, `&` in a shell that has
+    exited): Claude Code puts CLAUDE_CODE_SESSION_ID in every tool shell's environment, and that
+    survives detaching, while the process is no longer under the session's own process tree.
+    Linux only (/proc); elsewhere, none found. [(pid, command)]"""
+    proc = Path("/proc")
+    if not sid or not proc.is_dir():
+        return []
+    mark = f"CLAUDE_CODE_SESSION_ID={sid}".encode()
+    parents, found = {}, []
+    for d in proc.iterdir():
+        if not d.name.isdigit():
+            continue
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            stat = (d / "stat").read_text()
+            parents[int(d.name)] = int(stat.rsplit(")", 1)[1].split()[1])
+            if mark in (d / "environ").read_bytes().split(b"\0"):
+                found.append(int(d.name))
+    me = os.getpid()
+
+    def under(pid, root):
+        seen = set()
+        while pid and pid not in seen:
+            if pid == root:
+                return True
+            seen.add(pid)
+            pid = parents.get(pid)
+        return False
+    out = []
+    for pid in found:
+        if pid == me or (claude_pid and under(pid, claude_pid)) or under(me, pid):
+            continue  # still the session's own tree (its tools, hooks), or this very command's caller
+        with contextlib.suppress(OSError):
+            cmd = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            out.append((pid, cmd))
+    # a detached shell and its sleep are one job: show the outermost
+    return [(p, c) for p, c in out if parents.get(p) not in {q for q, _ in out}]
 
 
 def cmd_shelve(args):

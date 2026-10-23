@@ -582,6 +582,11 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   刚分出来的面板第一帧就是对的。不抢焦点。秘书的 pane 没了就自己退出，窗口随之关闭（不留下只有面板的窗口）。
 - pane 靠 pane 选项 `@claudesec-role`（secretary / queue / status）区分。秘书 pane 的定位、`--restart` 的
   respawn 都改成按这个找，不再按窗口取当前 pane（用户把焦点放在面板上时会认错）。
+- 认面板：pane 选项 `@claudesec-role` 之外，起动命令是 `claudesec dashboard show X` 的 pane 也算面板（role X），
+  所以没打标记的旧面板 `dashboard off` 也删得掉，也不会被当成秘书 pane。每块面板还带 `@claudesec-layout`（这一版的面板组成和
+  左右边）；不带或对不上的（旧版本建的）重排时整列重建。
+- `--restart` 在 respawn 秘书之前先排面板：秘书自己在 Bash 里跑 `claudesec --restart -d` 时，这个进程会跟着秘书一起被杀，
+  respawn 之后的步骤不会执行（2026-10-23 就是这样：重启了，面板还是旧的）。`claudesec run` 起来时也排一次，不管秘书是怎么起的。
 - 布局由 `arrange_dashboard` 定，幂等：窗口 ≥110 列就是三块，更窄不显示（秘书独占）；早先版本的两块，或 110–149 列合成的
   一块（role `both`），会被换成三块。配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
   client-attached 两个 hook 跑 `claudesec dashboard layout`，终端尺寸变了自动重排。整机重启后用户敲 `claudesec`

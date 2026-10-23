@@ -58,8 +58,11 @@ class Dashboard(unittest.TestCase):
 
     def fake_tmux(self, *args, check=True):
         self.calls.append(args)
-        if args[0] == "list-panes":
-            return "".join(f"{p}|{role}|{i}\n" for p, role, i in self.panes)
+        if args[0] == "list-panes":  # a pane is (id, role, index[, start command[, layout stamp]])
+            return "".join(f"{p[0]}|{p[1]}|{p[2]}|{p[3] if len(p) > 3 else ''}\n" for p in self.panes)
+        if args[0] == "show-options":
+            pane = next(p for p in self.panes if p[0] == args[args.index("-t") + 1])
+            return (pane[4] if len(pane) > 4 else "") + "\n"
         if args[0] == "display":
             return f"{self.window_width}\n"
         if args[0] == "split-window":
@@ -106,10 +109,38 @@ class Dashboard(unittest.TestCase):
         self.assertIn(("kill-pane", "-t", "%5"), self.calls)
         self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
 
+    def current(self, *roles):
+        layout = self.cs.dash_layout(self.cs.config())
+        return [(f"%{5 + i}", role, str(1 + i), f"claudesec dashboard show {role}", layout)
+                for i, role in enumerate(roles)]
+
     def test_nothing_changes_when_all_panes_are_there(self):
-        self.panes += [("%5", "queue", "1"), ("%6", "status", "2"), ("%7", "notices", "3")]
+        self.panes += self.current("queue", "status", "notices")
         self.cs.arrange_dashboard("claudesec")
         self.assertFalse([a for a in self.calls if a[0] in ("kill-pane", "split-window")])
+
+    def test_panes_an_older_version_laid_out_are_rebuilt(self):
+        # the right roles, but no layout stamp: built before panes carried one
+        self.panes += [(p, role, i, cmd) for p, role, i, cmd, _ in self.current("queue", "status", "notices")]
+        self.cs.arrange_dashboard("claudesec")
+        self.assertEqual([a[2] for a in self.calls if a[0] == "kill-pane"], ["%5", "%6", "%7"])
+        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
+        stamps = [a for a in self.calls if a[0] == "set-option" and "@claudesec-layout" in a]
+        self.assertEqual(len(stamps), 3)
+
+    def test_an_unmarked_dashboard_pane_is_still_one(self):
+        # what the user hit: a lone `dashboard show queue` pane without its role mark survived
+        # `dashboard off` and sat next to the new column after `on`
+        self.panes.append(("%9", "", "1", "CLAUDESEC_HOME=/h /x/bin/claudesec dashboard show queue"))
+        self.assertEqual(self.cs.secretary_pane("claudesec"), "%1")
+        (self.home / "config.json").write_text(json.dumps({"language": "zh", "dashboard": False}))
+        self.cs.arrange_dashboard("claudesec")
+        self.assertEqual([a[2] for a in self.calls if a[0] == "kill-pane"], ["%9"])
+        self.assertFalse([a for a in self.calls if a[0] == "split-window"])
+
+    def test_an_unmarked_dashboard_pane_is_not_taken_for_the_secretary(self):
+        self.panes = [("%9", "", "0", "claudesec dashboard show queue"), ("%1", "", "1", "claudesec run")]
+        self.assertEqual(self.cs.secretary_pane("claudesec"), "%1")
 
     def test_short_model_names(self):
         self.assertEqual(self.cs.short_model("claude-opus-5-5"), "opus-5-5")

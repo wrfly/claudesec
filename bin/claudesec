@@ -334,6 +334,11 @@ def cmd_start(args):
             # tmux layout left a shell or a bare `claude --resume` in the window; take it over.
             if wrapped:  # the exiting `claudesec run` sees this and leaves the workers running
                 (HOME / "restarting").write_text(str(time.time()))
+            # Before the respawn: run by the secretary itself (`claudesec --restart -d` from its
+            # Bash), this process dies with it, and nothing after the respawn happens.
+            tmux("set-option", "-p", "-t", pane, "@claudesec-role", "secretary", check=False)
+            with contextlib.suppress(Exception):
+                arrange_dashboard(sess)
             tmux("respawn-pane", "-k", "-t", pane, "-c", str(HOME), run)
     tmux("set-option", "-p", "-t", pane, "@claudesec-role", "secretary", check=False)
     arrange_dashboard(sess)
@@ -367,9 +372,29 @@ DASH_SIDE = "right"  # of the secretary; config.json "dashboard_side": "left" pu
 
 
 def window_panes(target):
-    """(pane id, role, index) of each pane in target's window; role is "" when unmarked."""
-    out = tmux("list-panes", "-t", target, "-F", "#{pane_id}|#{@claudesec-role}|#{pane_index}", check=False)
-    return [tuple(line.split("|")) for line in out.splitlines() if line.count("|") == 2]
+    """(pane id, role, index) of each pane in target's window; role is "" when unmarked. A pane
+    running `claudesec dashboard show X` that lost its mark, or an older claudesec never set the
+    one asked for, is a dashboard pane all the same: role X."""
+    out = tmux("list-panes", "-t", target, "-F",
+               "#{pane_id}|#{@claudesec-role}|#{pane_index}|#{pane_start_command}", check=False)
+    panes = []
+    for line in out.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 3:
+            continue
+        pane, role, index = parts[:3]
+        shown = re.search(r"\bdashboard show(?:\s+(\w+))?", parts[3] if len(parts) > 3 else "")
+        if not role and shown:
+            role = shown[1] or "status"
+        panes.append((pane, role, index))
+    return panes
+
+
+def dash_layout(cfg):
+    """What the dashboard column looks like in this version: its panes and side. Each pane
+    carries it (@claudesec-layout), so panes an older version laid out differently, or before
+    panes carried it, are rebuilt rather than kept."""
+    return ",".join(DASH_PANES) + ":" + cfg.get("dashboard_side", DASH_SIDE)
 
 
 def secretary_pane(sess):
@@ -402,8 +427,11 @@ def arrange_dashboard_locked(sess):
     want = list(DASH_PANES) if cfg.get("dashboard", True) and width >= DASH_MIN else []
     # "both" is the combined pane earlier versions put in a narrower window. A list, not a dict
     # by role: a doubled dashboard must not pass for the wanted one.
-    have = [(role, p) for p, role, _ in window_panes(sec) if role in (*DASH_PANES, "both")]
-    if sorted(role for role, _ in have) == sorted(want):
+    have = [(role, p) for p, role, _ in window_panes(sec) if role in (*DASH_PANES, "both", "dashboard")
+            or role and role != "secretary"]  # any other mark is a dashboard role of another version
+    layout = dash_layout(cfg)
+    stamps = {tmux("show-options", "-pqv", "-t", p, "@claudesec-layout", check=False).strip() for _, p in have}
+    if sorted(role for role, _ in have) == sorted(want) and (not want or stamps == {layout}):
         return
     for _, p in have:
         tmux("kill-pane", "-t", p, check=False)
@@ -414,11 +442,13 @@ def arrange_dashboard_locked(sess):
     prev = tmux("split-window", "-d", "-h", *left, "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
                 "-P", "-F", "#{pane_id}", f"{dash} {want[0]}").strip()
     tmux("set-option", "-p", "-t", prev, "@claudesec-role", want[0], check=False)
+    tmux("set-option", "-p", "-t", prev, "@claudesec-layout", layout, check=False)
     for i, role in enumerate(want[1:], 1):  # each split leaves the panes above an equal share
         left_n = len(want) - i
         prev = tmux("split-window", "-d", "-v", "-l", f"{100 * left_n // (left_n + 1)}%", "-t", prev,
                     "-c", str(HOME), "-P", "-F", "#{pane_id}", f"{dash} {role}").strip()
         tmux("set-option", "-p", "-t", prev, "@claudesec-role", role, check=False)
+        tmux("set-option", "-p", "-t", prev, "@claudesec-layout", layout, check=False)
     tmux("select-pane", "-t", sec, check=False)  # focus stays with the secretary
 
 
@@ -1266,6 +1296,9 @@ def cmd_run(args):
     # so a fixed cwd gives it one stable memory directory.
     os.chdir(HOME)
     (HOME / "run.pid").write_text(str(os.getpid()))  # a newer one tells an older shelve-all to stop
+    if os.environ.get("TMUX_PANE") and has_session(cfg["tmux_session"]):
+        with contextlib.suppress(Exception):  # every secretary start, however it was started
+            arrange_dashboard(cfg["tmux_session"])
     detach("wake-all")
     detach("reminders")
     # Not exec: the workers are put away after the secretary exits. That is done here, by claudesec,

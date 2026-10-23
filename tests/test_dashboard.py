@@ -74,11 +74,26 @@ class Dashboard(unittest.TestCase):
 
     # ---- layout
 
-    def test_two_panes_whenever_the_window_is_wide_enough(self):
+    def test_three_panes_whenever_the_window_is_wide_enough(self):
         for cols in (110, 126, 200):
             self.calls, self.window_width = [], cols
             self.cs.arrange_dashboard("claudesec")
-            self.assertEqual(self.roles_made(), ["queue", "status"], cols)
+            self.assertEqual(self.roles_made(), ["queue", "status", "notices"], cols)
+        splits = [a for a in self.calls if a[0] == "split-window"]
+        self.assertEqual([a[a.index("-l") + 1] for a in splits], ["36%", "66%", "50%"])  # thirds
+        self.assertNotIn("-b", splits[0])  # right of the secretary
+
+    def test_the_column_goes_left_when_configured(self):
+        (self.home / "config.json").write_text(json.dumps({"language": getattr(self, "LANG", "zh"),
+                                                            "dashboard_side": "left"}))
+        self.cs.arrange_dashboard("claudesec")
+        self.assertIn("-b", [a for a in self.calls if a[0] == "split-window"][0])
+
+    def test_two_panes_from_before_become_three(self):
+        self.panes += [("%5", "queue", "1"), ("%6", "status", "2")]
+        self.cs.arrange_dashboard("claudesec")
+        self.assertIn(("kill-pane", "-t", "%5"), self.calls)
+        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
 
     def test_none_in_a_narrow_window(self):
         self.window_width = 109
@@ -89,10 +104,10 @@ class Dashboard(unittest.TestCase):
         self.panes.append(("%5", "both", "1"))
         self.cs.arrange_dashboard("claudesec")
         self.assertIn(("kill-pane", "-t", "%5"), self.calls)
-        self.assertEqual(self.roles_made(), ["queue", "status"])
+        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
 
-    def test_nothing_changes_when_both_panes_are_there(self):
-        self.panes += [("%5", "queue", "1"), ("%6", "status", "2")]
+    def test_nothing_changes_when_all_panes_are_there(self):
+        self.panes += [("%5", "queue", "1"), ("%6", "status", "2"), ("%7", "notices", "3")]
         self.cs.arrange_dashboard("claudesec")
         self.assertFalse([a for a in self.calls if a[0] in ("kill-pane", "split-window")])
 

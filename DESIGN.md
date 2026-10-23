@@ -538,8 +538,10 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 ### 主窗口面板（`claudesec dashboard`）
 
-秘书窗口左边是秘书，右边一列两块面板（窗口宽的 36%，上下各半）：上面 `dashboard show queue` 显示 queue.md 的
-「待问 / 待答」（空的那块不显示；「搁置」折成最后一行；不显示「已处理」），下面 `dashboard show status` 显示 worker、搁置的名字、未到点提醒。
+秘书窗口左边是秘书，右边一列三块面板（窗口宽的 36%，上下三等分；顺序是 `DASH_PANES`，`dashboard_side: "left"` 把这一列放到左边）：
+上面 `dashboard show queue` 显示 queue.md 的「待问 / 待答」（空的那块不显示；「搁置」折成最后一行；不显示「已处理」），
+中间 `dashboard show status` 显示 worker、搁置的名字、未到点提醒，下面 `dashboard show notices` 显示 notices.md 的「待办」：
+要用户去做、但不用拍板的事（去某窗口说 push、在 VNC 里装扩展）。通知和决策队列共用编号序列（queue.last），用户说「46」不会有歧义。
 - 默认每条折叠成一行（放不下的截成「…」）；点一条展开看全文、再点收起，点标题栏（或 Tab）全部展开 / 收起。
   点完焦点自动还给秘书 pane（tmux 的点击会先把焦点切到面板，不还的话用户接着打字会打进面板里）。
   组与组之间空一行。展开状态在面板进程里，按条目内容记，刷新不丢。
@@ -576,8 +578,8 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   刚分出来的面板第一帧就是对的。不抢焦点。秘书的 pane 没了就自己退出，窗口随之关闭（不留下只有面板的窗口）。
 - pane 靠 pane 选项 `@claudesec-role`（secretary / queue / status）区分。秘书 pane 的定位、`--restart` 的
   respawn 都改成按这个找，不再按窗口取当前 pane（用户把焦点放在面板上时会认错）。
-- 布局由 `arrange_dashboard` 定，幂等：窗口 ≥110 列就是两块，更窄不显示（秘书独占）；早先版本 110–149 列合成的
-  一块（role `both`）会被换成两块。配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
+- 布局由 `arrange_dashboard` 定，幂等：窗口 ≥110 列就是三块，更窄不显示（秘书独占）；早先版本的两块，或 110–149 列合成的
+  一块（role `both`），会被换成三块。配置 `dashboard: false` 时不显示。每次 `claudesec` / `--restart` / `--new` 都跑一次；session 上挂了 client-resized、
   client-attached 两个 hook 跑 `claudesec dashboard layout`，终端尺寸变了自动重排。整机重启后用户敲 `claudesec`
   重建 session，布局随之恢复（这个 session 本来就不交给 tmux-resurrect）。
 - 回归测试 `tests/test_dashboard.py`：布局、换行、队列解析、进展排序、滚动和按键。端到端（隔离的 tmux server，

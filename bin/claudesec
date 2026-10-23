@@ -358,8 +358,10 @@ def cmd_start(args):
 # with the secretary.
 
 DASH_MIN = 110    # window columns below which the secretary keeps the whole window
-DASH_SHARE = 36   # percent of the window the right column takes
+DASH_SHARE = 36   # percent of the window the dashboard column takes
 DASH_REFRESH = 3
+DASH_PANES = ("queue", "status", "notices")  # top to bottom
+DASH_SIDE = "right"  # of the secretary; config.json "dashboard_side": "left" puts the column there
 
 
 def window_panes(target):
@@ -394,10 +396,11 @@ def arrange_dashboard_locked(sess):
         return
     tmux("set-option", "-p", "-t", sec, "@claudesec-role", "secretary", check=False)
     width = int(tmux("display", "-p", "-t", sec, "#{window_width}", check=False).strip() or 0)
-    want = ["queue", "status"] if config().get("dashboard", True) and width >= DASH_MIN else []
+    cfg = config()
+    want = list(DASH_PANES) if cfg.get("dashboard", True) and width >= DASH_MIN else []
     # "both" is the combined pane earlier versions put in a narrower window. A list, not a dict
     # by role: a doubled dashboard must not pass for the wanted one.
-    have = [(role, p) for p, role, _ in window_panes(sec) if role in ("queue", "status", "both")]
+    have = [(role, p) for p, role, _ in window_panes(sec) if role in (*DASH_PANES, "both")]
     if sorted(role for role, _ in have) == sorted(want):
         return
     for _, p in have:
@@ -405,12 +408,15 @@ def arrange_dashboard_locked(sess):
     if not want:
         return
     dash = f"{hook_cmd()} dashboard show"
-    top = tmux("split-window", "-d", "-h", "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
-               "-P", "-F", "#{pane_id}", f"{dash} queue").strip()
-    tmux("set-option", "-p", "-t", top, "@claudesec-role", "queue", check=False)
-    below = tmux("split-window", "-d", "-v", "-l", "50%", "-t", top, "-c", str(HOME),
-                 "-P", "-F", "#{pane_id}", f"{dash} status").strip()
-    tmux("set-option", "-p", "-t", below, "@claudesec-role", "status", check=False)
+    left = ["-b"] if cfg.get("dashboard_side", DASH_SIDE) == "left" else []
+    prev = tmux("split-window", "-d", "-h", *left, "-l", f"{DASH_SHARE}%", "-t", sec, "-c", str(HOME),
+                "-P", "-F", "#{pane_id}", f"{dash} {want[0]}").strip()
+    tmux("set-option", "-p", "-t", prev, "@claudesec-role", want[0], check=False)
+    for i, role in enumerate(want[1:], 1):  # each split leaves the panes above an equal share
+        left_n = len(want) - i
+        prev = tmux("split-window", "-d", "-v", "-l", f"{100 * left_n // (left_n + 1)}%", "-t", prev,
+                    "-c", str(HOME), "-P", "-F", "#{pane_id}", f"{dash} {role}").strip()
+        tmux("set-option", "-p", "-t", prev, "@claudesec-role", role, check=False)
     tmux("select-pane", "-t", sec, check=False)  # focus stays with the secretary
 
 
@@ -798,7 +804,7 @@ def show_dashboard(what):
                 if sec is None:
                     return
                 try:
-                    content = (size, *(queue_blocks if what == "queue" else status_blocks)(size.columns - 1))
+                    content = (size, *{"queue": queue_blocks, "notices": notices_blocks}.get(what, status_blocks)(size.columns - 1))
                 except Exception as e:  # a half-written file, a bad entry: show it, try again
                     content = (size, [(REV, tr(f" 读状态出错，{DASH_REFRESH} 秒后重试 ",
                                                 f" Can't read the state; again in {DASH_REFRESH}s "))],
@@ -978,8 +984,12 @@ def secretary_prompt():
 
 def take_queue_number(text):
     """The next queue item number: past every one in queue.md and every one handed out before,
-    so a number cleared out of 已处理 isn't handed out again."""
+    so a number cleared out of 已处理 isn't handed out again. Notices draw from the same numbers,
+    so "46" means one thing whichever pane it is in."""
     last = HOME / "queue.last"
+    for other in (HOME / "queue.md", HOME / "notices.md"):
+        with contextlib.suppress(OSError):
+            text += "\n" + other.read_text()
     seen = [int(m[1]) for m in map(QUEUE_ITEM.match, text.splitlines()) if m and m[1]]
     with contextlib.suppress(OSError, ValueError):
         seen.append(int(last.read_text()))
@@ -1046,6 +1056,115 @@ def cmd_queue(args):
     tmp = path.with_name(".queue.md.tmp")
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, path)
+
+
+# ---------- notices: things for the user to do that need no decision ----------
+# "Say push in window X", "install the extension over VNC": the user has to act, but there is
+# nothing to choose, so they stay out of the decision queue. notices.md, two sections; the
+# numbers come from the queue's sequence.
+
+NOTICE_INTRO = """# 通知消息
+
+秘书维护。要用户去做、但不用用户拍板的事：去某个 worker 窗口说 push、在 VNC 里装扩展、登录一下。
+要用户定的仍然进决策队列。每条一行 `- #编号 [worker] 要做什么`；`claudesec notice add` 登记（编号和
+决策队列共用一个序列），用户做完 `claudesec notice done 编号`。
+"""
+NOTICE_INTRO_EN = """# Notices
+
+Kept by the secretary: things the user has to do that need no decision (say push in a worker's
+window, install the extension over VNC, log in somewhere). Decisions still go to the queue. One line
+each, `- #number [worker] what to do`; `claudesec notice add` files one (numbers shared with the
+decision queue), `claudesec notice done number` once the user has done it.
+"""
+NOTICE_SECTIONS = {"open": ("待办", "To do"), "done": ("已完成", "Done")}
+
+
+def notice_section(heading):
+    low = heading.lower()
+    return next((key for key, words in NOTICE_SECTIONS.items() if any(w.lower() in low for w in words)), None)
+
+
+def notice_lines():
+    """notices.md's lines, with both sections."""
+    path = HOME / "notices.md"
+    lines = path.read_text().splitlines() if path.exists() else tr(NOTICE_INTRO, NOTICE_INTRO_EN).splitlines()
+    for key, words in NOTICE_SECTIONS.items():
+        if not any(line.startswith("## ") and notice_section(line) == key for line in lines):
+            lines += ["", f"## {words[0 if lang() == 'zh' else 1]}"]
+    return lines
+
+
+def open_notices():
+    """(number, tag, text) of each notice still to do."""
+    path = HOME / "notices.md"
+    out, section = [], None
+    for line in (path.read_text() if path.exists() else "").splitlines():
+        if line.startswith("## "):
+            section = notice_section(line)
+            continue
+        m = QUEUE_ITEM.match(line)
+        if section != "open" or not m:
+            continue
+        body = m[2].strip()
+        tag = re.match(r"\[([^\]]+)\]\s*", body)
+        out.append((m[1] and int(m[1]), tag[1] if tag else None, body[tag.end():] if tag else body))
+    return out
+
+
+def cmd_notice(args):
+    """`notice add [--from W] TEXT`: a notice with the next number, printed. `notice done N`:
+    moved to 已完成 with today's date. `notice list`: the open ones."""
+    if args.action == "list":
+        items = open_notices()
+        print("\n".join(f"#{n} " + (f"[{t}] " if t else "") + text for n, t, text in items)
+              or tr("没有要用户去做的事。", "Nothing for the user to do."))
+        return
+    lines = notice_lines()
+    if args.action == "add":
+        text = " ".join(args.words).strip() or sys.exit("notice add: what should the user do?")
+        n = take_queue_number("")
+        item = f"- #{n} " + (f"[{args.source}] " if args.source else "") + text
+        at = next(i for i, l in enumerate(lines) if l.startswith("## ") and notice_section(l) == "open")
+        end = next((i for i in range(at + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        while end > at + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines[end:end] = ([""] if end == at + 1 else []) + [item]
+        print(f"#{n}")
+    else:  # done
+        num = args.number.lstrip("#")
+        found = [i for i, l in enumerate(lines) if (m := QUEUE_ITEM.match(l)) and m[1] == num
+                 and not l.startswith("## ")]
+        if not found:
+            sys.exit(f"notice done: no notice #{num} in {HOME / 'notices.md'}")
+        body = QUEUE_ITEM.match(lines[found[0]])[2].strip()
+        del lines[found[0]]
+        tag = re.match(r"\[[^\]]+\]\s*", body)
+        at_tag = tag.end() if tag else 0
+        body = f"{body[:at_tag]}{dt.date.today().isoformat()} {body[at_tag:]}"
+        at = next(i for i, l in enumerate(lines) if l.startswith("## ") and notice_section(l) == "done")
+        lines[at + 1:at + 1] = ["", f"- #{num} {body}"]  # newest first
+        print(f"#{num} → {NOTICE_SECTIONS['done'][0 if lang() == 'zh' else 1]}")
+    lines = [l for i, l in enumerate(lines) if l.strip() or i == 0 or lines[i - 1].strip()]
+    path = HOME / "notices.md"
+    tmp = path.with_name(".notices.md.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def notices_blocks(cols):
+    """The notices pane: (title bar, blocks)."""
+    items = open_notices()
+    title = bar(tr(" 通知消息", " Notices"), f"{NOTICE_SECTIONS['open'][0 if lang() == 'zh' else 1]} {len(items)} ", cols)
+    if not items:
+        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])]
+    blocks, num_w = [], max(len(str(n or "·")) for n, _, _ in items)
+    for n, tag, text in items:
+        head = [(BOLD, str(n or "·").rjust(num_w)), ("", " ")]
+        name = [(CYAN, tag), ("", " ")] if tag else []
+        lines = wrap(name + [("", text)], cols - num_w - 1)
+        full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
+        blocks.append(foldable(("n", n, tag, text), full, fit(head + name + [("", text)], cols)))
+    return title, blocks
 
 
 def cmd_run(args):
@@ -2227,6 +2346,11 @@ def cmd_status(args):
                          (w.get("shelf_summary") or w.get("last_summary") or "").replace("\n", " ")[:60]))
         print_rows(rows)
     print_reminders()
+    items = open_notices()
+    if items:
+        print(tr("\n通知（要用户去做的事；claudesec notice done 编号）：", "\nNotices (for the user to do; claudesec notice done N):"))
+        for n, t, text in items:
+            print(f"  #{n} " + (f"[{t}] " if t else "") + text)
     print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1])
     sessions = external_sessions()
     if sessions:
@@ -3128,6 +3252,10 @@ def hook_secretary_session_start():
         if open_items.get("backlog"):
             out += [f"另有 {len(open_items['backlog'])} 件在「搁置」，用户提起前不问："
                     + "；".join(l.strip()[2:] for l in open_items["backlog"])]
+    notices = open_notices()
+    if notices:
+        out += ["", f"通知 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
+                *(f"- #{n} " + (f"[{t}] " if t else "") + text for n, t, text in notices)]
     print("\n".join(out)[:9500])
 
 
@@ -3386,6 +3514,11 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("notice"); s.set_defaults(fn=cmd_notice)
+    notice = s.add_subparsers(dest="action", required=True)
+    s = notice.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--from", dest="source")
+    s = notice.add_parser("done"); s.add_argument("number")
+    notice.add_parser("list")
     s = sub.add_parser("queue"); s.set_defaults(fn=cmd_queue)
     queue = s.add_subparsers(dest="action", required=True)  # so --asked goes before or after the text
     s = queue.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--asked", action="store_true")
@@ -3395,7 +3528,7 @@ def main():
     s.add_argument("--note")
     s = queue.add_parser("number")
     s = sub.add_parser("dashboard"); s.add_argument("action", choices=["on", "off", "layout", "show"])
-    s.add_argument("what", nargs="?", choices=["queue", "status"]); s.set_defaults(fn=cmd_dashboard)
+    s.add_argument("what", nargs="?", choices=list(DASH_PANES)); s.set_defaults(fn=cmd_dashboard)
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)

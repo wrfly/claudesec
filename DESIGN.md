@@ -123,6 +123,10 @@ perf     需要决策  两种 cache 方案，等你选        ← 是
 
 秘书把「用户决策：…」转给一个 NEED_DECISION / BLOCKED 的 worker 时（SendMessage 的 hook，或 Cursor 的 `send`），
 注册表里它就改成 PROGRESS、摘要「已答，在处理：…」，「等你？」随之消失，不用等它下一次汇报。权限对话框不算，那要在它窗口里点。
+更一般地：worker 的最后一条汇报（DONE / FAILED / BLOCKED / NEED_DECISION）之后，它只要开始了新的一轮，也改回 PROGRESS
+（摘要「收到回复，在处理：…」或「在做新的一轮（上次 DONE：…）」），直到下一次汇报。判据：汇报时写 `workers/<名>/after-report`，
+那一轮结束（Stop hook）把它标成 idle；Claude worker 之后第一次非 SendMessage 的工具调用（PostToolUse `*` 的守卫检查这个文件，
+平时不起进程），Cursor worker 下一次提交提示（beforeSubmitPrompt），就改回在做。汇报那一轮里的收尾调用不算。
 
 ### 2.5 秘书的铁律
 

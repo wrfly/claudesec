@@ -1491,7 +1491,7 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
-    for mark in ("reported", "finish"):
+    for mark in ("reported", "finish", AFTER_REPORT):
         (d / mark).unlink(missing_ok=True)
     prompt = render_prompt((PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
@@ -1507,8 +1507,10 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     q = shlex.quote(name)
     asking = {"type": "command", "command": f"{cmd} hook worker-permission {q}"}
     # Any tool event after a prompt means it was answered; the test keeps the common case cheap.
+    # Also how a worker seen as done or waiting (its last report) is seen working again (AFTER_REPORT).
     answered = [{"matcher": "*", "hooks": [{"type": "command", "command":
-                 f"[ ! -e {shlex.quote(str(d / 'waiting-permission'))} ] || {cmd} hook worker-permission-done {q}"}]}]
+                 f"[ ! -e {shlex.quote(str(d / 'waiting-permission'))} ] && [ ! -e {shlex.quote(str(d / AFTER_REPORT))} ]"
+                 f" || {cmd} hook worker-permission-done {q}"}]}]
     own = {"autoMemoryDirectory": memory} if memory else memory_settings(cwd)
     (d / "settings.json").write_text(json.dumps({**own, "hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-session-start {q}"}]}],
@@ -2873,6 +2875,11 @@ def record_report(name, text):
     (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
     if typ in TERMINAL:
         (worker_dir(name) / "reported").write_text(typ)
+    after = worker_dir(name) / AFTER_REPORT
+    if typ in TERMINAL:
+        after.write_text("reported")  # "idle" once that turn ends; see back_at_work
+    else:
+        after.unlink(missing_ok=True)
     if discussion_over:
         # Bring the user back to the secretary, who summarizes and offers to dispatch the to-dos.
         tmux("select-window", "-t", f"={config()['tmux_session']}:secretary", check=False)
@@ -3242,6 +3249,7 @@ def hook_cursor_prompt():
     name = cursor_worker()
     if name:
         (worker_dir(name) / "busy").write_text(now())
+        back_at_work(name, new_turn=True)  # a prompt after a final report: an answer or new work
 
 
 def hook_cursor_stop():
@@ -3319,6 +3327,9 @@ def hook_cursor_stop():
 def hook_worker_stop(name):
     data = hook_input()
     (worker_dir(name) / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    after = worker_dir(name) / AFTER_REPORT
+    if after.exists():
+        after.write_text("idle")  # the reporting turn is over; its next tool call means something new came
     permission_answered(name)
     with registry() as reg:  # a turn that ends normally is past any API error
         w = reg["workers"].get(name)
@@ -3537,8 +3548,42 @@ def permission_answered(name):
 
 
 def hook_worker_permission_done(name):
-    hook_input()
+    """After a tool call while a dialog is open or the last report still stands (the settings'
+    guard keeps it cheap otherwise)."""
+    data = hook_input()
     permission_answered(name)
+    if data.get("tool_name") != "SendMessage":  # the report itself, or another one
+        back_at_work(name)
+
+
+# The pane shows a worker's last report: DONE, FAILED, BLOCKED, NEED_DECISION. Once it works again
+# (an answer from the secretary, a new task, a decision pasted into a Cursor window) that would
+# say done or stuck while it is busy. So a final report leaves a marker; the turn's end makes it
+# "idle"; the first tool call of a later turn (a Claude worker) or the next prompt (a Cursor
+# worker) puts the worker back to working, until its next report.
+AFTER_REPORT = "after-report"
+
+
+def back_at_work(name, new_turn=False):
+    marker = worker_dir(name) / AFTER_REPORT
+    try:
+        state = marker.read_text().strip()
+    except OSError:
+        return
+    if state != "idle" and not new_turn:
+        return  # still in the turn that reported: it may wrap up, but nothing new came in
+    marker.unlink(missing_ok=True)
+    with registry() as reg:
+        w = reg["workers"].get(name)
+        if w is None or w["status"] not in TERMINAL:
+            return
+        was, old = w["status"], " ".join((w.get("last_summary") or "").split())
+        if was in ("NEED_DECISION", "BLOCKED"):
+            summary = old if old.startswith("已答，在处理") else f"收到回复，在处理：{old}"
+        else:
+            summary = f"在做新的一轮（上次 {was}：{old}）"
+        w.update(status="PROGRESS", pending_ask=None, last_summary=summary[:200])
+    append_log(name, "resumed", f"working again after its {was} report")
 
 
 # Claude Code sends SIGTERM to an async hook when its timeout runs out: 600 s if none is set

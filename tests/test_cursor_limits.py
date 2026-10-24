@@ -52,6 +52,19 @@ class CursorLimits(unittest.TestCase):
         self.config({"cursor_max_running": 0})  # 0: no limit
         self.cs.cursor_room("spawn c")
 
+    def test_the_commands_run_under_nice(self):
+        # a shell runs these; nice in front of a VAR=value takes it for the program (d32e4aa: every
+        # spawned Cursor window exited at once)
+        import shlex
+        import subprocess
+        for cmd in (self.cs.cursor_launch_command("w", "m"), self.cs.cursor_command("w", "m")):
+            words = shlex.split(cmd)
+            i = words.index("nice")
+            self.assertNotIn("=", words[i + 3], cmd)
+            self.assertTrue(all("=" in w for w in words[:i]), cmd)
+            probe = cmd.replace(words[i + 3], "true", 1).split(" hook ")[0].split(" --model ")[0]
+            self.assertEqual(subprocess.run(["sh", "-c", probe]).returncode, 0, probe)
+
     def test_nice(self):
         self.assertEqual(self.cs.cursor_nice(), "nice -n 10 ")
         self.assertIn("nice -n 10 agent --model m", self.cs.cursor_command("w", "m"))

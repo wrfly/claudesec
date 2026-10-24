@@ -14,13 +14,17 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
   claudesec queue add [--asked|--later] TEXT   a decision queue item with the next number (printed: #N);
                                     --asked: in 待答 (asked, waiting), --later: in 搁置 (put off)
-  claudesec queue move N backlog|todo|doing|done [--note T]   item #N to 搁置 / 待问 / 待答 / 已处理
+  claudesec queue move N backlog|todo|doing|done|ideas [--note T]   item #N to 搁置 / 待问 / 待答 / 已处理 / 记录
+                                    (queue add --idea: a note the user wants kept, not a question)
+  claudesec queue list [--older DAYS]    open items with how long they have waited
+  claudesec queue doctor [--fix]         check queue.md (line-number prefixes, doubled sections, …)
   claudesec queue number                 number the open queue items written without one
   claudesec notice add [--from W] TEXT   something for the user to do (not decide); notice done N, notice list
   claudesec show N                       the whole of queue item or notice #N
   claudesec dashboard on|off              queue and progress panes beside the secretary (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
+  claudesec model NAME MODEL [--force]   switch a worker's model: restart it on MODEL, conversation kept
   claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
   claudesec wait N                       the delegator waits for N's final report (background Bash)
   claudesec status                       one-screen table of workers
@@ -568,9 +572,12 @@ QUEUE_ITEM = re.compile(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(?:#(\d+)\s+)?(\S.*)"
 # queue.md's sections, a backlog -> todo -> doing -> done flow: 搁置 the user put off (not asked
 # until they bring it up), 待问 to ask one by one, 待答 asked and waiting for the answer,
 # 已处理 decided. Files from before 搁置 called 待答 「已问未答」.
-QUEUE_SECTIONS = {"backlog": ("搁置", "Backlog"), "todo": ("待问", "To ask"), "doing": ("待答", "Waiting"),
-                  "done": ("已处理", "Done")}
-QUEUE_ALIASES = {"backlog": ("later",), "todo": ("todo",), "doing": ("已问未答", "doing", "asked"), "done": ()}
+QUEUE_SECTIONS = {"ideas": ("记录", "Ideas"), "backlog": ("搁置", "Backlog"), "todo": ("待问", "To ask"),
+                  "doing": ("待答", "Waiting"), "done": ("已处理", "Done")}
+QUEUE_ALIASES = {"ideas": ("idea", "notes"), "backlog": ("later",), "todo": ("todo",),
+                 "doing": ("已问未答", "doing", "asked"), "done": ()}
+# What a paste of Read's numbered output leaves in front of each line ("  12\t"), once per paste
+LINE_NUMBER = re.compile(r"^(?: *\d+\t)+")
 
 
 def section_name(key):
@@ -585,12 +592,55 @@ def queue_section(heading):
                  if any(w.lower() in low for w in (*words, *QUEUE_ALIASES[key]))), None)
 
 
+def repair_queue(lines):
+    """(lines, problems): queue.md as it should be, and what was wrong with it. Line-number
+    prefixes from a pasted Read are stripped (2026-10-25: up to three on every line); a section
+    that appears twice, as it did once a damaged file's headings went unrecognized and four new
+    ones were appended, is merged into one: items in the order found, 已处理's later ones first."""
+    problems = []
+    numbered = sum(1 for line in lines if LINE_NUMBER.match(line))
+    if numbered:
+        lines = [LINE_NUMBER.sub("", line) for line in lines]
+        problems.append(tr(f"{numbered} 行前面有行号", f"{numbered} lines had line numbers in front"))
+    heads = [i for i, line in enumerate(lines) if line.startswith("## ") and queue_section(line)]
+    keys = [queue_section(lines[i]) for i in heads]
+    twice = [k for k in QUEUE_SECTIONS if keys.count(k) > 1]
+    if not twice:
+        return lines, problems
+    problems.append(tr("分区重复：", "sections twice: ") + tr("、", ", ").join(section_name(k) for k in twice))
+    blocks = {}
+    for n, i in enumerate(heads):
+        body = lines[i + 1:heads[n + 1] if n + 1 < len(heads) else len(lines)]
+        while body and not body[0].strip():
+            body = body[1:]
+        while body and not body[-1].strip():
+            body = body[:-1]
+        if keys[n] not in blocks:
+            blocks[keys[n]] = (lines[i], body)
+        elif keys[n] == "done":  # newest first
+            blocks["done"] = (blocks["done"][0], body + [""] + blocks["done"][1])
+        else:
+            blocks[keys[n]] = (blocks[keys[n]][0], blocks[keys[n]][1] + body)
+    out = lines[:heads[0]]
+    for key in QUEUE_SECTIONS:
+        if key in blocks:
+            head, body = blocks[key]
+            out += [head, ""] + body + ([""] if body else [])
+    return out, problems
+
+
+def queue_text():
+    """queue.md as read, repaired (not written back; any `claudesec queue` command does that)."""
+    path = HOME / "queue.md"
+    return "\n".join(repair_queue(path.read_text().splitlines())[0]) if path.exists() else ""
+
+
 def queue_items(text):
-    """The undecided items of queue.md: (section, number, tag, body, note), section "backlog",
-    "todo" or "doing", number None when it has none, note the trailing （中，…） or the date it
-    was asked."""
+    """The undecided items of queue.md: (section, number, tag, body, note), section "ideas",
+    "backlog", "todo" or "doing", number None when it has none, note the trailing （中，…） or the
+    date it was asked."""
     items, section = [], None
-    for line in text.splitlines():
+    for line in repair_queue(text.splitlines())[0]:
         if line.startswith("## "):
             section = queue_section(line)
             section = None if section == "done" else section
@@ -619,6 +669,31 @@ def paren(text):
     return tr(f"（{text}）", f" ({text})")
 
 
+def queue_meta():
+    """{number: {"added": date}} for queue items, kept beside queue.md so hand edits of the file
+    don't lose it. Items from before it have no date."""
+    with contextlib.suppress(OSError, ValueError):
+        return json.loads((HOME / "queue-meta.json").read_text())
+    return {}
+
+
+def note_added(num):
+    meta = queue_meta()
+    meta.setdefault(str(num), {})["added"] = dt.date.today().isoformat()
+    tmp = HOME / f".queue-meta.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(meta, indent=1) + "\n")
+    os.replace(tmp, HOME / "queue-meta.json")
+
+
+def item_age(num, section, note, meta=None):
+    """Days an open item has waited: since it was asked (待答), else since it was added; None
+    when unknown."""
+    when = note if section == "doing" else (meta if meta is not None else queue_meta()).get(str(num), {}).get("added")
+    with contextlib.suppress(TypeError, ValueError):
+        return (dt.date.today() - dt.date.fromisoformat(when)).days
+    return None
+
+
 # A pane's body is a list of blocks (key, folded, unfolded): the lines of one item folded to one
 # line, and all of them. Headings and spacing have key None and don't fold. Everything starts
 # folded; a click on an item unfolds it, a click on the title bar (or Tab) does all of them.
@@ -639,6 +714,8 @@ def queue_blocks(cols):
     ask = [i for i in items if i[0] == "todo"]
     asked = [i for i in items if i[0] == "doing"]
     later = [i for i in items if i[0] == "backlog"]
+    ideas = [i for i in items if i[0] == "ideas"]
+    meta = queue_meta()
     title = bar(tr(" 决策队列", " Decisions"),
                 f"{section_name('todo')} {len(ask)}  {section_name('doing')} {len(asked)} ", cols)
     if not ask and not asked:
@@ -666,13 +743,21 @@ def queue_blocks(cols):
             name = [(CYAN, tag), ("", " ")] if tag else []
             lines = wrap(name + [("", text), (DIM, tail)], cols - num_w - 1)
             full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
-            blocks.append(foldable(("q", num, tag, text), full, fit(head + name + [("", text)], cols)))
-    if later:  # put off by the user: out of the way, one line until clicked open
+            age = item_age(num, section, note, meta)
+            age = f"{age}d" if age else ""  # how long it has waited; nothing on its first day
+            short = fit(head + name + [("", text)], cols - (len(age) + 1 if age else 0))
+            if age:
+                short += [("", " " * (cols - sum(width(t) for _, t in short) - len(age))), (DIM, age)]
+            # with an age the folded line differs from the full one even when the item fits on one
+            blocks.append((("q", num, tag, text), [short], full) if age else foldable(("q", num, tag, text), full, short))
+    for key, group in (("backlog", later), ("ideas", ideas)):  # not questions: one line each until opened
+        if not group:
+            continue
         names = tr("；", "; ").join(f"{f'#{n} ' if n else ''}{f'[{tag}] ' if tag else ''}{text}"
-                                   for _, n, tag, text, _ in later)
-        segs = [(BOLD, f"{section_name('backlog')} {len(later)}"), ("", "  "), (DIM, names)]
+                                   for _, n, tag, text, _ in group)
+        segs = [(BOLD, f"{section_name(key)} {len(group)}"), ("", "  "), (DIM, names)]
         lines = wrap(segs, cols, cols - 2)
-        blocks += [fixed([]), foldable(("backlog",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
+        blocks += [fixed([]), foldable((key,), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
                                        fit(segs, cols))]
     return title, blocks
 
@@ -965,8 +1050,8 @@ def cmd_dashboard(args):
 QUEUE_INTRO = """# 决策队列
 
 秘书维护。worker 的 NEED_DECISION、要用户定的 TODO 先进这里，按重要程度排序，一次只问用户一件。
-四块，像 backlog → todo → doing → done：「搁置」用户说以后再说的，不主动问；「待问」接下来一件件问的；
-「待答」问过了、等用户回答；「已处理」定了的，新的在上。
+像 backlog → todo → doing → done：「搁置」用户说以后再说的，不主动问；「待问」接下来一件件问的；
+「待答」问过了、等用户回答；「已处理」定了的，新的在上。「记录」是用户只让记下的想法，不是要问的问题。
 每条一行 `- #编号 [worker] 问题（高|中|低）`。编号用 `claudesec queue add` 拿，跟着条目走，不改、不复用；
 在块之间挪用 `claudesec queue move 编号 backlog|todo|doing|done`。用户看着面板用编号回答。
 """
@@ -974,9 +1059,9 @@ QUEUE_INTRO_EN = """# Decision queue
 
 Kept by the secretary. Workers' NEED_DECISIONs and TODOs the user has to decide land here, most
 important first; the user is asked one at a time.
-Four sections, like backlog -> todo -> doing -> done: Backlog, what the user put off (not asked
-about); To ask, asked next, one by one; Waiting, asked and waiting for the answer; Done, decided,
-newest first.
+Like backlog -> todo -> doing -> done: Backlog, what the user put off (not asked about); To ask,
+asked next, one by one; Waiting, asked and waiting for the answer; Done, decided, newest first.
+Ideas holds what the user only asked to note down: not questions.
 One line an item: `- #number [worker] question (high|medium|low)`. Numbers come from
 `claudesec queue add` and stay with the item; `claudesec queue move N backlog|todo|doing|done`
 moves one. The user answers by number from the panel.
@@ -992,8 +1077,10 @@ def queue_template():
 
 
 def normalize_queue(lines):
-    """queue.md's lines with all four sections, in order of the flow when one has to be added;
-    an older file's 「已问未答」 becomes 「待答」 and its intro the current one."""
+    """queue.md's lines repaired (see repair_queue) and with all its sections, in order of the
+    flow when one has to be added; an older file's 「已问未答」 becomes 「待答」 and its intro the
+    current one."""
+    lines = repair_queue(lines)[0]
     heads = [i for i, line in enumerate(lines) if line.startswith("## ")]
     old = [i for i in heads if "已问未答" in lines[i]]
     for i in old:
@@ -1065,12 +1152,63 @@ def take_queue_number(text):
     for other in (HOME / "queue.md", HOME / "notices.md"):
         with contextlib.suppress(OSError):
             text += "\n" + other.read_text()
-    seen = [int(m[1]) for m in map(QUEUE_ITEM.match, text.splitlines()) if m and m[1]]
+    seen = [int(m[1]) for m in (QUEUE_ITEM.match(LINE_NUMBER.sub("", l)) for l in text.splitlines()) if m and m[1]]
     with contextlib.suppress(OSError, ValueError):
         seen.append(int(last.read_text()))
     n = max(seen, default=0) + 1
     last.write_text(f"{n}\n")
     return n
+
+
+def queue_list(older=None):
+    """The open items, one line each: number, section, how long it has waited, text."""
+    meta, rows, unknown = queue_meta(), [], 0
+    for section, num, tag, body, note in queue_items(queue_text()):
+        age = item_age(num, section, note, meta)
+        if older is not None and (age is None or age < older):
+            unknown += age is None
+            continue
+        rows.append((f"#{num}" if num else "·", section_name(section), "?" if age is None else f"{age}d",
+                     (f"[{tag}] " if tag else "") + " ".join(body.split())[:90]))
+    if rows:
+        print_rows([tr(("编号", "分区", "等了", "内容"), ("#", "section", "waited", "text")), *rows])
+    else:
+        print(tr("没有符合的条目。", "No such items."))
+    if unknown:
+        print(tr(f"另有 {unknown} 条不知道放了多久（记日期之前加的）。",
+                 f"And {unknown} of unknown age (added before dates were kept)."))
+
+
+def queue_doctor(raw, problems, fix):
+    """What's wrong with queue.md: damage repair_queue undoes, and what it can't decide for you
+    (a number twice, unnumbered items, items above the first section)."""
+    lines = repair_queue(raw)[0]
+    seen, section, loose = {}, None, 0
+    for line in lines:
+        if line.startswith("## "):
+            section = queue_section(line)
+            continue
+        m = QUEUE_ITEM.match(line)
+        if m and section is None:
+            loose += 1
+        if m and m[1]:
+            seen.setdefault(m[1], []).append(section)
+    twice = {n: s for n, s in seen.items() if len(s) > 1}
+    unnumbered = sum(1 for _, n, *_ in queue_items("\n".join(lines)) if not n)
+    if twice:
+        problems = problems + [tr("编号出现多次：", "numbers more than once: ") + ", ".join(
+            f"#{n}（{'/'.join(section_name(k) if k else '?' for k in s)}）" for n, s in sorted(twice.items()))]
+    if unnumbered:
+        problems.append(tr(f"{unnumbered} 条未定的没有编号（`claudesec queue number`）",
+                           f"{unnumbered} open items without a number (`claudesec queue number`)"))
+    if loose:
+        problems.append(tr(f"{loose} 条在所有分区之前", f"{loose} items above the first section"))
+    print("\n".join(f"- {p}" for p in problems) if problems else tr("queue.md 没问题。", "queue.md is fine."))
+    if problems and not fix:
+        print(tr("行号和重复分区：`claudesec queue doctor --fix` 修（先备份）；其余的要手动看。",
+                 "Line numbers and doubled sections: `claudesec queue doctor --fix` repairs them (after a backup); "
+                 "the rest needs a look by hand."))
+        sys.exit(1)
 
 
 def cmd_queue(args):
@@ -1080,16 +1218,35 @@ def cmd_queue(args):
     to date first."""
     path = HOME / "queue.md"
     HOME.mkdir(parents=True, exist_ok=True)
-    lines = normalize_queue((path.read_text() if path.exists() else queue_template()).splitlines())
+    raw = (path.read_text() if path.exists() else queue_template()).splitlines()
+    _, problems = repair_queue(raw)
+    if args.action in ("list", "doctor"):
+        if args.action == "doctor":
+            queue_doctor(raw, problems, args.fix)
+            if not args.fix:
+                return
+        else:
+            queue_list(args.older)
+            return
+    if problems:  # repaired below; keep the damaged one, and say so
+        backups = HOME / "backups"
+        backups.mkdir(exist_ok=True)
+        keep = backups / f"queue-{dt.datetime.now():%Y%m%d-%H%M%S}.md"
+        keep.write_text("\n".join(raw) + "\n")
+        print(tr(f"queue.md 坏了（{'；'.join(problems)}），已修好，原样备份在 {keep}",
+                 f"queue.md was damaged ({'; '.join(problems)}); repaired, the damaged one kept at {keep}"),
+              file=sys.stderr)
+    lines = normalize_queue(raw)
     if args.action == "add":
         text = " ".join(args.words).strip()
         if not text:
             sys.exit("queue add: what is the question?")
-        if args.asked and args.later:
-            sys.exit("queue add: --asked or --later, not both")
-        key = "doing" if args.asked else "backlog" if args.later else "todo"
+        if sum(map(bool, (args.asked, args.later, getattr(args, "idea", False)))) > 1:
+            sys.exit("queue add: one of --asked, --later, --idea")
+        key = "doing" if args.asked else "backlog" if args.later else "ideas" if getattr(args, "idea", False) else "todo"
         n = take_queue_number("\n".join(lines))
         queue_append(lines, key, f"- #{n} {with_asked_date(text) if key == 'doing' else text}")
+        note_added(n)
         print(f"#{n}")
     elif args.action == "move":
         key = {**{k: k for k in QUEUE_SECTIONS}, **{w: k for k, ws in QUEUE_SECTIONS.items() for w in ws}}.get(args.to)
@@ -1097,7 +1254,13 @@ def cmd_queue(args):
         found = [i for i, line in enumerate(lines)
                  if (m := QUEUE_ITEM.match(line)) and m[1] == num and not line.startswith("## ")]
         if not found:
-            sys.exit(f"queue move: no item #{num} in {path}")
+            notice = any((m := QUEUE_ITEM.match(line)) and m[1] == num for line in
+                         ((HOME / "notices.md").read_text().splitlines() if (HOME / "notices.md").exists() else []))
+            sys.exit(tr(f"queue move：{path} 里没有 #{num}。", f"queue move: no item #{num} in {path}. ")
+                     + (tr(f"#{num} 是通知：`claudesec notice done {num}`。", f"#{num} is a notice: `claudesec notice done {num}`.")
+                        if notice else tr("`claudesec queue list` 列出未定的条目；文件可能坏了的话 `claudesec queue doctor`。",
+                                          "`claudesec queue list` lists the open items; if the file may be damaged, "
+                                          "`claudesec queue doctor`.")))
         i = found[0]
         frm = next(queue_section(lines[j]) for j in range(i, -1, -1) if lines[j].startswith("## "))
         text = QUEUE_ITEM.match(lines[i])[2].strip()
@@ -1125,7 +1288,9 @@ def cmd_queue(args):
                 continue
             m = QUEUE_ITEM.match(line)
             if section and m and not m[1]:
-                lines[i] = f"- #{take_queue_number(chr(10).join(lines))} {m[2].strip()}"
+                n = take_queue_number(chr(10).join(lines))
+                lines[i] = f"- #{n} {m[2].strip()}"
+                note_added(n)
                 done.append(lines[i])
         print("\n".join(done) or tr("未定的条目都有编号了", "every open item has a number"))
     tmp = path.with_name(".queue.md.tmp")
@@ -1234,6 +1399,7 @@ def cmd_show(args):
                                     (HOME / "notices.md", notice_section, NOTICE_SECTIONS)):
         section = None
         for line in (path.read_text() if path.exists() else "").splitlines():
+            line = LINE_NUMBER.sub("", line)
             if line.startswith("## "):
                 section = section_of(line)
                 continue
@@ -3057,6 +3223,24 @@ def send_text(name, w, text, by="secretary"):
     append_log(name, f"{by}→worker", text)
 
 
+def cmd_model(args):
+    """Switch a worker to another model: shelve it and wake it on the new one, the conversation
+    kept. The one way for a Cursor worker, whose agent takes the model only on its command line;
+    works for a Claude Code worker too. A busy worker is left alone (--force cuts it off)."""
+    w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
+    if w["status"] != "SHELVED":
+        err = quietly(cmd_shelve, name=args.name, note=f"switching to {args.model}", as_name=None, force=args.force)
+        if err:
+            sys.exit(f"model: {err}")
+    with registry() as reg:
+        reg["workers"][args.name]["shelved_by"] = "model"
+    err = quietly(cmd_wake, name=args.name, model=args.model, quiet=True)
+    if err:
+        sys.exit(f"model: {args.name} is shelved now, but waking it on {args.model} failed: {err}. "
+                 f"`claudesec wake {args.name} --model <model>` tries again.")
+    print(f"{args.name} now runs {args.model} (conversation kept; it waits for your next message)")
+
+
 def cmd_send(args):
     """Secretary → Cursor worker: pasted into its window as one message. Sent while it works,
     the message waits in Cursor's queue and runs when the turn ends."""
@@ -3066,6 +3250,9 @@ def cmd_send(args):
     if not cursor_running(w):
         sys.exit(f"{args.name} has no running agent (status {w['status']}); `claudesec wake {args.name}` it first")
     text = sys.stdin.read().strip() or sys.exit("empty message: pass it on stdin")
+    if re.match(r"/model\b", text):  # pasted as text, it is a message to the model, not a command
+        sys.exit(f"NOT SENT: a pasted /model doesn't switch a Cursor worker's model. Run "
+                 f"`claudesec model {args.name} <model>`: it restarts the agent on the new model, conversation kept.")
     send_text(args.name, w, text)
     mark_answered(args.name, text)
     with registry() as reg:
@@ -3282,6 +3469,20 @@ CURSOR_FALLBACK_MODEL = "gpt-5.6-sol-high"
 AGENT_START = "[claudesec] Cursor agent, model "
 
 
+def cursor_error_text(window):
+    """The error a Cursor agent printed at the end of a failed turn ("Error: Model Blocked"): its
+    stop hook says only "error". The screen may lag the hook by a moment."""
+    if not window:
+        return ""
+    for _ in range(3):
+        lines = [l.strip() for l in pane_text(window, suggestion="drop").splitlines() if l.strip()]
+        hits = [l for l in lines[-40:] if re.search(r"\b(Error|error|ERROR)\b|Blocked|blocked", l)]
+        if hits:
+            return " ".join(hits[-1].split())[:200]
+        time.sleep(1)
+    return ""
+
+
 def hook_cursor_launch(name):
     """What a spawned Cursor worker's window runs: its agent, in the foreground. Cursor now and
     then answers a model variant string with "Cannot use this model" and exits, though the same
@@ -3423,17 +3624,24 @@ def hook_cursor_stop():
     if data.get("status") == "error":
         idle()
         (d / "ended-error").write_text(now())
+        said = cursor_error_text(w.get("window"))
+        why = f"Cursor ({data.get('model') or '?'}): {said or 'turn ended with status error'}"
         with registry() as reg:
             w = reg["workers"][name]
             if w["status"] not in ("API_ERROR", "WAITING_PERMISSION"):
                 w["status_before"] = w["status"]
-            w.update(status="API_ERROR", pending_ask="Cursor: turn ended with status error", last_report_at=now())
-        append_log(name, "api-error", "Cursor: turn ended with status error")
+            w.update(status="API_ERROR", pending_ask=why, last_report_at=now())
+        append_log(name, "api-error", why)
+        blocked = re.search(r"(?i)model.{0,20}(blocked|not available|cannot use)|(blocked|cannot use).{0,20}model", said or "")
         if not w.get("delegated_by") and w.get("mode") != "discuss":  # a delegator's wait reports it
-            raise_alert(tr(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报。"
-                           f"用 `claudesec send {name}` 让它从中断处继续。",
+            raise_alert(tr(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报：{why}。"
+                           + (f"是模型用不了：`claudesec model {name} <模型>` 换一个（会重开 agent，对话保留）。"
+                              if blocked else f"用 `claudesec send {name}` 让它从中断处继续。"),
                            f"Cursor worker {name}'s turn ended in an error; it sits at its prompt and won't report "
-                           f"on its own. Tell it to carry on from where it stopped with `claudesec send {name}`."))
+                           f"on its own: {why}. "
+                           + (f"The model can't be used: switch with `claudesec model {name} <model>` (restarts the "
+                              "agent, keeps the conversation)." if blocked else
+                              f"Tell it to carry on from where it stopped with `claudesec send {name}`.")))
         return
     if w["status"] == "API_ERROR":
         with registry() as reg:
@@ -3530,7 +3738,8 @@ def hook_secretary_session_start():
     queue = HOME / "queue.md"
     if queue.exists():
         open_items, section = {}, None
-        for line in open_part(queue).splitlines():
+        text = queue_text()
+        for line in text.split(done_heading(text))[0].splitlines():
             if line.startswith("## "):
                 section = queue_section(line)
             elif section and QUEUE_ITEM.match(line):
@@ -3544,6 +3753,10 @@ def hook_secretary_session_start():
             out += [tr(f"另有 {len(open_items['backlog'])} 件在「搁置」，用户提起前不问：",
                        f"And {len(open_items['backlog'])} in Backlog, not to be asked about until the user brings them up: ")
                     + tr("；", "; ").join(l.strip()[2:] for l in open_items["backlog"])]
+        if open_items.get("ideas"):
+            out += [tr(f"「记录」里 {len(open_items['ideas'])} 条是用户让记下的想法，不是要问的问题：",
+                       f"Ideas holds {len(open_items['ideas'])} notes the user asked to keep, not questions: ")
+                    + tr("；", "; ").join(l.strip()[2:] for l in open_items["ideas"])]
     notices = open_notices()
     if notices:
         out += ["", tr(f"通知 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
@@ -3870,7 +4083,9 @@ def main():
     s = sub.add_parser("queue"); s.set_defaults(fn=cmd_queue)
     queue = s.add_subparsers(dest="action", required=True)  # so --asked goes before or after the text
     s = queue.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--asked", action="store_true")
-    s.add_argument("--later", action="store_true")
+    s.add_argument("--later", action="store_true"); s.add_argument("--idea", action="store_true")
+    s = queue.add_parser("list"); s.add_argument("--older", type=int, metavar="DAYS")
+    s = queue.add_parser("doctor"); s.add_argument("--fix", action="store_true")
     s = queue.add_parser("move"); s.add_argument("number")
     s.add_argument("to", choices=[*QUEUE_SECTIONS, *(w for ws in QUEUE_SECTIONS.values() for w in ws)])
     s.add_argument("--note")
@@ -3880,6 +4095,8 @@ def main():
     s = sub.add_parser("review"); s.add_argument("--print", action="store_true"); s.set_defaults(fn=cmd_review)
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
+    s = sub.add_parser("model"); s.add_argument("name"); s.add_argument("model")
+    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_model)
     s = sub.add_parser("delegate"); s.add_argument("boss"); s.add_argument("--name", required=True)
     s.add_argument("--dir"); s.add_argument("--model"); s.add_argument("--ack"); s.set_defaults(fn=cmd_delegate)
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--timeout", type=int, default=4 * 3600)

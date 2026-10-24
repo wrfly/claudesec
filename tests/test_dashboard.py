@@ -266,7 +266,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(self.queue("add", "[t] 以后再聊", later=True), "#15")
         text = (self.home / "queue.md").read_text()
         heads = [l for l in text.splitlines() if l.startswith("## ")]
-        self.assertEqual(heads, ["## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
+        self.assertEqual(heads, ["## 记录", "## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
         self.assertNotIn("已问未答", text)
         self.assertEqual(self.numbers(), [("backlog", 15), ("todo", 12), ("todo", None), ("todo", 3),
                                           ("todo", None), ("doing", 9)])
@@ -452,7 +452,7 @@ class English(Dashboard):
         self.write_queue()
         self.queue("add", "x", later=True)
         heads = [l for l in (self.home / "queue.md").read_text().splitlines() if l.startswith("## ")]
-        self.assertEqual(heads, ["## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
+        self.assertEqual(heads, ["## 记录", "## 搁置", "## 待问（按优先级）", "## 待答", "## 已处理"])
 
     def test_progress_pane_lists_what_needs_the_user_first(self):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {

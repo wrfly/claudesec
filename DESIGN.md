@@ -214,6 +214,13 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 设成解析后的目录，不加任何规则，default、auto 两种模式写、default 模式读都直接通过。worktree 和子目录在 init 事件里
 报出的 memory 路径都是主仓库的。worker 改 memory 用 Write / Edit（worker.md）；Bash 的 `rm`、`cat >` 照样会问。
 
+**Cursor 的错误和换模型**：Cursor 的 stop hook 只给 status=error，不给原因；原因在屏幕上（2026-10-25 upreset 被切到被团队屏蔽的
+Grok 4.7，几个小时每轮都「Error: Model Blocked」，告警只写了 status error）。现在出错时截一下它的窗口，取最后一行带 Error /
+Blocked 的字，连同 hook 给的模型名写进 pending_ask、日志和告警；像是模型用不了时告警直接给 `claudesec model`。
+Cursor 的模型只认命令行上的 `--model`，往窗口里贴 `/model …` 只会变成一条发给模型的消息：`claudesec send` 拒绝以 `/model` 开头的
+内容并指向 `claudesec model <名字> <模型>`，它就是 shelve（忙的不动，`--force` 才打断）再 quiet wake `--model`，对话保留，
+Claude Code worker 也能用。
+
 **本地 Cursor 的 CPU**：每个 agent 是一棵本地进程树，能吃满几个核（用户嫌占 CPU，2026-10-24）。上 Cursor 云端
 （Cloud Agents，只有 REST API 能脚本化，要关掉账号的 privacy mode、给仓库装 GitHub App、云端命令全自动执行）用户没选，
 选了在本地压着：config `cursor_max_running`（默认 2）个以上的 Cursor worker 在干活（STARTING / PROGRESS、窗口还在）时，
@@ -563,6 +570,15 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   换掉讲旧分区的说明、并掉成串的空行），条目和编号不动。会话开始注入给秘书的「还有 N 件没定」只算待问 + 待答，搁置另起一行。
 - `claudesec queue move N backlog|todo|doing|done [--note 文本]`：挪条目。进待答写上当天「已问」日期，回到待问 / 搁置去掉它；
   进已处理放在最上面，写上当天日期，`--note`（如「用户答：A」）替换问题。省得秘书手写脚本改文件。
+- 第五块「记录」（Ideas）：用户只让记下的想法，不是问题。`queue add --idea` / `queue move N ideas`；面板折成最后一行，
+  会话开始注入里单列一行，不算「没定」的。
+- 容错（2026-10-25 真出过）：秘书把 Read 带行号的输出写回了 queue.md，每行前面多了 1–3 个「数字+Tab」，分区标题认不出来，
+  下一条 `queue` 命令以为缺分区，又在末尾补了一整套，之后 move 找不到编号或挪进了后补的那套。现在读的地方（面板、注入、show、
+  发号）都先 `repair_queue`：去掉行号前缀、重复的分区合成一个（已处理里后补的那套在前）；任何 `queue` 命令发现文件坏了先原样
+  备份到 `~/.claudesec/backups/`、在 stderr 说一声再写回修好的。`queue doctor [--fix]` 另查编号重复、没编号、在分区外的条目，
+  有问题时退出码 1。move 找不到编号时退出码 1，说是不是通知、提示 `queue list` / `queue doctor`。
+- 年龄：`queue-meta.json` 记每条加入的日期（放在 queue.md 旁边，秘书手改文件不会丢）；待答按「已问」日期算。面板折叠行右边
+  显示等了几天（当天不显示），`queue list [--older 天数]` 列出来，之前加的条目不知道日期显示 `?`。
 - 编号是给用户回答用的（「12 A」），所以要稳：条目在块之间挪、别的条目删掉，都不变；号只增不复用
   （`queue.last` 记着发到了几）。`claudesec queue add [--asked|--later] 文本` 加到「待问」（或「待答」「搁置」）末尾、打印 `#N`，
   `--asked` 放在文本前后都行，并自动写上当天的「YYYY-MM-DD 已问：」；待答的条目没有日期或日期不对时，面板只是不显示

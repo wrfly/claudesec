@@ -67,6 +67,9 @@ claudesec 的 pane 显示 `(not saved: @resurrect-skip)`。
     claudesec dashboard off    # 关掉秘书右侧的队列 / 进展 / 通知面板（on 打开）
     claudesec notice add --from W "去 W 窗口说 push"   # 要用户去做的事；notice done N 标完成
     claudesec show 46          # 决策队列或通知 #46 的全文（面板里点一下那条也会展开）
+    claudesec queue list --older 7   # 等了一周以上的未定条目
+    claudesec queue doctor     # 检查 queue.md（行号前缀、重复分区、编号重复）；--fix 修
+    claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Cursor worker 换模型就用它
 
 队列面板上每条有个编号，直接回秘书「12 A」「15 不用了」就是在答那一条。
 

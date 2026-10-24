@@ -33,6 +33,8 @@ Written with defaults on the first run; fields you leave out keep their defaults
 | `worker_model` | `"claude-opus-5-5"` | Default model for workers; `claudesec spawn --model` overrides it per worker |
 | `worker_permission_mode` | `"auto"` | Workers' `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"` (GPT-5.6 Sol 1M High) | Default model for `spawn --agent cursor` (Cursor's `agent` CLI). The first Cursor worker adds three hooks to `~/.cursor/hooks.json` (after a backup); they act only inside claudesec's Cursor workers. Set `"network": {"useHttp1ForAgent": true}` in `~/.cursor/cli-config.json`, or the agent stalls on HTTP/2 |
+| `cursor_max_running` | `2` | At most this many local Cursor workers at work at once (one idling at its prompt doesn't count); `spawn --agent cursor`, `wake` and `delegate` past it refuse and say who is busy. `0`: no limit |
+| `cursor_nice` | `10` | Cursor agents run under `nice -n` this, so they yield the CPU to everything else; `0`: normal priority |
 | `secretary_name` | `"secretary"` | The secretary's session name; workers send their reports to it |
 | `tmux_session` | `"claudesec"` | The tmux session the secretary and workers live in |
 | `cursor` | `"auto"` | Whether Cursor workers (`spawn --agent cursor`, a worker's `claudesec delegate`) can be used. `"auto"`: if the `agent` command is installed; `false`: off; `true`: on (still unavailable without `agent`). When unavailable, those two commands refuse and say why, and the secretary's and workers' rules leave out handing work to Cursor. `claudesec status` shows the current state at the end. After a change, `claudesec --restart`; workers pick it up when next started or woken |

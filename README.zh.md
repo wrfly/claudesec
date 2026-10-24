@@ -29,6 +29,8 @@
 | `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定 |
 | `worker_permission_mode` | `"auto"` | worker 的 `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High） | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
+| `cursor_max_running` | `2` | 同时在干活的本地 Cursor worker 最多几个（停在提示符上空闲的不算）；超了 `spawn --agent cursor`、`wake`、`delegate` 会拒绝并说明是谁在跑。`0` 不限 |
+| `cursor_nice` | `10` | Cursor agent 用 `nice -n` 这个值运行，CPU 让给别的程序；`0` 正常优先级 |
 | `secretary_name` | `"secretary"` | 秘书的会话名，worker 用它发汇报 |
 | `tmux_session` | `"claudesec"` | 秘书和 worker 所在的 tmux session |
 | `cursor` | `"auto"` | Cursor worker（`spawn --agent cursor`、worker 的 `claudesec delegate`）能不能用。`"auto"`：机器上有 `agent` 命令就能用；`false` 关掉；`true` 要用（没装 `agent` 仍不可用）。不可用时这两个命令拒绝并说明原因，秘书和 worker 的规则里也不出现交给 Cursor 的内容。`claudesec status` 末尾显示当前状态。改完 `claudesec --restart`，worker 下次启动或唤醒时生效 |

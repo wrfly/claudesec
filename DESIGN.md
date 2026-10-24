@@ -214,6 +214,13 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 设成解析后的目录，不加任何规则，default、auto 两种模式写、default 模式读都直接通过。worktree 和子目录在 init 事件里
 报出的 memory 路径都是主仓库的。worker 改 memory 用 Write / Edit（worker.md）；Bash 的 `rm`、`cat >` 照样会问。
 
+**本地 Cursor 的 CPU**：每个 agent 是一棵本地进程树，能吃满几个核（用户嫌占 CPU，2026-10-24）。上 Cursor 云端
+（Cloud Agents，只有 REST API 能脚本化，要关掉账号的 privacy mode、给仓库装 GitHub App、云端命令全自动执行）用户没选，
+选了在本地压着：config `cursor_max_running`（默认 2）个以上的 Cursor worker 在干活（STARTING / PROGRESS、窗口还在）时，
+`spawn --agent cursor`、`wake`、`delegate` 拒绝并列出谁在跑，delegate 的拒绝带 `NOT DELEGATED:`，worker 照规则自己做或开
+subagent；接着做同一个 worker 不算新增。停在提示符上的不算（几乎不占 CPU）。`cursor_nice`（默认 10）：agent 命令前加
+`nice -n`，整棵进程树继承。`claudesec status` 的 Cursor 那行显示「在跑 N/上限」。
+
 **生命周期**：秘书窗口里跑的是 `claudesec run`，它不 exec claude，而是把它当子进程包一层。
 - 启动时：后台 `claudesec lifecycle wake-all`。被秘书退出收起的 worker（`shelved_by: exit`），以及进程已经没了的
   worker（窗口或整个 tmux session 被杀），都用 `--resume` **静默**恢复：不带首条 prompt，不跑模型，状态还原。

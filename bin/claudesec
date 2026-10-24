@@ -92,6 +92,8 @@ DEFAULT_CONFIG = {
     "cursor_worker_model": "gpt-5.6-sol[context=1m,reasoning=high,fast=false]",
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
+    "cursor_max_running": 2,          # local Cursor workers at work at once; spawn / wake / delegate past it refuse
+    "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
     "language": None,                 # what the panes, status and queue say: "zh", "en"; None = see lang()
 }
@@ -1481,6 +1483,8 @@ def cmd_spawn(args):
     model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
     if cursor:
         require_cursor("spawn --agent cursor")
+        if not args.for_worker:  # a delegation was checked by delegate, which says it its own way
+            cursor_room(f"spawn {name}")
         check_cursor_http1()
 
     if args.discuss:
@@ -1502,7 +1506,7 @@ def cmd_spawn(args):
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     # A Cursor worker's window runs `hook cursor-launch`, which runs the agent: it retries or falls
     # back when the model is refused, and records a failure instead of a STARTING that never ends.
-    cmd = (f"CLAUDESEC_MODEL={shlex.quote(model)} {hook_cmd()} hook cursor-launch {shlex.quote(name)}"
+    cmd = (f"CLAUDESEC_MODEL={shlex.quote(model)} {cursor_nice()}{hook_cmd()} hook cursor-launch {shlex.quote(name)}"
            if cursor else worker_command(name, d, cfg, model))
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project, cmd).strip()
 
@@ -1630,7 +1634,7 @@ def install_cursor_hooks():
 def cursor_command(name, model, *extra, d=None):
     """The worker's agent command; with d, its first message comes from d/initial.md."""
     env = f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))}"
-    return (env + " " + " ".join(shlex.quote(a) for a in ["agent", "--model", model, "--trust", *extra])
+    return (env + " " + cursor_nice() + " ".join(shlex.quote(a) for a in ["agent", "--model", model, "--trust", *extra])
             + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if d else ""))
 
 
@@ -1654,6 +1658,34 @@ def require_cursor(what):
     ok, why = cursor_available()
     if not ok:
         sys.exit(f"{what}: Cursor workers are not available here — {why}.")
+
+
+CURSOR_AT_WORK = {"STARTING", "PROGRESS"}
+
+
+def cursor_busy(but=None):
+    """Cursor workers whose agent is at work on this machine: a live window and a turn under way.
+    One idling at its prompt (done, waiting on the user) costs next to no CPU and doesn't count."""
+    alive = alive_windows()
+    return sorted(n for n, w in read_registry()[1].items()
+                  if is_cursor(w) and n != but and w["status"] in CURSOR_AT_WORK and w.get("window") in alive)
+
+
+def cursor_room(what, but=None, prefix=""):
+    """Refuse when cursor_max_running Cursor workers are already at work: each agent is a local
+    process tree that can take whole cores (the user's CPU, 2026-10-24)."""
+    limit = int(config().get("cursor_max_running") or 0)
+    busy = cursor_busy(but)
+    if limit and len(busy) >= limit:
+        sys.exit(f"{prefix}{what}: {len(busy)} Cursor workers are already at work ({', '.join(busy)}), the limit "
+                 f"(cursor_max_running in config.json) is {limit}. Wait for one to finish, or do it with a "
+                 f"subagent or yourself.")
+
+
+def cursor_nice():
+    """`nice -n N ` before a Cursor agent's command, or nothing."""
+    n = int(config().get("cursor_nice") or 0)
+    return f"nice -n {n} " if n > 0 and shutil.which("nice") else ""
 
 
 def prompt_file(name):
@@ -2358,6 +2390,9 @@ def cmd_wake(args):
     holder = None if cursor else live_holder(sid)
     if cursor:
         require_cursor(f"wake {name}")
+        if not getattr(args, "quiet", False):  # a quiet wake only reopens the conversation; no turn runs
+            cursor_room(f"wake {name}", but=name, prefix="NOT DELEGATED: " if getattr(args, "intro", None) and
+                        w.get("delegated_by") else "")
         check_cursor_http1()
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
@@ -2480,7 +2515,11 @@ def cmd_status(args):
         print(tr("\n通知（要用户去做的事；claudesec notice done 编号）：", "\nNotices (for the user to do; claudesec notice done N):"))
         for n, t, text in items:
             print(f"  #{n} " + (f"[{t}] " if t else "") + text)
-    print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1])
+    load = ""
+    if cursor_available()[0] and config().get("cursor_max_running"):
+        load = tr(f" · 在跑 {len(cursor_busy())}/{config()['cursor_max_running']}",
+                  f" · at work {len(cursor_busy())}/{config()['cursor_max_running']}")
+    print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1] + load)
     sessions = external_sessions()
     if sessions:
         print(tr("\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：",
@@ -3099,6 +3138,7 @@ def cmd_delegate(args):
     name = args.name
     if not NAME_RE.match(name):
         sys.exit(f"bad name {name!r}: lowercase letters, digits, dashes")
+    cursor_room(f"delegating {name}", but=name, prefix="NOT DELEGATED: ")
     hits = delegate_guard(task)
     if hits and not args.ack:
         append_log(boss, "delegate-refused", f"{name}: hits {', '.join(hits)}\n{task}")

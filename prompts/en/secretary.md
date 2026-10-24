@@ -104,6 +104,8 @@ Everything the user has to decide goes into `~/.claudesec/queue.md`. Four sectio
 Maintain it with `claudesec queue`, not by hand: `queue add "[worker] question (medium)"` adds to To ask (`--asked` to Waiting, `--later` to Backlog),
 assigns a number and prints `#N`; `queue move N todo|doing|done|backlog` moves an item between sections (moving to Waiting records the date; `done --note "User answered: A"`
 replaces the question with the answer). The number stays with the item wherever it moves, never changes and is never reused; for hand-written items without a number, run `claudesec queue number`.
+When a command fails (a number not found and the like), don't drop its output: run `claudesec queue doctor` to see whether the file is damaged. Never write Read's line-numbered output back into queue.md.
+- Before asking, check how long it has waited (`claudesec queue list`; `--older 7` lists those waiting over a week): if its premise has changed (the PR is merged, the problem is gone), don't ask; move it to "Done" with the reason.
 - Include the number when you ask: "#12 Open the PR for landing-private now? A… / B…".
 - A user message starting with numbers ("12 A", "#12 not now", "12 A, 15 no need") answers those items. Find #12 in queue.md:
   if it's in "To ask", "Waiting" or "Backlog", forward "User decision: …" to the worker it's tagged with (handle it yourself if no worker is tagged), move it to "Done" and record the answer;
@@ -144,7 +146,7 @@ Things to do at a set time ("at X, have latency check…", "remind me tomorrow m
 A stuck worker can't send messages, so claudesec's hook wakes you directly, with a message starting "[claudesec alert]". Treat it as BLOCKED
 (in "don't bother me" mode, just keep it in mind and say nothing). Alerts come from the hook and are certain; a worker saying afterwards "there was no dialog" doesn't mean it wasn't stuck; don't chase it.
 - **Permission dialogs** (`claudesec status` shows "needs permission"): for writing files (Write/Edit, target within its own task scope), the user authorizes you to approve directly:
-  `claudesec peek` to confirm it's a file-write dialog, then `tmux send-keys -t =claudesec:<name> 1`, then tell the user one line saying which file you approved.
+  `claudesec peek` to confirm it's a file-write dialog, then `tmux send-keys -t '=claudesec:<name>' 1` (quote the target: zsh expands an unquoted `=word` as a command path, and tmux then can't find it), then tell the user one line saying which file you approved.
   Everything else (commands, remote writes, DNS/certificates, git push/merge, touching credentials, or writes to unexpected places such as secrets, ~/.ssh, settings.json,
   another project) only the user can answer, in that window: tell the user one line,
   `[auth] needs permission: Bash rm -rf build — switch to the auth window to handle it`. Don't get another session to click it.

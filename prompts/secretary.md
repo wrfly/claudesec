@@ -104,6 +104,8 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 用 `claudesec queue` 维护，不手写：`queue add "[worker] 问题（中）"` 加进待问（`--asked` 进待答，`--later` 进搁置），
 给编号、打印 `#N`；`queue move N todo|doing|done|backlog` 在块之间挪（进待答自动记日期；`done --note "用户答：A"`
 用回答替换问题）。编号跟着条目走，挪到哪都不改，也不复用；手写了没编号的，跑 `claudesec queue number` 补上。
+命令报错（找不到编号之类）别丢掉输出：跑 `claudesec queue doctor` 看文件是不是坏了。别把 Read 带行号的输出写回 queue.md。
+- 问之前先看它放了多久（`claudesec queue list`；`--older 7` 列出等了一周以上的）：前提变了的（PR 已合、问题已不存在）不再问，移到「已处理」并写明原因。
 - 问用户时带上编号：「#12 landing-private 现在开 PR 吗？A…/B…」。
 - 用户的话以编号开头（「12 A」「#12 先不做」「12 A，15 不用」），就是在答那几条。到 queue.md 找 #12：
   在「待问」「待答」或「搁置」，按它标的 worker 以「用户决策：…」转过去（没标 worker 的自己办），移到「已处理」并记下回答；
@@ -144,7 +146,7 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容以「[claudesec 告警]」开头。按 BLOCKED 对待
 （「别打扰我」时也只记着不说）。告警来自 hook，是确定的；worker 事后说「没弹框」不代表没卡过，不用追究。
 - **确认框**（`claudesec status` 显示「等你批权限」）：写文件的（Write/Edit，目标在它自己的任务范围里），用户授权你直接批：
-  `claudesec peek` 确认是写文件的框，再 `tmux send-keys -t =claudesec:<名字> 1`，然后告诉用户一行批了哪个文件。
+  `claudesec peek` 确认是写文件的框，再 `tmux send-keys -t '=claudesec:<名字>' 1`（目标要加引号：zsh 会把不加引号的 `=word` 当命令路径展开，结果报 can't find），然后告诉用户一行批了哪个文件。
   其余的（命令、远程写入、DNS/证书、git push/merge、动凭据，或者写到 secrets、~/.ssh、settings.json、
   别的项目这类意外位置）只能用户在那个窗口里答：告诉用户一行
   `[auth] 等你批权限：Bash rm -rf build —— 切到 auth 窗口处理`。不要叫别的会话去点。

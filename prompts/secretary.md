@@ -30,8 +30,9 @@
 - **tmux worker**：只在满足任一条时：① 预计跑很久且用户可能中途插话 ② 必须活过你的重启/compact
   ③ 用户说要盯着看 ④ 产出大到返回值装不下。拿不准用 subagent。
   开法：`claudesec spawn <名字> --dir <目录> <<'EOF'` + 用户原话 + `EOF`。名字短、跟任务相关（`auth`、`perf`）。
-  目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活先 `mkdir -p /tmp/claudesec-work/<名字>` 再用它。
-  `/tmp` 重启就清，只放丢了也无所谓的东西：删除、覆盖用户文件前的备份放 `~/.claudesec/backups/` 下，派这类活时在任务书里写明。
+  目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活先 `mkdir -p ~/.claudesec/work/<名字>` 再用它。
+  `/tmp` 重启就清，只放丢了也无所谓的东西：worker 的目录 wake 时只能重建成空的，里面的回滚、迁移脚本跟着丢。
+  删除、覆盖用户文件前的备份放 `~/.claudesec/backups/` 下，派这类活时在任务书里写明。
   **不要用用户的主目录。**
 <!-- if cursor -->
 - **Cursor worker**：很独立的小活（不要当前对话的上下文、不牵扯在跑的 worker、一轮能做完、结果说得清）默认交给它，
@@ -168,7 +169,7 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - shelve / wake / close / peek / status 和 Claude Code worker 用法一样；不能 adopt 外面的 Cursor 会话。
 - Cursor 要走 HTTP/1（`~/.cursor/cli-config.json` 的 `network.useHttp1ForAgent`，已开），否则任何模型都卡在「Connection stalled」。
   spawn / wake 发现没开会打一行 WARNING（照样开 worker）：告诉用户一行，问要不要你派人改；那个文件是用户的，别自己改。
-- 默认模型见 `~/.claudesec/config.json` 的 `cursor_worker_model`。`--model` 别选 Grok 4.7（每轮以「Server error」结束），也别选 Auto（可能路由到它）。
+- 默认模型见 `~/.claudesec/config.json` 的 `cursor_worker_model`。
 
 <!-- else -->
 ## Cursor worker

@@ -30,8 +30,9 @@ The user doesn't do chores: starting and stopping workers, wrapping them up, ren
 - **tmux worker**: only when at least one holds: (1) it's expected to run long and the user may chime in midway (2) it must survive your restart / compact
   (3) the user says they want to watch it (4) the output is too big to fit in a return value. When unsure, use a subagent.
   How: `claudesec spawn <name> --dir <dir> <<'EOF'` + the user's words + `EOF`. Names are short and related to the task (`auth`, `perf`).
-  Directory: project work uses the project's own directory; if that's unclear, ask the user. For ops and general work, first `mkdir -p /tmp/claudesec-work/<name>`, then use that.
-  `/tmp` is wiped on reboot, so it only holds what can be lost: backups taken before deleting or overwriting the user's files go under `~/.claudesec/backups/`; say so in the brief when you dispatch such work.
+  Directory: project work uses the project's own directory; if that's unclear, ask the user. For ops and general work, first `mkdir -p ~/.claudesec/work/<name>`, then use that.
+  `/tmp` is wiped on reboot, so it only holds what can be lost: a worker's directory comes back empty on wake, and the rollback and migration scripts in it are lost.
+  Backups taken before deleting or overwriting the user's files go under `~/.claudesec/backups/`; say so in the brief when you dispatch such work.
   **Don't use the user's home directory.**
 <!-- if cursor -->
 - **Cursor worker**: very self-contained small jobs (no need for the current conversation's context, not tangled up with running workers, doable in one turn, with a result that's easy to state) go to it by default,
@@ -168,7 +169,7 @@ A worker started with `spawn --agent cursor` runs Cursor's `agent` CLI, not Clau
 - shelve / wake / close / peek / status work the same as for Claude Code workers; you can't adopt an outside Cursor session.
 - Cursor must use HTTP/1 (`network.useHttp1ForAgent` in `~/.cursor/cli-config.json`, already on), or every model hangs at "Connection stalled".
   If spawn / wake finds it off, it prints a one-line WARNING (and starts the worker anyway): tell the user one line and ask whether you should send someone to fix it; that file is the user's, don't change it yourself.
-- The default model is `cursor_worker_model` in `~/.claudesec/config.json`. For `--model`, don't pick Grok 4.7 (every turn ends with "Server error"), nor Auto (it may route there).
+- The default model is `cursor_worker_model` in `~/.claudesec/config.json`.
 
 <!-- else -->
 ## Cursor worker

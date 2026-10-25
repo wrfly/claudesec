@@ -5,8 +5,9 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec [start] [--new|--restart] [-d]   open the secretary in its own tmux session "claudesec"
                                     (resumes the last secretary; --new starts fresh; --restart reloads
                                     prompt and hooks keeping the conversation; -d don't switch)
-  claudesec spawn NAME --dir DIR [--model M] [--discuss] [--agent claude|cursor] [--for WORKER] < task.txt
-                                    (--discuss: a discussion window the user is switched into;
+  claudesec spawn NAME [--dir DIR] [--model M] [--discuss] [--agent claude|cursor] [--for WORKER] < task.txt
+                                    (no --dir: ~/.claudesec/work/NAME, made if missing;
+                                    --discuss: a discussion window the user is switched into;
                                     --agent cursor: Cursor's `agent` CLI instead of Claude Code;
                                     --for: the worker that delegated it, named in its reports)
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
@@ -1646,7 +1647,11 @@ def cmd_spawn(args):
     task = getattr(args, "task", None) or sys.stdin.read().strip()
     if not task:
         sys.exit("empty task: pass the user's words on stdin")
-    project = str(Path(args.dir).expanduser().resolve())
+    if args.dir:
+        project = str(Path(args.dir).expanduser().resolve())
+    else:  # ops and general work: a directory of its own that a reboot keeps
+        (HOME / "work" / name).mkdir(parents=True, exist_ok=True)
+        project = str((HOME / "work" / name).resolve())
     if args.for_worker and args.for_worker not in workers:
         sys.exit(f"--for {args.for_worker}: no such worker")
     cursor = args.agent == "cursor"
@@ -4178,7 +4183,7 @@ def main():
     s.add_argument("--restart", action="store_true")
     s.add_argument("-d", "--detach", action="store_true"); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
-    s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir", required=True)
+    s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir")
     s.add_argument("--model"); s.add_argument("--discuss", action="store_true")
     s.add_argument("--agent", choices=["claude", "cursor"], default="claude")
     s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.set_defaults(fn=cmd_spawn)

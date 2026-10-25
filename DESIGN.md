@@ -446,7 +446,8 @@ worker 干活（可开 subagent，结果不外泄）
 claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
-claudesec spawn NAME --dir D [--model M] [--discuss] [--agent cursor] [--for WORKER] <<< 任务原文
+claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor] [--for WORKER] <<< 任务原文
+                                                不带 --dir：~/.claudesec/work/NAME（没有就建），运维、通用的活用
 claudesec delegate ME --name N [--dir D] [--ack 理由] <<< 任务书   worker 把小活交给 Cursor worker
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报

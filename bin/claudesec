@@ -36,7 +36,9 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
                                             keeps its history); an exited session by its session id
   claudesec shelve NAME [--note N] [--force]   stop a worker or outside session, keep only its record
-  claudesec wake NAME [--model M] [< instruction]   resume a shelved one in a new window (history kept)
+  claudesec wake NAME [--model M] [--dir D] [< instruction]   resume a shelved one in a new window (history
+                                    kept); --dir: in D, for a worker whose directory moved
+  claudesec redir OLD NEW                a directory moved (repo renamed): workers recorded in OLD go to NEW
   claudesec archive NAME [--summary S] [--tags a,b] [--files x,y]
   claudesec archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
   claudesec lesson TYPE SITUATION CORRECTION
@@ -47,6 +49,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import functools
+import hashlib
 import io
 import json
 import os
@@ -57,6 +60,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -1625,7 +1629,7 @@ def wake_orphans():
         raise_alert(tr("秘书启动时这些 worker 没能自动恢复（仍是搁置状态，可以再试 claudesec wake）：\n",
                        "When the secretary started, these workers couldn't be brought back automatically (still "
                        "shelved; claudesec wake can try again):\n")
-                    + "\n".join(f"- {n}: {e.splitlines()[0][:200]}" for n, e in failed.items()))
+                    + "\n".join(f"- {n}: {e.splitlines()[0][:400]}" for n, e in failed.items()))
 
 
 def cmd_spawn(args):
@@ -1899,6 +1903,75 @@ def cursor_chat_exists(chat):
 
 def conversation_exists(w):
     return cursor_chat_exists(w.get("session")) if is_cursor(w) else bool(w.get("session") and transcript(w["session"]))
+
+
+SCRATCH_ROOTS = tuple({Path("/tmp"), Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve()})  # a reboot wipes these
+
+
+def where_now(path):
+    """A recorded working directory as it is today: (dir, note). A move recorded by `claudesec
+    redir` is followed; a directory under the temp dir, which a reboot wipes, is made again, empty
+    (what was in it is gone; the conversation still says what it was doing). (None, None) when it
+    is gone and nothing says where it went."""
+    if Path(path).is_dir():
+        return path, None
+    reg_path = HOME / "registry.json"
+    moves = (json.loads(reg_path.read_text()) if reg_path.exists() else {}).get("moved", {})
+    for old in sorted(moves, key=len, reverse=True):
+        if path == old or path.startswith(old + "/"):
+            new = moves[old] + path[len(old):]
+            if Path(new).is_dir():
+                return new, f"{path} moved to {new}"
+    root = next((r for r in SCRATCH_ROOTS if r in Path(path).parents), None)
+    if root:
+        with contextlib.suppress(OSError):
+            Path(path).mkdir(parents=True, exist_ok=True)
+            return path, f"{path} was under {root}, which a reboot wipes: made it again, empty"
+    return None, None
+
+
+def started_in(path):
+    """The directory a Claude Code transcript's session was started in."""
+    with contextlib.suppress(OSError):
+        with open(path) as f:
+            for line in f:
+                if '"cwd"' in line:
+                    with contextlib.suppress(ValueError):
+                        if (cwd := json.loads(line).get("cwd")):
+                            return cwd
+    return None
+
+
+def follow_conversation(w, cwd, old=None):
+    """Move a shelved worker's conversation to where `--resume` run in cwd looks for it, once the
+    directory it was started in has moved away. Claude Code keeps transcripts by start directory
+    (projects/<dir with - for every non-alphanumeric>/), and only one whose start directory is
+    gone is moved. Cursor keeps chats by the md5 of the directory; one is moved only out of old,
+    the directory the worker is known to have left. Returns what was moved, or None."""
+    sid = w.get("session")
+    if not sid:
+        return None
+    if is_cursor(w):
+        chats = Path.home() / ".cursor" / "chats"
+        src = chats / hashlib.md5(str(old).encode()).hexdigest() / sid if old else None
+        dst = chats / hashlib.md5(str(cwd).encode()).hexdigest() / sid
+        if not src or not src.is_dir() or src == dst or dst.exists():
+            return None
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        return f"chat {sid} moved to {dst.parent}"
+    src = transcript(sid)
+    if not src:
+        return None
+    start = started_in(src)
+    dst = claude_project(cwd)
+    if src.parent == dst or not start or start == str(cwd) or Path(start).is_dir() or (dst / src.name).exists():
+        return None
+    dst.mkdir(parents=True, exist_ok=True)
+    if (src.parent / sid).is_dir() and not (dst / sid).exists():  # its subagents and tool results
+        (src.parent / sid).rename(dst / sid)
+    src.rename(dst / src.name)
+    return f"transcript {sid} moved from {src.parent.name} to {dst.name}"
 
 
 def cursor_running(w):
@@ -2557,8 +2630,20 @@ def cmd_wake(args):
     cursor = is_cursor(w)
     if not conversation_exists(w):
         sys.exit(f"{name}: conversation {sid} is gone; it can't be resumed")
-    if not Path(cwd).is_dir():
-        sys.exit(f"{name}: its directory {cwd} is gone; nothing to resume in")
+    left = w.get("moved_from")  # set by redir: the directory it was in before the move
+    if getattr(args, "dir", None):
+        new = str(Path(args.dir).expanduser().resolve())
+        if not Path(new).is_dir():
+            sys.exit(f"--dir {new}: no such directory")
+        moved = f"{cwd} → {new} (--dir)" if new != cwd else None
+        left, cwd = (cwd if moved else left), new
+    else:
+        new, moved = where_now(cwd)
+        if not new:
+            sys.exit(f"{name}: its directory {cwd} is gone, so wake has nowhere to resume it. If it moved "
+                     f"(a renamed repo): `claudesec redir {shlex.quote(cwd)} NEW_DIR` points every worker "
+                     f"recorded there at the new place; `claudesec wake {name} --dir NEW_DIR` moves just this one.")
+        left, cwd = (cwd if new != cwd else left), new
     holder = None if cursor else live_holder(sid)
     if cursor:
         require_cursor(f"wake {name}")
@@ -2579,6 +2664,12 @@ def cmd_wake(args):
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
     model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
+    followed = follow_conversation(w, cwd, old=left)
+    if moved or followed or left:
+        with registry() as reg:
+            reg["workers"][name]["dir"] = cwd
+            reg["workers"][name].pop("moved_from", None)
+        append_log(name, "task", "; ".join(filter(None, [moved, followed])) or f"now in {cwd}")
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=w.get("agent", "claude"),
                        memory=w.get("memory"))
     (d / "exit").unlink(missing_ok=True)
@@ -2614,7 +2705,8 @@ def cmd_wake(args):
                      f"{shown!r}, so SendMessage(to: {name!r}) won't reach it. Run `/rename {name}` in that window.")
         print(f"woke {name} ({model}) in window {window}; "
               + ("idle, history loaded" if quiet else
-                 "it will report on the new instruction" if instruction else "it will report what it was doing"))
+                 "it will report on the new instruction" if instruction else "it will report what it was doing")
+              + (f". Directory: {moved}" if moved else ""))
         return
     if verdict == "dialog":
         print(f"{name} is resuming in {window}, but it is STUCK ON A DIALOG — tell the user to "
@@ -2624,6 +2716,32 @@ def cmd_wake(args):
         reg["workers"][name].update(status="SHELVED", window=None, session=sid)
     sys.exit(f"wake FAILED ({verdict}): {name} stays shelved. Window {window} is left as it is. "
              f"The conversation is intact: `{'agent' if cursor else 'claude'} --resume {sid}` in {cwd}.\n{tail}")
+
+
+def cmd_redir(args):
+    """A directory moved (a repo renamed): point every worker recorded in it, or below it, at the
+    new place, and remember the move for what is recorded elsewhere (archived Cursor delegations).
+    Conversations follow at the next wake, once nothing is writing to them."""
+    old = os.path.normpath(os.path.abspath(os.path.expanduser(args.old)))
+    new = str(Path(args.new).expanduser().resolve())
+    if not Path(new).is_dir():
+        sys.exit(f"{new}: no such directory")
+    if Path(old).exists():
+        sys.exit(f"{old} is still there; redir is for a directory that moved away. "
+                 f"To move one worker: `claudesec wake NAME --dir {shlex.quote(new)}`")
+    if new == old or new.startswith(old + "/"):
+        sys.exit(f"{new} is inside {old}")
+    moved = []
+    with registry() as reg:
+        for name, w in reg["workers"].items():
+            d = w.get("dir") or ""
+            if d == old or d.startswith(old + "/"):
+                w["moved_from"] = w.get("moved_from") or d
+                w["dir"] = new + d[len(old):]
+                moved.append(f"{name} ({w['status']}): {w['dir']}")
+        reg.setdefault("moved", {})[old] = new
+    print(f"{old} → {new}: " + ("\n  " + "\n  ".join(moved) if moved else "no worker was recorded there")
+          + "\nRemembered for archived delegations too. `claudesec wake NAME` resumes a shelved one there.")
 
 
 def confirm_resume(name, pane, d, sid):
@@ -3069,10 +3187,15 @@ def print_reminders():
 
 # ---------- daily review: tidy the secretary's memory, propose prompt changes ----------
 
+def claude_project(cwd):
+    """Where Claude Code keeps transcripts and auto memory of sessions started in cwd."""
+    return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
 def secretary_memory_dir():
     """Claude Code keys auto memory by cwd, and the secretary's cwd is HOME. By the resolved cwd:
     with HOME under a linked /home, an unresolved name is a dir nobody writes to."""
-    return claude_dir() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HOME.resolve())) / "memory"
+    return claude_project(HOME.resolve()) / "memory"
 
 
 def memory_settings(cwd):
@@ -3363,18 +3486,20 @@ def cmd_delegate(args):
         by = past.get("delegated_by")
         if by and by != boss:
             sys.exit(f"NOT DELEGATED: {name} was {by}'s delegation (archived {past['path']}); pick another --name")
-        if not (past.get("session") and cursor_chat_exists(past["session"]) and Path(past["project"]).is_dir()):
+        project, _ = where_now(past["project"])
+        if not (past.get("session") and cursor_chat_exists(past["session"]) and project):
             sys.exit(f"NOT DELEGATED: {name} already finished and was closed, and its chat or its directory "
                      f"({past['project']}) is gone, so it can't pick this up. Delegate under a new --name with "
                      f"--dir {past['project']}, and put in the task what it needs from the first round "
                      f"(its archive: {past['path']}).")
         with registry() as reg:
             reg["workers"][name] = {
-                "window": None, "dir": past["project"], "model": past.get("model"), "task": task,
+                "window": None, "dir": project, "model": past.get("model"), "task": task,
                 "agent": "cursor", "delegated_by": boss, "mode": "task", "status": "SHELVED",
                 "shelved_by": "archived", "session": past["session"], "started_at": now(),
                 "last_report_at": now(), "last_summary": "", "pending_ask": None,
                 "archived": str(past["path"].relative_to(HOME / "history")),
+                **({"moved_from": past["project"]} if project != past["project"] else {}),
             }
         if ack:
             append_log(name, "ack", ack)
@@ -4070,7 +4195,9 @@ def main():
     s = sub.add_parser("shelve"); s.add_argument("name"); s.add_argument("--note")
     s.add_argument("--as", dest="as_name"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_shelve)
-    s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.set_defaults(fn=cmd_wake)
+    s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.add_argument("--dir")
+    s.set_defaults(fn=cmd_wake)
+    s = sub.add_parser("redir"); s.add_argument("old"); s.add_argument("new"); s.set_defaults(fn=cmd_redir)
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)

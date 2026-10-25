@@ -461,7 +461,11 @@ claudesec archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< su
 claudesec lesson TYPE 情况 用户原话
 claudesec sessions              不归 claudesec 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
 claudesec shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）
-claudesec wake NAME [--model M] [<<< 新指令]     --resume 拉起，历史保留
+claudesec wake NAME [--model M] [--dir D] [<<< 新指令]     --resume 拉起，历史保留
+                                                目录不在了：/tmp 下的（重启清掉的）重建成空目录；
+                                                redir 记过的搬家照着走；都不是就拒绝并提示 redir / --dir。
+                                                换了目录时对话跟着挪（Claude 的 transcript 按启动目录存，Cursor 的按目录 md5）
+claudesec redir OLD NEW                         目录搬了（仓库改名）：登记在 OLD 及其下的 worker 都改到 NEW，搬家记进注册表
 claudesec --restart                             重载秘书的 prompt 和 hook，对话保留，worker 不动
 claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```

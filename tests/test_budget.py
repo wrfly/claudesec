@@ -163,3 +163,40 @@ class WorkerBudgetCommands(Budget):
         self.assertFalse((self.cs.worker_dir("w") / "frozen-own").exists())
         self.run_cli("budget", "--worker", "w", "--off")
         self.assertFalse((self.cs.worker_dir("w") / "budget_usd").exists())
+
+
+class Runaway(Budget):
+    """Alerts for workers without a budget that spend a lot."""
+
+    def setUp(self):
+        super().setUp()
+        self.alerts = []
+        self.cs.raise_alert = self.alerts.append
+
+    def test_share_of_the_window(self):
+        self.window(30, 60, usd=100)
+        self.spent = 20
+        self.assertEqual(self.cs.check_runaway(), [])
+        self.spent = 31
+        self.assertEqual(len(self.cs.check_runaway()), 1)
+        self.assertIn("over 30%", self.alerts[0])
+        self.assertEqual(self.cs.check_runaway(), [])  # once per window
+
+    def test_quiet_and_expensive(self):
+        reg = json.loads((self.home / "registry.json").read_text())
+        reg["workers"]["w"]["last_report_at"] = (self.now - dt.timedelta(minutes=90)).isoformat()
+        (self.home / "registry.json").write_text(json.dumps(reg))
+        self.spent = 25
+        self.assertIn("90 minutes ago", self.cs.check_runaway()[0])
+        self.assertEqual(self.cs.check_runaway(), [])  # once per report
+        reg["workers"]["w"]["budget_usd"] = 50  # one with a budget of its own is left to that
+        reg["workers"]["w"]["last_report_at"] = (self.now - dt.timedelta(minutes=95)).isoformat()
+        (self.home / "registry.json").write_text(json.dumps(reg))
+        self.assertEqual(self.cs.check_runaway(), [])
+
+    def test_recent_report_or_cheap_is_fine(self):
+        reg = json.loads((self.home / "registry.json").read_text())
+        reg["workers"]["w"]["last_report_at"] = (self.now - dt.timedelta(minutes=10)).isoformat()
+        (self.home / "registry.json").write_text(json.dumps(reg))
+        self.spent = 100
+        self.assertEqual(self.cs.check_runaway(), [])

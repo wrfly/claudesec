@@ -29,6 +29,7 @@
 | `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定 |
 | `worker_permission_mode` | `"auto"` | worker 的 `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High） | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
+| `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | 没设额度的 worker 花得太多时告警：超过预算窗口上限的这个比例，或者上次汇报超过 M 分钟后又花了超过 $N |
 | `cursor_max_running` | CPU 核数的一半 | 同时在干活的本地 Cursor worker 最多几个（停在提示符上空闲的不算；不配：本机核数的一半，至少 1；配了数字就按数字；`0` 不限）；超了 `spawn --agent cursor`、`wake`、`delegate` 会拒绝并说明是谁在跑。`0` 不限 |
 | `cursor_nice` | `10` | Cursor agent 用 `nice -n` 这个值运行，CPU 让给别的程序；`0` 正常优先级 |
 | `secretary_name` | `"secretary"` | 秘书的会话名，worker 用它发汇报 |

@@ -106,6 +106,11 @@ DEFAULT_CONFIG = {
     "cursor_worker_model": "gpt-5.6-sol[context=1m,reasoning=high,fast=false]",
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
+    # Runaway alerts for workers without a budget of their own: spent more than this share of the
+    # budget window's cap, or more than runaway_usd since a report runaway_quiet_minutes ago.
+    "runaway_pool_share": 0.3,
+    "runaway_usd": 20,
+    "runaway_quiet_minutes": 60,
     "cursor_max_running": None,       # local Cursor workers at work at once; spawn / wake / delegate past it
                                       # refuse. None: half the CPU cores (at least 1); 0: no limit
     "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
@@ -3745,13 +3750,79 @@ def fire_due_reminders():
         print(f"{now()} {r['id']} → {r['target']}: {how}", flush=True)
 
 
+RUNAWAY_CHECK_SECS = 300
+
+
+def check_runaway(now_t=None):
+    """Alert the secretary, once each, about a worker with no budget of its own that spends a lot:
+    more than runaway_pool_share of the budget window's cap since the window began, or more than
+    runaway_usd since its last report when that was over runaway_quiet_minutes ago. Claude Code
+    workers only (a Cursor agent's spend isn't visible). Returns the alerts raised."""
+    cfg, now_t = config(), now_t or dt.datetime.now().astimezone()
+    workers = {n: w for n, w in read_registry()[1].items()
+               if w["status"] != "SHELVED" and not is_cursor(w) and not w.get("budget_usd") and w.get("session")}
+    if not workers:
+        return []
+    path = HOME / "runaway.json"
+    try:
+        seen = json.loads(path.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    raised = []
+    b = read_budget()
+    share = float(cfg.get("runaway_pool_share") or 0)
+    if b and b.get("usd") and share and not b.get("frozen"):
+        start = dt.datetime.fromisoformat(b["start"])
+        if start <= now_t:
+            for name, usd in worker_cost(workers, since=start).items():
+                key = f"pool|{name}|{b['start']}"
+                if usd and usd > share * b["usd"] and key not in seen:
+                    seen[key] = now()
+                    raised.append(tr(f"[预算] {name} 没有自己的额度，但这个预算窗口里已经花了 {money(usd)}，"
+                                     f"超过窗口上限 {money(b['usd'])} 的 {share:.0%}。看看它在做什么（peek），要不要让它收尾或给它设额度（问用户）。",
+                                     f"[budget] {name} has no budget of its own and has spent {money(usd)} in this window, "
+                                     f"over {share:.0%} of its {money(b['usd'])} cap. See what it's doing (peek), and whether "
+                                     f"it should wrap up or get a budget (ask the user)."))
+    limit, quiet = float(cfg.get("runaway_usd") or 0), float(cfg.get("runaway_quiet_minutes") or 0)
+    if limit:
+        for name, w in workers.items():
+            last = w.get("last_report_at") or w.get("started_at")
+            if not last:
+                continue
+            since = dt.datetime.fromisoformat(last)
+            if (now_t - since).total_seconds() < quiet * 60:
+                continue
+            usd = worker_cost({name: w}, since=since).get(name)
+            key = f"quiet|{name}|{last}"
+            if usd and usd > limit and key not in seen:
+                seen[key] = now()
+                mins = int((now_t - since).total_seconds() // 60)
+                raised.append(tr(f"[花费] {name} 上次汇报是 {mins} 分钟前，之后已经花了约 {money(usd)}（阈值 {money(limit)}），"
+                                 f"而且没有额度。peek 看看是不是卡在循环里，必要时 interrupt。",
+                                 f"[spend] {name} last reported {mins} minutes ago and has spent about {money(usd)} since "
+                                 f"(threshold {money(limit)}), with no budget. Peek at it for a loop; interrupt if needed."))
+    if raised:
+        tmp = path.with_name(f".runaway.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(seen))
+        os.replace(tmp, path)
+        for text in raised:
+            raise_alert(text)
+    return raised
+
+
 def check_reminders(run_pid):
     """Runs alongside the secretary, for as long as its `claudesec run` is the current one.
-    The lock hands over from an older checker whose secretary is gone."""
+    The lock hands over from an older checker whose secretary is gone. Runaway spending is
+    looked at here too, less often."""
+    last_runaway = 0.0
     with open(HOME / "reminders-checker.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
             fire_due_reminders()
+            if time.monotonic() - last_runaway >= RUNAWAY_CHECK_SECS:
+                last_runaway = time.monotonic()
+                with contextlib.suppress(Exception):  # a bad transcript line mustn't stop the reminders
+                    check_runaway()
             time.sleep(REMINDER_CHECK_SECS)
 
 

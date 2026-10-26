@@ -33,6 +33,7 @@ Written with defaults on the first run; fields you leave out keep their defaults
 | `worker_model` | `"claude-opus-5-5"` | Default model for workers; `claudesec spawn --model` overrides it per worker |
 | `worker_permission_mode` | `"auto"` | Workers' `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"` (GPT-5.6 Sol 1M High) | Default model for `spawn --agent cursor` (Cursor's `agent` CLI). The first Cursor worker adds three hooks to `~/.cursor/hooks.json` (after a backup); they act only inside claudesec's Cursor workers. Set `"network": {"useHttp1ForAgent": true}` in `~/.cursor/cli-config.json`, or the agent stalls on HTTP/2 |
+| `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | Alerts about a worker with no budget of its own: over this share of the budget window's cap, or over $N since a report more than M minutes ago |
 | `cursor_max_running` | half the CPU cores | At most this many local Cursor workers at work at once (one idling at its prompt doesn't count; unset: half this machine's cores, at least 1; a number: that; `0`: no limit); `spawn --agent cursor`, `wake` and `delegate` past it refuse and say who is busy. `0`: no limit |
 | `cursor_nice` | `10` | Cursor agents run under `nice -n` this, so they yield the CPU to everything else; `0`: normal priority |
 | `secretary_name` | `"secretary"` | The secretary's session name; workers send their reports to it |

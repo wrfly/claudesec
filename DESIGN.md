@@ -719,3 +719,7 @@ send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，
 工具调用，要求发 BLOCKED（ToolSearch 放行是因为 SendMessage 可能要先加载，实测过）。冻结期间 spawn、wake（quiet 的除外）、delegate
 拒绝。`--add` / 新的 `--until` / `--off` 解冻；`--from` 预约的窗口由提醒检查器到点打开。解冻后 claudesec 把「预算已恢复，继续」
 粘贴进每个被冻结的 worker 窗口，并告诉秘书。已经在跑的 worker 要等下次 spawn / wake 才有这个 hook。Cursor 不管。
+
+失控告警：提醒检查器（跟着秘书跑）每 5 分钟看一次没有自己额度的 Claude Code worker：预算窗口有金额上限时，这个窗口里花了超过上限的
+`runaway_pool_share`（默认 30%）；或者上次汇报已经超过 `runaway_quiet_minutes`（默认 60）分钟、之后花了超过 `runaway_usd`（默认 $20）。
+各告警一次（runaway.json 记着），告诉秘书去 peek，要不要收尾或设额度问用户。阈值都在 config.json 里可改。

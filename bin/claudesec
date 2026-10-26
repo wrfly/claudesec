@@ -913,10 +913,20 @@ def unfold(blocks, opened):
     return body, keys
 
 
-def dash_view(title, body, rows, top):
+def dash_view(title, body, rows, top, footer=()):
     """The rows the pane shows: the title, then body from line `top` on, with a note above and
-    below when there is more that way. Returns (lines, top kept in range, the body line each
-    shown row is, None for the title and notes)."""
+    below when there is more that way, and the footer lines pinned to the pane's last rows.
+    Returns (lines, top kept in range, the body line each shown row is, None for the title,
+    notes, padding and footer)."""
+    footer = list(footer) if rows - len(footer) >= 4 else []  # a pane too short keeps its body
+    lines, top, rowmap = dash_body(title, body, rows - len(footer), top)
+    if footer:
+        pad = rows - len(footer) - len(lines)
+        lines, rowmap = lines + [[]] * pad + footer, rowmap + [None] * (pad + len(footer))
+    return lines, top, rowmap
+
+
+def dash_body(title, body, rows, top):
     room = rows - 1
     if len(body) <= room or room < 3:
         return [title] + body[:room], 0, [None] + list(range(min(room, len(body))))
@@ -993,7 +1003,7 @@ def show_dashboard(what):
                                [fixed([("", repr(e))])])
                 due = time.monotonic() + DASH_REFRESH
             body, keys = unfold(content[2], opened)
-            lines, top, rowmap = dash_view(content[1], body, size.lines, top)
+            lines, top, rowmap = dash_view(content[1], body, size.lines, top, content[3] if len(content) > 3 else ())
             frame = "\x1b[K\r\n".join(paint(fit(line, size.columns - 1)) for line in lines)
             if frame != shown:
                 sys.stdout.write("\x1b[H" + frame + "\x1b[K\x1b[J")
@@ -1435,13 +1445,13 @@ def cmd_show(args):
 
 
 def notices_blocks(cols):
-    """The notices pane: (title bar, blocks)."""
+    """The notices pane: (title bar, blocks, footer): today's spend in the footer, on the last row."""
     items = open_notices()
     title = bar(tr(" 通知消息", " Notices"), f"{NOTICE_SECTIONS['open'][0 if lang() == 'zh' else 1]} {len(items)} ", cols)
-    spend = spend_today_line()  # at the very bottom (the user, 2026-10-26)
-    tail = [fixed([]), fixed([(DIM, cut(spend, cols))])] if spend else []
+    spend = spend_today_line()  # pinned to the pane's bottom edge (the user, 2026-10-26)
+    footer = [[(DIM, cut(spend, cols))]] if spend else []
     if not items:
-        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])] + tail
+        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])], footer
     blocks, num_w = [], max(len(str(n or "·")) for n, _, _ in items)
     for n, tag, text in items:
         head = [(BOLD, str(n or "·").rjust(num_w)), ("", " ")]
@@ -1449,7 +1459,7 @@ def notices_blocks(cols):
         lines = wrap(name + [("", text)], cols - num_w - 1)
         full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
         blocks.append(foldable(("n", n, tag, text), full, fit(head + name + [("", text)], cols)))
-    return title, blocks + tail
+    return title, blocks, footer
 
 
 def cmd_run(args):
@@ -2515,8 +2525,8 @@ def spend_today_line():
     if not total:
         return ""
     sec = per_owner.get(config()["secretary_name"], 0.0)
-    return tr(f"今天花费：秘书 {money(sec)} · 全部 {money(total)}（claudesec cost --today 看明细）",
-              f"Spent today: secretary {money(sec)} · everything {money(total)} (details: claudesec cost --today)")
+    return tr(f"今天花费：秘书 {money(sec)} · 全部 {money(total)}",
+              f"Spent today: secretary {money(sec)} · everything {money(total)}")
 
 
 def worker_moneys(workers):

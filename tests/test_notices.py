@@ -47,7 +47,7 @@ class Notices(unittest.TestCase):
 
     def test_pane_lists_open_notices(self):
         self.run_cli("notice", "add", "--from", "claudesec", "VNC 里装 Claude 扩展")
-        title, blocks = self.cs.notices_blocks(60)
+        title, blocks, _ = self.cs.notices_blocks(60)
         shown = "".join(text for _, lines, _ in blocks for line in lines for _, text in line)
         self.assertIn("VNC 里装 Claude 扩展", shown)
         self.assertIn("1", title[0][1])
@@ -70,14 +70,28 @@ if __name__ == "__main__":
 
 
 class SpendAtTheBottom(Notices):
-    def test_todays_spend_is_the_last_line_of_the_notices_pane(self):
-        self.cs.spend_today_line = lambda: "今天花费：秘书 $1.0 · 全部 $3.0（claudesec cost --today 看明细）"
+    def test_todays_spend_is_pinned_to_the_last_row_of_the_notices_pane(self):
+        self.cs.spend_today_line = lambda: "今天花费：秘书 $1.0 · 全部 $3.0"
         for with_items in (False, True):
             if with_items:
                 self.run_cli("notice", "add", "装扩展")
-            _, blocks = self.cs.notices_blocks(80)
-            last = "".join(t for _, t in blocks[-1][1][0])
-            self.assertTrue(last.startswith("今天花费"), last)
+            title, blocks, footer = self.cs.notices_blocks(80)
+            body, _ = self.cs.unfold(blocks, set())
+            lines, _, rowmap = self.cs.dash_view(title, body, 20, 0, footer)
+            self.assertEqual(len(lines), 20)
+            self.assertEqual("".join(t for _, t in lines[-1]), "今天花费：秘书 $1.0 · 全部 $3.0")
+            self.assertIsNone(rowmap[-1])  # a click there opens nothing
         self.cs.spend_today_line = lambda: ""
-        _, blocks = self.cs.notices_blocks(80)
-        self.assertNotIn("今天花费", "".join(t for b in blocks for line in b[1] for _, t in line))
+        self.assertEqual(self.cs.notices_blocks(80)[2], [])
+
+    def test_the_footer_stays_when_the_notices_scroll(self):
+        self.cs.spend_today_line = lambda: "今天花费：秘书 $1.0 · 全部 $3.0"
+        for i in range(30):
+            self.run_cli("notice", "add", f"第 {i} 件")
+        title, blocks, footer = self.cs.notices_blocks(80)
+        body, _ = self.cs.unfold(blocks, set())
+        lines, _, _ = self.cs.dash_view(title, body, 20, 0, footer)
+        texts = ["".join(t for _, t in line) for line in lines]
+        self.assertEqual(len(texts), 20)
+        self.assertTrue(texts[-1].startswith("今天花费"))
+        self.assertIn("↓", texts[-2])  # the "more below" note sits just above it

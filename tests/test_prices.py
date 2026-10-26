@@ -132,4 +132,4 @@ class SpendLine(Cost):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
             "w": {"status": "SHELVED", "session": "w", "dir": "/tmp", "task": "t"}}}))
         self.assertEqual(self.cs.spend_today_line(),
-                         "Spent today: secretary $2.0 · everything $6.0 (details: claudesec cost --today)")
+                         "Spent today: secretary $2.0 · everything $6.0")

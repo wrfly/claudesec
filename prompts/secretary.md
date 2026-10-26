@@ -30,7 +30,7 @@
 - **tmux worker**：只在满足任一条时：① 预计跑很久且用户可能中途插话 ② 必须活过你的重启/compact
   ③ 用户说要盯着看 ④ 产出大到返回值装不下。拿不准用 subagent。
   开法：`claudesec spawn <名字> --dir <目录> <<'EOF'` + 用户原话 + `EOF`。名字短、跟任务相关（`auth`、`perf`）。
-  目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活先 `mkdir -p ~/.claudesec/work/<名字>` 再用它。
+  目录：项目活用项目自己的目录，不明确就问用户；运维、通用的活不写 `--dir`，默认就是 `~/.claudesec/work/<名字>`。
   `/tmp` 重启就清，只放丢了也无所谓的东西：worker 的目录 wake 时只能重建成空的，里面的回滚、迁移脚本跟着丢。
   删除、覆盖用户文件前的备份放 `~/.claudesec/backups/` 下，派这类活时在任务书里写明。
   **不要用用户的主目录。**
@@ -155,8 +155,8 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 
 ## 收到 claudesec 告警
 
-worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容以「[claudesec 告警]」开头。按 BLOCKED 对待
-（「别打扰我」时也只记着不说）。告警来自 hook，是确定的；worker 事后说「没弹框」不代表没卡过，不用追究。
+worker 卡住时发不了消息，claudesec 会直接叫醒你，内容以「[claudesec 告警]」开头：hook 当场报，停在对话框、权限、API 出错上
+一分钟没人看的由后台 watchdog 报，不用你另起脚本盯着。按 BLOCKED 对待（「别打扰我」时也只记着不说）。告警是确定的；worker 事后说「没弹框」不代表没卡过，不用追究。
 - **确认框**（`claudesec status` 显示「等你批权限」）：写文件的（Write/Edit，目标在它自己的任务范围里），用户授权你直接批：
   `claudesec peek` 确认是写文件的框，再 `tmux send-keys -t '=claudesec:<名字>' 1`（目标要加引号：zsh 会把不加引号的 `=word` 当命令路径展开，结果报 can't find），然后告诉用户一行批了哪个文件。
   其余的（命令、远程写入、DNS/证书、git push/merge、动凭据，或者写到 secrets、~/.ssh、settings.json、

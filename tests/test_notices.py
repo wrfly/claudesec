@@ -67,3 +67,17 @@ class Notices(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpendAtTheBottom(Notices):
+    def test_todays_spend_is_the_last_line_of_the_notices_pane(self):
+        self.cs.spend_today_line = lambda: "今天花费：秘书 $1.0 · 全部 $3.0（claudesec cost --today 看明细）"
+        for with_items in (False, True):
+            if with_items:
+                self.run_cli("notice", "add", "装扩展")
+            _, blocks = self.cs.notices_blocks(80)
+            last = "".join(t for _, t in blocks[-1][1][0])
+            self.assertTrue(last.startswith("今天花费"), last)
+        self.cs.spend_today_line = lambda: ""
+        _, blocks = self.cs.notices_blocks(80)
+        self.assertNotIn("今天花费", "".join(t for b in blocks for line in b[1] for _, t in line))

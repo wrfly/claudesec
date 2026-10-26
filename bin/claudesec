@@ -885,9 +885,6 @@ def status_blocks(cols, now=None):
         blocks.append((("s", name), [head], [head] + more))
     if not rows:
         blocks.append(fixed([(DIM, tr("没有在跑的 worker。", "No workers running."))]))
-    spend = spend_today_line()
-    if spend:
-        blocks += [fixed([]), fixed([(DIM, cut(spend, cols))])]
     if shelved:
         segs = [(BOLD, f"{labels[4]} {len(shelved)}"), ("", "  "), (DIM, tr("、", ", ").join(shelved))]
         lines = wrap(segs, cols, cols - 2)
@@ -1441,8 +1438,10 @@ def notices_blocks(cols):
     """The notices pane: (title bar, blocks)."""
     items = open_notices()
     title = bar(tr(" 通知消息", " Notices"), f"{NOTICE_SECTIONS['open'][0 if lang() == 'zh' else 1]} {len(items)} ", cols)
+    spend = spend_today_line()  # at the very bottom (the user, 2026-10-26)
+    tail = [fixed([]), fixed([(DIM, cut(spend, cols))])] if spend else []
     if not items:
-        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])]
+        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])] + tail
     blocks, num_w = [], max(len(str(n or "·")) for n, _, _ in items)
     for n, tag, text in items:
         head = [(BOLD, str(n or "·").rjust(num_w)), ("", " ")]
@@ -1450,7 +1449,7 @@ def notices_blocks(cols):
         lines = wrap(name + [("", text)], cols - num_w - 1)
         full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
         blocks.append(foldable(("n", n, tag, text), full, fit(head + name + [("", text)], cols)))
-    return title, blocks
+    return title, blocks + tail
 
 
 def cmd_run(args):

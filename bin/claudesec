@@ -336,6 +336,20 @@ def secretary_runs_claudesec(sess, pane):
     return any(is_claudesec_run(pid) for pid in [out[1], *kids])
 
 
+def extended_keys():
+    """Let Shift+Enter (a newline in Claude Code) through tmux: tmux asks the outer terminal to
+    report modified keys apart (Shift+Enter is otherwise just Enter) only with extended-keys on
+    and the terminal listed with the extkeys feature. Server options, so the user's own sessions on this server get them too; harmless there (a
+    program gets extended keys only when it asks). A client attached before this needs to
+    reattach. The outer terminal must send Shift+Enter apart from Enter: GNOME Terminal (VTE)
+    doesn't, whatever tmux does; Ctrl+J or Alt+Enter work there."""
+    if tmux("show-options", "-sv", "extended-keys", check=False).strip() == "off":
+        tmux("set-option", "-s", "extended-keys", "on", check=False)
+    features = tmux("show-options", "-sv", "terminal-features", check=False)
+    if not re.search(r"^xterm\*:.*\bextkeys\b", features, re.M):
+        tmux("set-option", "-as", "terminal-features", "xterm*:extkeys", check=False)
+
+
 def cmd_start(args):
     """Put the secretary in its own tmux session, then switch or attach to it."""
     sess = config()["tmux_session"]
@@ -365,6 +379,7 @@ def cmd_start(args):
                 arrange_dashboard(sess)
             tmux("respawn-pane", "-k", "-t", pane, "-c", str(HOME), run)
     tmux("set-option", "-p", "-t", pane, "@claudesec-role", "secretary", check=False)
+    extended_keys()
     arrange_dashboard(sess)
     # Keep this session out of tmux-resurrect's saved layouts (a post-save hook that honours
     # @resurrect-skip drops it): restored, its panes would be bare `claude --resume`s without
@@ -1693,6 +1708,7 @@ def cmd_spawn(args):
         sys.exit("--budget: only for Claude Code workers (claudesec can't see what a Cursor agent spends), "
                  "and above 0" if cursor else "--budget must be above 0")
     model = args.model or cfg["cursor_worker_model" if cursor else "worker_model"]
+    model = model if cursor else unpaid(model)
     if cursor:
         require_cursor("spawn --agent cursor")
         if not args.for_worker:  # a delegation was checked by delegate, which says it its own way
@@ -2067,6 +2083,8 @@ def stuck_on_dialog(name, target):
         pane = pane_text(target, suggestion="drop")
         if not pane and target not in alive_windows():
             sys.exit(f"worker {name}: {target} exited right away")
+        if answer_credit_dialog(name, target, pane):
+            continue
         if re.search(r"trust this folder|Do you trust|Enter to confirm|Do you want to", pane):
             tail = "\n".join(l for l in pane.splitlines() if l.strip())[-1200:]
             print(f"{name} started in {target}, but it is STUCK ON A DIALOG — tell the user to "
@@ -2926,6 +2944,7 @@ def cmd_wake(args):
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
     model = args.model or w.get("model") or cfg["cursor_worker_model" if cursor else "worker_model"]
+    model = model if cursor else unpaid(model)
     followed = follow_conversation(w, cwd, old=left)
     if moved or followed or left:
         with registry() as reg:
@@ -3020,6 +3039,8 @@ def confirm_resume(name, pane, d, sid):
             return f"resumed as a different session {got}", screen
         if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
             return "claude exited", screen
+        if answer_credit_dialog(name, pane, screen):
+            continue
         # A dialog blocks before SessionStart; only one that stays up counts.
         dialog = dialog + 1 if re.search(r"trust this folder|Do you trust|Enter to confirm", screen) else 0
         if dialog >= 5:
@@ -3861,6 +3882,8 @@ def check_reminders(run_pid):
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
             fire_due_reminders()
+            with contextlib.suppress(Exception):  # nor a window that vanished mid-look
+                check_stuck()
             if time.monotonic() - last_runaway >= RUNAWAY_CHECK_SECS:
                 last_runaway = time.monotonic()
                 with contextlib.suppress(Exception):  # a bad transcript line mustn't stop the reminders
@@ -4669,6 +4692,130 @@ def mark_answered(name, text):
         w.update(status="PROGRESS", pending_ask=None, last_summary=tr(f"已答，在处理：{line}", f"answered, working on it: {line}")[:200])
 
 
+# ---------- watchdog: a worker stuck on a dialog ----------
+
+STUCK_SECS = 60
+DIALOG_FOOTER = re.compile(r"Enter to confirm|Esc to cancel|Esc to exit|trust this folder|Do you trust|Do you want to")
+CREDITS = re.compile(r"(?:runs on|uses) usage credits")
+SWITCH = re.compile(r"Switch to (.+?)(?: and continue)?\s*$")
+
+
+def screen_dialog(screen):
+    """The dialog a window ends in, as its last lines, or None. Only the bottom counts: older
+    messages above may quote one, and below an idle prompt sits Claude Code's input box."""
+    lines = [l.rstrip() for l in screen.splitlines() if l.strip()]
+    if not any(DIALOG_FOOTER.search(l) for l in lines[-4:]):
+        return None
+    return "\n".join(lines[-12:])
+
+
+def model_id(shown):
+    """Claude Code's name for a model → its id: "Opus 5.5" → "claude-opus-5-5"."""
+    return "claude-" + re.sub(r"[^a-z0-9]+", "-", re.sub(r"\(.*?\)", "", shown).lower()).strip("-")
+
+
+def unpaid(model):
+    """The model to run instead of one Claude Code said runs on usage credits, bought apart from
+    the plan (learned by answer_credit_dialog)."""
+    path = HOME / "registry.json"
+    with contextlib.suppress(OSError, ValueError):
+        return (json.loads(path.read_text()).get("credit_models") or {}).get(model, model)
+    return model
+
+
+def answer_credit_dialog(name, target, screen=None):
+    """Claude Code asks before a model that runs on usage credits ("Switch to Opus 5.5 and
+    continue / Continue with Fable 5.1"). Pick the switch, which costs nothing extra; record the
+    worker's new model, and the swap for later spawns and wakes, and for shelved workers on the
+    same model. Returns a note for the secretary, or None when no such dialog is up."""
+    for _ in range(6):
+        screen = screen if screen is not None else pane_text(target, suggestion="drop")
+        dialog = screen_dialog(screen)
+        if not dialog or not CREDITS.search(dialog):
+            return None
+        lines = screen.splitlines()
+        at = max((i for i, l in enumerate(lines) if l.lstrip().startswith("❯")), default=None)
+        to = max((i for i, l in enumerate(lines) if SWITCH.search(l)), default=None)
+        if at is None or to is None:
+            return None
+        if at == to:
+            break
+        tmux("send-keys", "-t", target, "Down" if to > at else "Up")
+        time.sleep(0.3)
+        screen = None
+    else:
+        return None
+    new = model_id(SWITCH.search(lines[to])[1])
+    tmux("send-keys", "-t", target, "Enter")
+    with registry() as reg:
+        w = reg["workers"].get(name) or {}
+        old = w.get("model")
+        if w:
+            w["model"] = new
+        if old and old != new:
+            reg.setdefault("credit_models", {})[old] = new
+            for other in reg["workers"].values():
+                if other["status"] == "SHELVED" and other.get("model") == old:
+                    other["model"] = new
+    permission_answered(name)
+    append_log(name, "task", f"{old or 'its model'} runs on usage credits: picked Switch to {new}")
+    return tr(f"worker {name} 的模型 {old} 要额外付费（usage credits），Claude Code 弹框问；已自动选「切到 {new} 继续」，"
+              f"注册表里改成 {new}，以后用 {old} 的 spawn / wake 都直接用 {new}。",
+              f"worker {name}'s model {old} runs on usage credits, paid apart from the plan, and Claude Code asked; "
+              f"picked \"Switch to {new}\" for it. The registry says {new} now, and spawns and wakes on {old} use {new}.")
+
+
+def user_watching(window):
+    """The user has this window in front of them: the current window of an attached session."""
+    out = tmux("display", "-p", "-t", window, "#{window_active} #{session_attached}", check=False).split() if window else []
+    return len(out) == 2 and out[0] == "1" and out[1] != "0"
+
+
+def check_stuck(now_t=None):
+    """Runs with the reminders. A running worker that has sat on a dialog (a permission or
+    confirmation prompt, a trust question, anything ending in Enter to confirm / Esc to cancel)
+    or on an API error for STUCK_SECS wakes the secretary, once per dialog, unless the user is
+    looking at its window. The hooks alert sooner for what they see; the screen catches the rest.
+    Returns the alerts raised."""
+    now_t = time.time() if now_t is None else now_t
+    path = HOME / "stuck.json"
+    try:
+        seen = json.loads(path.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    live, keep, raised = alive_windows(), {}, []
+    for name, w in read_registry()[1].items():
+        if w["status"] == "SHELVED" or w.get("window") not in live:
+            continue
+        screen = pane_text(w["window"], suggestion="drop")
+        if not is_cursor(w) and (note := answer_credit_dialog(name, w["window"], screen)):
+            raise_alert(note)
+            raised.append(note)
+            continue
+        if w["status"] in ("WAITING_PERMISSION", "API_ERROR"):
+            sig = f"{w['status']}|{w.get('last_report_at')}"
+            what = w.get("pending_ask") or w["status"]
+        elif (dialog := screen_dialog(screen)):
+            sig = "screen|" + hashlib.md5(re.sub(r"\d+", "", dialog).encode()).hexdigest()  # a ticking clock is the same dialog
+            what = "\n".join(dialog.splitlines()[-6:])
+        else:
+            continue
+        entry = seen.get(name) if (seen.get(name) or {}).get("sig") == sig else None
+        entry = keep[name] = entry or {"sig": sig, "since": now_t, "alerted": w.get("alerted_for") == sig}
+        if entry["alerted"] or now_t - entry["since"] < STUCK_SECS or user_watching(w["window"]):
+            continue
+        entry["alerted"] = True
+        mins = int((now_t - entry["since"]) // 60)
+        text = tr(f"worker {name} 卡住 {mins} 分钟以上了，停在这里等人处理（窗口 {name}）：\n{what}",
+                  f"worker {name} has been stuck for over {mins} min, waiting for someone in window {name}:\n{what}")
+        raise_alert(text)
+        raised.append(text)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keep, indent=1, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    return raised
+
+
 # ---------- dialogs: a worker waiting on the user ----------
 
 def describe_request(tool, inp):
@@ -4724,9 +4871,13 @@ def hook_worker_permission_alert(name):
         w["status"] = "WAITING_PERMISSION"
         w["pending_ask"] = m["detail"]
         w["last_report_at"] = now()
-        discuss = w.get("mode") == "discuss"
+        # Not when the user has the window in front of them (a discussion, mostly); if they look
+        # away and leave it, check_stuck speaks up.
+        watching = user_watching(w.get("window"))
+        if not watching:
+            w["alerted_for"] = f"WAITING_PERMISSION|{w['last_report_at']}"
     append_log(name, "permission", m["detail"])
-    if not discuss:  # in a discussion the user is already looking at the window
+    if not watching:
         raise_alert(tr(f"worker {name} 卡在一个确认对话框上，等用户在窗口 {name} 里处理：{m['detail']}",
                        f"worker {name} is stuck on a confirmation dialog, waiting for the user in window {name}: {m['detail']}"))
 
@@ -4746,9 +4897,11 @@ def hook_worker_stop_failure(name):
         w["status"] = "API_ERROR"
         w["pending_ask"] = err
         w["last_report_at"] = now()
-        discuss = w.get("mode") == "discuss"
+        watching = user_watching(w.get("window"))  # then they see it; check_stuck speaks up if it stays
+        if not watching:
+            w["alerted_for"] = f"API_ERROR|{w['last_report_at']}"
     append_log(name, "api-error", err)
-    if not discuss:  # in a discussion the user is in the window and sees it
+    if not watching:
         raise_alert(tr(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}",
                        f"worker {name}'s turn broke off on an API error; it sits at its prompt and won't report on its own: {err}"))
 

@@ -211,7 +211,7 @@ worker 卡住时发不了消息，claudesec 的 hook 会直接叫醒你，内容
 - 你退出时，claudesec 会自己收起所有 worker（忙着的等这一轮做完再收）；你启动时（包括重启电脑后用户跑 `claudesec`），
   claudesec 会自动把它们静默恢复，用户手动搁置的除外。这些不用你做，也**不要让用户去关窗口或做任何收尾的杂活**。
 - 启动后收到「没能自动恢复」的告警，告诉用户一行，问要不要再试 `claudesec wake`（不试，下次启动 claudesec 也会再试）。
-  用户自己搁置的，等用户发话再 wake。
+  用户自己搁置的，等用户发话再 wake。目录搬了的（仓库改名之类），整个目录用 `claudesec redir OLD NEW`，单个用 `claudesec wake NAME --dir NEW`。
 
 ## 主窗口面板
 

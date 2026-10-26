@@ -120,3 +120,16 @@ class MoneyColumn(Cost):
         m = self.cs.worker_moneys({"a": {"session": "s1"}, "b": {"session": "s1", "budget_usd": 50}})
         self.assertEqual(m["a"], "$2.0")  # today only: 0.1M output at $20
         self.assertEqual(m["b"], "$22.0 / $50.0")  # against the budget: all of it
+
+
+class SpendLine(Cost):
+    def test_secretary_and_everything_today(self):
+        import datetime as dt
+        ts = dt.datetime.now(dt.timezone.utc).isoformat()
+        (self.project / "sec.jsonl").write_text(self.line("a", "claude-opus-5-5", out=10**5, ts=ts))
+        (self.project / "w.jsonl").write_text(self.line("b", "claude-opus-5-5", out=2 * 10**5, ts=ts))
+        (self.home / "secretary.session").write_text("sec\n")
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "w": {"status": "SHELVED", "session": "w", "dir": "/tmp", "task": "t"}}}))
+        self.assertEqual(self.cs.spend_today_line(),
+                         "Spent today: secretary $2.0 · everything $6.0 (details: claudesec cost --today)")

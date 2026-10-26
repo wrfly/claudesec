@@ -885,6 +885,9 @@ def status_blocks(cols, now=None):
         blocks.append((("s", name), [head], [head] + more))
     if not rows:
         blocks.append(fixed([(DIM, tr("没有在跑的 worker。", "No workers running."))]))
+    spend = spend_today_line()
+    if spend:
+        blocks += [fixed([]), fixed([(DIM, cut(spend, cols))])]
     if shelved:
         segs = [(BOLD, f"{labels[4]} {len(shelved)}"), ("", "  "), (DIM, tr("、", ", ").join(shelved))]
         lines = wrap(segs, cols, cols - 2)
@@ -2501,6 +2504,22 @@ def money_word(usd, budget=None):
     return f"{spent} / {money(float(budget))}" if budget else spent
 
 
+def spend_today_line():
+    """"今天花费：秘书 $44.5 · 全部 $210": the secretary isn't a worker row, and the total takes in the
+    shelved and closed workers too. Empty when nothing was spent."""
+    today = dt.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    per_owner = {}
+    for owner, per in usage_by_owner(since=today).items():
+        costs = [cost_of(v, *k.split("|")) for k, v in per.items()]
+        per_owner[owner] = sum(c for c in costs if c is not None)
+    total = sum(per_owner.values())
+    if not total:
+        return ""
+    sec = per_owner.get(config()["secretary_name"], 0.0)
+    return tr(f"今天花费：秘书 {money(sec)} · 全部 {money(total)}（claudesec cost --today 看明细）",
+              f"Spent today: secretary {money(sec)} · everything {money(total)} (details: claudesec cost --today)")
+
+
 def worker_moneys(workers):
     """{name: $ column}: today's spend (the user, 2026-10-26: a worker's lifetime total read as
     today's), or, for one with a budget, its spend against the budget, which counts it all.
@@ -3033,6 +3052,9 @@ def cmd_status(args):
             rows.append((n, Path(w["dir"]).name, (w.get("shelved_at") or "")[:16].replace("T", " "), usage_word(usage[n]),
                          (w.get("shelf_summary") or w.get("last_summary") or "").replace("\n", " ")[:60]))
         print_rows(rows)
+    spend = spend_today_line()
+    if spend:
+        print("\n" + spend)
     print_reminders()
     items = open_notices()
     if items:

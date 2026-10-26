@@ -1453,6 +1453,9 @@ def cmd_run(args):
             "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
                              {"hooks": [watch]}],
             "Stop": [{"hooks": [watch]}],
+            # A turn that dies on an API error (billing, overload) has no Stop: without this,
+            # no watcher until the user's next message, and the alerts that woke it are lost.
+            "StopFailure": [{"hooks": [{**watch, "command": f"{cmd} hook secretary-watch-failed"}]}],
             "PostToolUse": [{"matcher": "SendMessage",
                              "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-prompt"}]}],
@@ -4106,13 +4109,30 @@ def back_at_work(name, new_turn=False):
 # night's alerts (10-23, devbox) waited in alerts/ until the user's next message.
 WATCH_TIMEOUT = 24 * 3600
 WATCH_MARGIN = 300
+# After the secretary's turn fails on an API error: wait this long before waking it again. Each
+# retry that fails again is one cheap rejected request; 10-23 the account ran out of credit and
+# nothing woke the secretary for 2.5 days.
+WATCH_RETRY = 15 * 60
 WATCH_REARM = ("[claudesec] 告警监听到期重挂：没有新告警，这不是任务。什么都不用做、不用回复，"
                "直接结束这一轮（结束时会自动重新挂上监听）。")
 WATCH_REARM_EN = ("[claudesec] The alert watcher timed out and is being re-armed: there are no new alerts, and this "
                   "is not a task. Do nothing and don't reply; just end this turn (ending it re-arms the watcher).")
 
 
-def hook_secretary_watch():
+def hook_secretary_watch_failed():
+    """StopFailure: the secretary's turn died on an API error. Whatever alerts it was woken for
+    go back to alerts/, and a watcher is armed that waits a while before waking it again, so a
+    billing or capacity error doesn't turn into a tight loop of failing turns."""
+    inflight, done = HOME / "alerts" / "inflight.json", HOME / "alerts" / "delivered"
+    with contextlib.suppress(OSError, ValueError):
+        for name in json.loads(inflight.read_text()):
+            with contextlib.suppress(OSError):
+                (done / name).rename(HOME / "alerts" / name)
+    inflight.unlink(missing_ok=True)
+    hook_secretary_watch(delay=WATCH_RETRY)
+
+
+def hook_secretary_watch(delay=0):
     """Armed in the background at session start and every turn end; one instance at a time.
     Exits 2 with the pending alerts, which wakes the secretary (asyncRewake)."""
     data = hook_input()
@@ -4125,8 +4145,19 @@ def hook_secretary_watch():
                  os.getppid())
     alerts, done = HOME / "alerts", HOME / "alerts" / "delivered"
     done.mkdir(parents=True, exist_ok=True)
+    inflight = alerts / "inflight.json"
+    if data.get("hook_event_name") == "Stop":
+        inflight.unlink(missing_ok=True)  # the turn they woke ended normally: handled
     deadline = time.monotonic() + WATCH_TIMEOUT - WATCH_MARGIN
+    quiet_until = time.monotonic() + delay
     while True:
+        if time.monotonic() < quiet_until:  # after a failed turn: give the API time to recover
+            try:
+                os.kill(owner, 0)
+            except OSError:
+                return
+            time.sleep(1)
+            continue
         if time.monotonic() > deadline:
             # Claude Code ends an async hook at its timeout, and nothing would arm another until
             # the secretary's next turn. Wake it with nothing to do; its turn end re-arms this.
@@ -4137,6 +4168,9 @@ def hook_secretary_watch():
             msgs = [f.read_text().strip() for f in files]
             for f in files:
                 f.rename(done / f.name)
+            # Kept until the turn they wake ends normally; a failed one puts them back.
+            names = json.loads(inflight.read_text()) if inflight.exists() else []
+            inflight.write_text(json.dumps(names + [f.name for f in files]))
             print(tr("[claudesec 告警]\n", "[claudesec alert]\n") + "\n".join(msgs), file=sys.stderr)
             sys.exit(2)
         try:
@@ -4152,6 +4186,7 @@ HOOKS = {
     "worker-permission-alert": hook_worker_permission_alert,
     "worker-permission-done": hook_worker_permission_done,
     "secretary-watch": hook_secretary_watch,
+    "secretary-watch-failed": hook_secretary_watch_failed,
     "worker-report": hook_worker_report,
     "worker-stop": hook_worker_stop,
     "worker-stop-failure": hook_worker_stop_failure,

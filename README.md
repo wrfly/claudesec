@@ -45,10 +45,11 @@ Written with defaults on the first run; fields you leave out keep their defaults
 
 ### Language
 
-Everything claudesec shows or tells the models comes in English and Chinese:
+What claudesec shows comes in English and Chinese:
 - the panes, `claudesec status` and `claudesec queue`;
-- the secretary's and workers' prompts (`prompts/en/` or `prompts/`);
 - alerts, and the context hooks inject.
+
+The secretary's and workers' prompts (`prompts/`) are Chinese only: the models follow them whatever language you talk to them in.
 
 Set `"language": "en"` (or `"zh"`) in `~/.claudesec/config.json`, then run `claudesec --restart`.
 Workers switch when they are next started or woken.
@@ -133,7 +134,7 @@ once it stops". Adopting restarts that session in its window, with its conversat
 ## Taking it to another machine
 
 What's in the repo applies to anyone: `prompts/secretary.md` (the secretary's constitution, including the
-conventions settled in reviews), `prompts/worker.md`, and their English versions in `prompts/en/`.
+conventions settled in reviews), and `prompts/worker.md`.
 
 These are not in the repo:
 - `~/.claudesec/`, this machine's state: registry, history, lessons, decision queue.

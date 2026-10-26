@@ -602,13 +602,9 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   settings.json 的 `language` 是否英语，否则中文。不看 LANG：中文用户跑 en_US.UTF-8 的很多（这台机器就是）。字符串就地写
   `tr("中文", "English")`，不另建翻译表。queue.md 读的时候中英文标题都认（`## To ask`、`## Waiting`、`## Backlog`、`## Done`，
   日期标记「已问：」/「asked:」，优先级（高 / high）），补标题按文件已有标题的语言，新建文件按 `lang()`。
-  提示词、给秘书的告警和 hook 注入也跟着走（见下）。
-- 英文版提示词：`prompts/en/` 下同名四份（secretary / worker / worker-cursor / review），`prompt_file()` 按 `lang()` 选；
-  中文仍读 `prompts/*.md`，渲染结果逐字不变。两份文件而不是单一来源：规则是成段的散文，模板化（每条规则一个 key）会把
-  提示词拆得没法读、没法改。漂移靠 `tests/test_prompt_parity.py` 拦：逐对比标题层级和顺序、Cursor 条件标记、每节每层缩进的
-  条目数、代码块和行数、`{{占位符}}`、行内代码（命令 / 路径 / 参数原样保留）、行内代码和粗体的个数，英文里不许有中文。
-  一边加删一条规则另一边没跟，测试就挂；复盘 worker 的说明里也写了「中英两份一起改，跑通这个测试」。
-  意译不直译：讲中文措辞的规则（开场白分清汇报和征求意见、用户说「先放着」「别打扰我」之类）换成英文用户自然的说法。
+  给秘书的告警和 hook 注入也跟着走（见下）；提示词不跟。
+- 提示词只有中文一份（`prompts/*.md`），设成 en 也读它：模型不挑语言（用户 2026-10-27 定；曾经的 `prompts/en/`
+  英文版和中英对照测试一并删了）。
   代码会产生或识别的短语（`User decision:`、`[claudesec alert]`、`[delegation receipt]`、`[reminder rN]`、`[for X]` 等）
   两边固定对应；识别的地方中英都认（`is_user_decision`、lessons / queue 的 `## Done`、归档索引的 `for X: `）。
   代码里给模型看的字（首条消息、Stop hook 的理由、会话开始注入、告警、回执、归档正文）写成 `tr("中文", "English")`，

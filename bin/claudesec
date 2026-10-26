@@ -1187,7 +1187,7 @@ def without_asked_date(text):
 def secretary_prompt():
     """secretary.md with the Cursor parts kept or dropped for this machine, as a file for claude."""
     path = HOME / "secretary-prompt.md"
-    path.write_text(render_prompt(prompt_file("secretary.md").read_text()))
+    path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()))
     return path
 
 
@@ -1768,7 +1768,7 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     d = worker_dir(name)
     for mark in ("reported", "finish", AFTER_REPORT):
         (d / mark).unlink(missing_ok=True)
-    prompt = render_prompt(prompt_file("worker-cursor.md" if agent == "cursor" else "worker.md").read_text())
+    prompt = render_prompt((PROMPTS / ("worker-cursor.md" if agent == "cursor" else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
               .replace("{{CLAUDESEC}}", hook_cmd()))
     (d / "prompt.md").write_text(prompt)
@@ -1936,11 +1936,6 @@ def cursor_nice():
     """`nice -n N ` before a Cursor agent's command, or nothing."""
     n = int(config().get("cursor_nice") or 0)
     return f"nice -n {n} " if n > 0 and shutil.which("nice") else ""
-
-
-def prompt_file(name):
-    """prompts/NAME, or its English twin prompts/en/NAME (same rules, see tests/test_prompt_parity.py)."""
-    return PROMPTS / "en" / name if lang() == "en" else PROMPTS / name
 
 
 def render_prompt(text):
@@ -3946,7 +3941,7 @@ def cmd_review(args):
     """A fresh worker each day: the review needs none of yesterday's context, and a long-lived
     one would carry every past review along."""
     date = dt.date.today().isoformat()
-    brief = prompt_file("review.md").read_text()
+    brief = (PROMPTS / "review.md").read_text()
     # Resolved: through a symlink every write would ask (see memory_settings). The worker gets it
     # as its own auto memory dir, where Write and Edit don't ask either.
     memory = secretary_memory_dir().resolve()
@@ -4572,7 +4567,7 @@ def hook_secretary_session_start():
         (HOME / "secretary.session").write_text(data["session_id"] + "\n")
     focus, workers = read_registry()
     out = [tr(f"[claudesec] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}",
-              f"[claudesec] State directory {HOME}; your constitution {prompt_file('secretary.md')}")]
+              f"[claudesec] State directory {HOME}; your constitution {PROMPTS / 'secretary.md'}")]
     import io
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf

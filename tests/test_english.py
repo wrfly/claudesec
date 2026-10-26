@@ -1,5 +1,6 @@
-"""With "language": "en", what claudesec tells the models is English too: the prompts it renders,
-first messages, Stop hook reasons, the secretary's session-start context, alerts. And it reads
+"""With "language": "en", what claudesec tells the models is English too: first messages, Stop hook
+reasons, the secretary's session-start context, alerts. The prompts are Chinese in either language
+(the user, 2026-10-27: models follow them whatever the language). And it reads
 English files and answers ("## Done", "User decision: …") as it reads Chinese ones.
 
     python3 -m unittest discover -s tests
@@ -60,11 +61,12 @@ class English(unittest.TestCase):
         return out.getvalue()
 
     def test_prompts(self):
-        self.no_chinese(self.cs.secretary_prompt().read_text(), "secretary prompt")
+        prompts = self.cs.PROMPTS
+        self.assertEqual(self.cs.secretary_prompt().read_text(),
+                         self.cs.render_prompt((prompts / "secretary.md").read_text()))
         for agent in ("claude", "cursor"):
             d = self.cs.prepare_worker("w", {"secretary_name": "secretary"}, "hi", self.home, agent=agent)
-            self.no_chinese((d / "prompt.md").read_text(), f"{agent} worker prompt")
-        self.no_chinese(self.cs.prompt_file("review.md").read_text(), "review brief")
+            self.assertTrue((d / "prompt.md").read_text().startswith("# 你是 ClaudeSec worker「w」"), agent)
 
     def test_first_messages(self):
         for text in (self.cs.ADOPT_PROMPT_EN, self.cs.WAKE_PROMPT_EN, self.cs.WAKE_REPORT_EN,
@@ -109,14 +111,8 @@ class English(unittest.TestCase):
 
 
 class ChineseStaysAsItWas(English):
-    """The Chinese side is unchanged: the original prompt files, Chinese messages."""
+    """The Chinese side is unchanged: Chinese messages."""
     LANG = "zh"
-
-    def test_prompts(self):
-        prompts = self.cs.PROMPTS
-        self.assertEqual(self.cs.prompt_file("secretary.md"), prompts / "secretary.md")
-        self.assertEqual(self.cs.secretary_prompt().read_text(),
-                         self.cs.render_prompt((prompts / "secretary.md").read_text()))
 
     def test_stop_hook_and_session_start(self):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {}}))

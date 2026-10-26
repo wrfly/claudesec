@@ -41,7 +41,7 @@
 
 ### 语言
 
-面板、`claudesec status`、`claudesec queue`，以及秘书和 worker 的提示词、告警、hook 注入，都有中文和英文两套。
+面板、`claudesec status`、`claudesec queue`，以及告警、hook 注入，都有中文和英文两套。秘书和 worker 的提示词（`prompts/`）只有中文：模型不挑语言，照样照做。
 在 `~/.claudesec/config.json` 里写 `"language": "en"`（或 `"zh"`），然后 `claudesec --restart`；新开或唤醒的 worker 自动跟着换。
 不写时跟 Claude Code 自己 settings.json 里的 `language` 走：是英语就用英文，否则中文。不看系统 locale。
 
@@ -107,6 +107,6 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 
 ## 带到别的机器
 
-repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`，以及它们在 `prompts/en/` 里的英文版。
+repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`。
 `~/.claudesec/` 是这台机器的状态（注册表、历史、教训、决策队列），秘书的 Claude Code memory 是这台机器上的偏好，都不在 repo 里；
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。

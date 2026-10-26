@@ -22,7 +22,7 @@
 2. 每加一条，同时找能删、能合并的：重复的、已经被代码保证的、过时的。提示词只加不减会撑爆秘书的上下文。
 3. **「铁律」一节一个字都不许改。**
    `<!-- if cursor --> … <!-- else --> … <!-- end cursor -->` 包着的是只在机器上有 Cursor worker 时才给出的内容，改的时候保留标记。
-4. 按仓库的 worktree 规则开新 worktree，分支 `review/{{DATE}}`；每处提示词改动中英两份（prompts/X.md 和 prompts/en/X.md）一起改，跑通 python3 -m unittest tests.test_prompt_parity；改完 commit，**不要 push**。
+4. 按仓库的 worktree 规则开新 worktree，分支 `review/{{DATE}}`；改完跑通 python3 -m unittest discover -s tests，commit，**不要 push**。
    `git diff origin/main` 存到 `{{REVIEWS}}/{{DATE}}.diff`。
 5. 汇报 NEED_DECISION：DID 写记忆改了什么（几条合并、删了哪些）；ASK 列每一处提示词改动，一行一条，
    标「加 / 删 / 改」和依据（哪几条教训或记忆），附 diff 文件路径；选项给「全部同意 / 只要第 N 条 / 都不要」。

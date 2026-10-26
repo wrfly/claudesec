@@ -3346,8 +3346,15 @@ def cmd_report(args):
 
 
 def send_text(name, w, text, by="secretary"):
-    """Paste text into a Cursor worker's window as one message."""
-    subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=text, text=True, check=True)
+    """Paste text into a Cursor worker's window as one message. A pasted message looks to Cursor
+    exactly like the user typing in its window, so it says where it comes from: delegated workers
+    had been reporting 「用户直接跟我说了：…」 about their delegator's follow-ups."""
+    head = (tr("[claudesec] 秘书转来的消息（不是用户在你窗口里打的字）：",
+               "[claudesec] A message passed on by the secretary (not the user typing in your window):")
+            if by == "secretary" else
+            tr(f"[claudesec] 委托你的 worker {by} 发来的消息（不是用户在你窗口里打的字）：",
+               f"[claudesec] A message from {by}, the worker that delegated to you (not the user typing in your window):"))
+    subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=f"{head}\n{text}", text=True, check=True)
     tmux("paste-buffer", "-p", "-d", "-b", "claudesec-send", "-t", w["window"])
     time.sleep(0.5)  # Enter apart from the paste, as when typed by hand
     tmux("send-keys", "-t", w["window"], "Enter")
@@ -3802,11 +3809,12 @@ def hook_cursor_stop():
     print(json.dumps({"followup_message":
         tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
            "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
-           "若用户刚在你的窗口直接跟你说过话，汇报里注明。",
+           + ("" if w.get("delegated_by") else "若用户刚在你的窗口直接打字跟你说过话，汇报里注明。"),
            f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send the "
            "secretary a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
-           "the format is under \"Reporting\" in your rules. If the user just talked to you in your window, say so "
-           "in the report.")}, ensure_ascii=False))
+           "the format is under \"Reporting\" in your rules."
+           + ("" if w.get("delegated_by") else " If the user just typed to you in your window, say so in the report."))},
+        ensure_ascii=False))
 
 
 def hook_worker_stop(name):

@@ -101,7 +101,8 @@ DEFAULT_CONFIG = {
     "cursor_worker_model": "gpt-5.6-sol[context=1m,reasoning=high,fast=false]",
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
-    "cursor_max_running": 2,          # local Cursor workers at work at once; spawn / wake / delegate past it refuse
+    "cursor_max_running": None,       # local Cursor workers at work at once; spawn / wake / delegate past it
+                                      # refuse. None: half the CPU cores (at least 1); 0: no limit
     "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
     "language": None,                 # what the panes, status and queue say: "zh", "en"; None = see lang()
@@ -1855,10 +1856,19 @@ def cursor_busy(but=None):
                   if is_cursor(w) and n != but and w["status"] in CURSOR_AT_WORK and w.get("window") in alive)
 
 
+def cursor_limit():
+    """cursor_max_running as it applies: a number set in config.json as is (0: no limit), else half
+    this machine's cores, at least one (the user, 2026-10-26: the devbox can run plenty)."""
+    value = config().get("cursor_max_running")
+    if value is None or str(value).lower() == "auto":
+        return max(1, (os.cpu_count() or 2) // 2)
+    return int(value)
+
+
 def cursor_room(what, but=None, prefix=""):
     """Refuse when cursor_max_running Cursor workers are already at work: each agent is a local
     process tree that can take whole cores (the user's CPU, 2026-10-24)."""
-    limit = int(config().get("cursor_max_running") or 0)
+    limit = cursor_limit()
     busy = cursor_busy(but)
     if limit and len(busy) >= limit:
         sys.exit(f"{prefix}{what}: {len(busy)} Cursor workers are already at work ({', '.join(busy)}), the limit "
@@ -2814,9 +2824,8 @@ def cmd_status(args):
         for n, t, text in items:
             print(f"  #{n} " + (f"[{t}] " if t else "") + text)
     load = ""
-    if cursor_available()[0] and config().get("cursor_max_running"):
-        load = tr(f" · 在跑 {len(cursor_busy())}/{config()['cursor_max_running']}",
-                  f" · at work {len(cursor_busy())}/{config()['cursor_max_running']}")
+    if cursor_available()[0] and cursor_limit():
+        load = tr(f" · 在跑 {len(cursor_busy())}/{cursor_limit()}", f" · at work {len(cursor_busy())}/{cursor_limit()}")
     print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1] + load)
     sessions = external_sessions()
     if sessions:

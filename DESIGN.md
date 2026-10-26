@@ -223,7 +223,7 @@ Claude Code worker 也能用。
 
 **本地 Cursor 的 CPU**：每个 agent 是一棵本地进程树，能吃满几个核（用户嫌占 CPU，2026-10-24）。上 Cursor 云端
 （Cloud Agents，只有 REST API 能脚本化，要关掉账号的 privacy mode、给仓库装 GitHub App、云端命令全自动执行）用户没选，
-选了在本地压着：config `cursor_max_running`（默认 2）个以上的 Cursor worker 在干活（STARTING / PROGRESS、窗口还在）时，
+选了在本地压着：config `cursor_max_running`（不配时按本机 CPU 核数的一半，至少 1；配数字按数字，0 不限；10-26 前默认是 2）个以上的 Cursor worker 在干活（STARTING / PROGRESS、窗口还在）时，
 `spawn --agent cursor`、`wake`、`delegate` 拒绝并列出谁在跑，delegate 的拒绝带 `NOT DELEGATED:`，worker 照规则自己做或开
 subagent；接着做同一个 worker 不算新增。停在提示符上的不算（几乎不占 CPU）。`cursor_nice`（默认 10）：agent 命令前加
 `nice -n`，整棵进程树继承。`claudesec status` 的 Cursor 那行显示「在跑 N/上限」。

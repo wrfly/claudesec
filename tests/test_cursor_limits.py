@@ -39,7 +39,23 @@ class CursorLimits(unittest.TestCase):
         self.assertEqual(self.cs.cursor_busy(), ["a", "b"])
         self.assertEqual(self.cs.cursor_busy(but="a"), ["b"])
 
+    def test_the_default_limit_is_half_the_cores(self):
+        import os
+        saved = os.cpu_count
+        try:
+            for cores, limit in ((32, 16), (3, 1), (1, 1), (None, 1)):
+                os.cpu_count = lambda c=cores: c
+                self.config({})
+                self.assertEqual(self.cs.cursor_limit(), limit, cores)
+            self.config({"cursor_max_running": 4})  # set in config.json: as is
+            self.assertEqual(self.cs.cursor_limit(), 4)
+            self.config({"cursor_max_running": 0})  # 0: no limit
+            self.assertEqual(self.cs.cursor_limit(), 0)
+        finally:
+            os.cpu_count = saved
+
     def test_room_refuses_past_the_limit(self):
+        self.config({"cursor_max_running": 2})
         self.workers(a={"agent": "cursor", "status": "PROGRESS", "window": "@1"},
                      b={"agent": "cursor", "status": "PROGRESS", "window": "@2"})
         with self.assertRaises(SystemExit) as e:

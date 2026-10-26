@@ -709,3 +709,13 @@ send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，
 未验证（需要用户真用时观察）：
 - 秘书 `/compact` 后靠注入的状态接上在跑的 worker
 - 秘书的判断质量：分类、路由、升级门槛、推送克制——这部分只能靠 3.6 的进化机制迭代
+
+## 额度（budget，2026-10-26）
+
+方案见 history/2026-10/2026-10-26-budget.md。记账：usage.json 按「本地小时|模型|速度」分桶，记输入、缓存写 5m、缓存写 1h、
+缓存读、输出；`claudesec cost` 按单价表（PRICES，官方定价页核对，config.json 的 prices 可覆盖）折算，未计价的模型不算 0。
+预算窗口 budget.json：开始、截止、可选金额。Claude Code worker 每次工具调用前过 PreToolUse 检查（没设预算时只是一次文件测试）：
+剩 15%（时间或金额，取先到的）时用 additionalContext 提示收尾，每个窗口一次；到点冻结，拒绝除 SendMessage / ToolSearch 外的所有
+工具调用，要求发 BLOCKED（ToolSearch 放行是因为 SendMessage 可能要先加载，实测过）。冻结期间 spawn、wake（quiet 的除外）、delegate
+拒绝。`--add` / 新的 `--until` / `--off` 解冻；`--from` 预约的窗口由提醒检查器到点打开。解冻后 claudesec 把「预算已恢复，继续」
+粘贴进每个被冻结的 worker 窗口，并告诉秘书。已经在跑的 worker 要等下次 spawn / wake 才有这个 hook。Cursor 不管。

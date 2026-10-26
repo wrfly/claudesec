@@ -82,6 +82,8 @@ To check: `python3 contrib/resurrect-agent-commands.py --check` should show clau
     claudesec --new            # a fresh secretary (new conversation)
     claudesec --restart        # reload the secretary's prompt and hooks; the conversation and workers are untouched
     claudesec -d               # start in the background, don't switch to it
+    claudesec budget --until 20:00 --usd 100   # a spending window for all workers: wrap-up notice at 85%, frozen at 100%
+    claudesec budget --add 50 | --until 23:00 | --from 09:00 --until 18:00 | --off   # extend, book the next window, end
     claudesec cost --today      # spend today by worker and model, at list prices (claudesec cost NAME --since 3h)
     claudesec dashboard off    # turn off the queue / workers / notices panes (on turns them back on)
     claudesec notice add --from W "say push in W's window"   # something for you to do; notice done N marks it done

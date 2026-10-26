@@ -29,6 +29,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
   claudesec wait N                       the delegator waits for N's final report (background Bash)
   claudesec status                       one-screen table of workers
+  claudesec budget --until T [--usd N] [--from T] | --add N | --off   a spending window for all workers;
+                                    wrap-up notice at 85%, frozen at 100%; no options: show it
   claudesec cost [NAME] [--today | --since T --until T]   spend by worker and model, at list prices
                                     (T: 3h / 2d ago, 09:00 today, 2026-10-25, or ISO)
   claudesec log NAME [-n N]              last N report entries of a worker
@@ -1651,6 +1653,7 @@ def cmd_spawn(args):
     name = args.name
     if not NAME_RE.match(name):
         sys.exit(f"bad worker name {name!r}: use lowercase letters, digits, dashes")
+    refuse_while_frozen(f"spawn {name}")
     _, workers = read_registry()
     old = workers.get(name)
     if old and old["status"] == "SHELVED":
@@ -1744,9 +1747,14 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     answered = [{"matcher": "*", "hooks": [{"type": "command", "command":
                  f"[ ! -e {shlex.quote(str(d / 'waiting-permission'))} ] && [ ! -e {shlex.quote(str(d / AFTER_REPORT))} ]"
                  f" || {cmd} hook worker-permission-done {q}"}]}]
+    # Budgets: before every tool call, but only a file test unless a window or this worker's budget is set.
+    budget = [{"matcher": "*", "hooks": [{"type": "command", "command":
+               f"[ ! -e {shlex.quote(str(HOME / 'budget.json'))} ] && [ ! -e {shlex.quote(str(d / 'budget_usd'))} ]"
+               f" || {cmd} hook worker-budget {q}"}]}]
     own = {"autoMemoryDirectory": memory} if memory else memory_settings(cwd)
     (d / "settings.json").write_text(json.dumps({**own, "hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-session-start {q}"}]}],
+        "PreToolUse": budget,
         "PermissionRequest": [{"matcher": "*", "hooks": [asking]}],
         "Notification": [{"matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
                           "hooks": [asking]}],
@@ -2856,6 +2864,8 @@ def cmd_wake(args):
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
                  f"someone resumed it outside claudesec")
     quiet = getattr(args, "quiet", False)
+    if not quiet:  # a quiet wake (the secretary's restart) runs no turn: nothing to spend
+        refuse_while_frozen(f"wake {name}")
     instruction = getattr(args, "instruction", None)
     if instruction is None:
         instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
@@ -3174,6 +3184,250 @@ LESSONS = "# 秘书的教训（用户说「复盘」时交给 claudesec worker �
 LESSONS_EN = "# The secretary's lessons (sorted by a claudesec worker at the daily review; reviewed ones move to Done)\n\n"
 
 
+# ---------- budgets: a spending window for everyone, and an optional one per worker ----------
+# budget.json: the window (start, until, an optional USD cap) and, once it has run out, who was
+# stopped. Spend is what every session claudesec runs cost since the start, at list prices
+# (usage_by_owner). Each tool call of a Claude Code worker passes the PreToolUse check below: past
+# 85% of the time or the money it is told to wrap up, once; at 100% the window is frozen and
+# every tool call is refused but the report. Cursor workers aren't covered. While frozen,
+# spawn / wake / delegate refuse. Unfrozen by `budget --add`, a later `--until`, `--off`, or a
+# window booked with --from starting; then each stopped worker is told to carry on.
+BUDGET_SOFT = 0.15   # wrap up with this share of the time or the money left
+
+
+def read_budget():
+    try:
+        return json.loads((HOME / "budget.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_budget(b):
+    path = HOME / "budget.json"
+    if b is None:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.with_name(f".budget.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(b, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def window_spent(b):
+    start = dt.datetime.fromisoformat(b["start"])
+    total = 0.0
+    for per in usage_by_owner(since=start).values():
+        for key, v in per.items():
+            usd = cost_of(v, *key.split("|"))
+            total += usd or 0
+    return total
+
+
+def budget_state(b, now=None):
+    """(state, why, spent) for the window: "off" before its start (or none), "ok", "soft", "over"."""
+    now = now or dt.datetime.now().astimezone()
+    if not b:
+        return "off", "", 0.0
+    start, until = dt.datetime.fromisoformat(b["start"]), dt.datetime.fromisoformat(b["until"])
+    if now < start:
+        return ("over" if b.get("frozen") else "off"), tr("等预约的窗口开始", "waiting for the booked window"), 0.0
+    spent = window_spent(b)
+    if b.get("frozen"):
+        return "over", b.get("frozen_why", ""), spent
+    if now >= until:
+        return "over", tr(f"预算窗口 {until:%H:%M} 到了", f"the budget window ended at {until:%H:%M}"), spent
+    if b.get("usd") and spent >= b["usd"]:
+        return "over", tr(f"预算 {money(b['usd'])} 花完了（已花 {money(spent)}）",
+                          f"the {money(b['usd'])} budget is spent ({money(spent)})"), spent
+    left_time = (until - now).total_seconds() / max(1.0, (until - start).total_seconds())
+    left_money = 1 - spent / b["usd"] if b.get("usd") else 1.0
+    if min(left_time, left_money) <= BUDGET_SOFT:
+        why = tr(f"预算窗口 {until:%H:%M} 结束", f"the budget window ends at {until:%H:%M}") \
+            if left_time <= left_money else \
+            tr(f"预算剩 {money(b['usd'] - spent)}（共 {money(b['usd'])}）", f"{money(b['usd'] - spent)} of {money(b['usd'])} left")
+        return "soft", why, spent
+    return "ok", "", spent
+
+
+def worker_budget_state(name, w):
+    """The same for a worker's own budget (spawn --budget): "ok", "soft" at 85%, "over" at 100%."""
+    cap = w.get("budget_usd")
+    if not cap:
+        return "ok", "", 0.0
+    spent = worker_cost({name: w}).get(name) or 0.0
+    if spent >= cap:
+        return "over", tr(f"你的额度 {money(cap)} 用完了（已花 {money(spent)}）",
+                          f"your {money(cap)} budget is used up ({money(spent)})"), spent
+    if spent >= cap * (1 - BUDGET_SOFT):
+        return "soft", tr(f"你的额度 {money(cap)} 已用到 {money(spent)}", f"you have used {money(spent)} of {money(cap)}"), spent
+    return "ok", "", spent
+
+
+def hook_worker_budget(name):
+    """PreToolUse for a Claude Code worker while a budget is set: tell it to wrap up, or refuse."""
+    data = hook_input()
+    w = read_registry()[1].get(name)
+    if w is None:
+        return
+    b = read_budget()
+    states = [budget_state(b), worker_budget_state(name, w)]
+    over = next(((why, kind) for (st, why, _), kind in zip(states, ("window", "worker")) if st == "over"), None)
+    if over:
+        why, kind = over
+        if kind == "window" and b and not b.get("frozen") and dt.datetime.now().astimezone() >= \
+                dt.datetime.fromisoformat(b["start"]):
+            b.update(frozen=True, frozen_why=why, frozen_at=now())
+            write_budget(b)
+            if secretary_alive():
+                raise_alert(tr(f"[预算] {why}：已冻结，worker 的工具调用都会被拒，秘书不要再派活。"
+                               f"要继续：claudesec budget --add <美元> 或 --until <时间>（要用户定）。",
+                               f"[budget] {why}: frozen; workers' tool calls are refused, don't hand out work. "
+                               f"To go on: claudesec budget --add <USD> or --until <time> (the user decides)."))
+        mark = worker_dir(name) / ("frozen-window" if kind == "window" else "frozen-own")
+        first = not mark.exists()
+        mark.write_text(why)
+        if data.get("tool_name") in ("SendMessage", "ToolSearch"):
+            return  # the report is how it says it stopped (ToolSearch: loading SendMessage, where it's deferred)
+        reason = tr(f"{why}。这次调用没有执行，别的工具也都会被拒；只剩汇报可以做：现在用 SendMessage "
+                    f"（还没加载的话先用 ToolSearch 加载它）给秘书发一条 BLOCKED："
+                    f"ISSUE 写{'预算到点' if kind == 'window' else '额度用完'}、做到了哪、还差什么、改了哪些没提交的文件，"
+                    f"{'问用户要不要追加额度，' if kind == 'worker' else ''}然后结束本轮。",
+                    f"{why}. This call did not run, and every other tool will be refused; only the report is left. "
+                    f"Send the secretary a BLOCKED report with SendMessage now (load it with ToolSearch first if it "
+                    f"isn't loaded): ISSUE says the {'budget ran out' if kind == 'window' else 'budget is used up'}, "
+                    f"how far you got, what's left, any uncommitted changes"
+                    f"{', and asks whether the user adds to it' if kind == 'worker' else ''}; then end your turn.")
+        if first:
+            append_log(name, "budget", f"stopped: {why}")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": reason}}, ensure_ascii=False))
+        return
+    soft = [(why, kind) for (st, why, _), kind in zip(states, ("window", "worker")) if st == "soft"]
+    for why, kind in soft:
+        mark = worker_dir(name) / f"warned-{kind}"
+        tag = (b or {}).get("start", "") if kind == "window" else str(w.get("budget_usd"))
+        if mark.exists() and mark.read_text() == tag:
+            continue  # once per window / budget
+        mark.write_text(tag)
+        text = tr(f"[claudesec 预算] {why}。现在开始收尾：把手上的改动提交，整理已有结论，给秘书发汇报"
+                  f"（{'DONE，或者 BLOCKED 说明还差什么' if kind == 'window' else 'DONE 交差；做不完就 BLOCKED，问用户要不要追加额度'}）。"
+                  f"预计做不完的不要再开新的大块工作。",
+                  f"[claudesec budget] {why}. Wrap up now: commit what you changed, sum up what you have and report to "
+                  f"the secretary ({'DONE, or BLOCKED saying what is left' if kind == 'window' else 'DONE; if it cannot be finished, BLOCKED asking whether the user adds to the budget'}). "
+                  f"Don't start large new pieces of work you can't finish.")
+        append_log(name, "budget", f"told to wrap up: {why}")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}},
+                         ensure_ascii=False))
+        return
+
+
+def refuse_while_frozen(what):
+    """spawn / wake / delegate: no new work while the window is frozen."""
+    st, why, _ = budget_state(read_budget())
+    if st == "over":
+        sys.exit(tr(f"{what}：预算已冻结（{why}），不派新活。要继续：claudesec budget --add <美元> 或 --until <时间>，由用户决定。",
+                    f"{what}: the budget is frozen ({why}); no new work. To go on: claudesec budget --add <USD> or "
+                    f"--until <time>, the user's call."))
+
+
+def resume_frozen(why):
+    """The window is open again: each worker it stopped is told to carry on (pasted into its
+    window; the secretary hears of it too)."""
+    workers = read_registry()[1]
+    stopped = [n for n in workers if (worker_dir(n) / "frozen-window").exists()]
+    alive = alive_windows()
+    text = tr(f"[claudesec] 预算已恢复（{why}）。接着做你被冻结前的活，按规则汇报。",
+              f"[claudesec] The budget is open again ({why}). Carry on with the work you were stopped in, and report as usual.")
+    told = []
+    for n in stopped:
+        (worker_dir(n) / "frozen-window").unlink(missing_ok=True)
+        (worker_dir(n) / "warned-window").unlink(missing_ok=True)
+        w = workers[n]
+        if w.get("window") in alive:
+            with contextlib.suppress(Exception):
+                send_text(n, w, text, by="claudesec")
+                told.append(n)
+    if secretary_alive():
+        raise_alert(tr(f"[预算] 已恢复（{why}）。" + (f"已通知被冻结的 worker 继续：{'、'.join(told)}。" if told else "没有被冻结的 worker。"),
+                       f"[budget] open again ({why}). " + (f"Told the stopped workers to carry on: {', '.join(told)}." if told else "No worker had been stopped.")))
+    return told
+
+
+def cmd_budget(args):
+    """Set, extend, book or end the spending window; with no options, show it."""
+    now_t = dt.datetime.now().astimezone()
+    b = read_budget()
+    if args.off:
+        was = b and b.get("frozen")
+        write_budget(None)
+        print(tr("预算窗口已关。", "Budget window off."))
+        if was:
+            resume_frozen(tr("预算窗口已关", "budget window turned off"))
+        return
+    if not (args.until or args.usd or args.add or args.start):
+        if not b:
+            print(tr("没有预算窗口。", "No budget window."))
+            return
+        st, why, spent = budget_state(b)
+        print(tr(f"预算窗口：{show_time(b['start'])} – {show_time(b['until'])}"
+                 + (f"，上限 {money(b['usd'])}" if b.get("usd") else "") + f"；已花 {money(spent)}；状态 {st}"
+                 + (f"（{why}）" if why else ""),
+                 f"Budget window: {show_time(b['start'])} – {show_time(b['until'])}"
+                 + (f", cap {money(b['usd'])}" if b.get("usd") else "") + f"; spent {money(spent)}; state {st}"
+                 + (f" ({why})" if why else "")))
+        return
+    try:
+        until = parse_when(args.until, now_t) if args.until else None
+        start = parse_when(args.start, now_t) if args.start else None
+    except ValueError as e:
+        sys.exit(str(e))
+    was_frozen = bool(b and b.get("frozen"))
+    if args.add:
+        if not b:
+            sys.exit(tr("没有预算窗口可以追加；先 claudesec budget --until <时间> [--usd N]。",
+                        "No budget window to add to; set one with claudesec budget --until <time> [--usd N]."))
+        if not until and dt.datetime.fromisoformat(b["until"]) <= now_t:
+            sys.exit(tr(f"窗口已在 {show_time(b['until'])} 到点，追加金额时要同时给新的 --until。",
+                        f"The window ended at {show_time(b['until'])}; give a new --until along with --add."))
+        b["usd"] = (b.get("usd") or window_spent(b)) + args.add
+        if until:
+            b["until"] = until.isoformat(timespec="seconds")
+    elif start and start > now_t:
+        # booked: a window that opens later; a frozen one stays frozen until then
+        if not until or until <= start:
+            sys.exit(tr("--from 要配一个在它之后的 --until。", "--from needs an --until after it."))
+        b = {"start": start.isoformat(timespec="seconds"), "until": until.isoformat(timespec="seconds"),
+             "usd": args.usd, "frozen": was_frozen, "frozen_why": (b or {}).get("frozen_why", ""), "set_at": now()}
+        write_budget(b)
+        with reminders() as data:  # the reminder checker opens it on time
+            rid = f"r{data['next_id']}"
+            data["next_id"] += 1
+            data["items"].append({"id": rid, "due": b["start"], "target": "secretary", "action": "budget-open",
+                                  "text": tr("预约的预算窗口开始", "the booked budget window opens"),
+                                  "every": None, "status": "pending", "created_at": now()})
+        print(tr(f"预约了预算窗口 {show_time(b['start'])} – {show_time(b['until'])}"
+                 + (f"，上限 {money(args.usd)}" if args.usd else "") + (f"；在那之前保持冻结（{rid} 到点解除）" if was_frozen else ""),
+                 f"Booked a budget window {show_time(b['start'])} – {show_time(b['until'])}"
+                 + (f", cap {money(args.usd)}" if args.usd else "") + (f"; frozen until then ({rid} opens it)" if was_frozen else "")))
+        return
+    else:
+        if not until:
+            sys.exit(tr("要给 --until（截止时间）。", "Give --until (when the window ends)."))
+        if b and not was_frozen and dt.datetime.fromisoformat(b["start"]) <= now_t:
+            b.update(until=until.isoformat(timespec="seconds"), usd=args.usd if args.usd else b.get("usd"))
+        else:
+            b = {"start": now_t.isoformat(timespec="seconds"), "until": until.isoformat(timespec="seconds"),
+                 "usd": args.usd, "frozen": False, "set_at": now()}
+    b["frozen"] = False
+    b.pop("frozen_why", None)
+    write_budget(b)
+    st, why, spent = budget_state(b)
+    print(tr(f"预算窗口：到 {show_time(b['until'])}" + (f"，上限 {money(b['usd'])}" if b.get("usd") else "")
+             + f"；已花 {money(spent)}", f"Budget window: until {show_time(b['until'])}"
+             + (f", cap {money(b['usd'])}" if b.get("usd") else "") + f"; spent {money(spent)}"))
+    if was_frozen:
+        resume_frozen(tr("用户追加了预算", "the user extended the budget"))
+
+
 def cmd_lesson(args):
     path = HOME / "lessons.md"
     text = path.read_text() if path.exists() else tr(LESSONS, LESSONS_EN)
@@ -3383,7 +3637,16 @@ def cmd_remind(args):
 
 
 def deliver_reminder(r):
-    """Wake the secretary with a due reminder, through the alert channel."""
+    """Wake the secretary with a due reminder, through the alert channel. A booked budget window
+    (budget --from) opens this way instead."""
+    if r.get("action") == "budget-open":
+        b = read_budget()
+        if b and b.get("frozen"):
+            b.update(frozen=False)
+            b.pop("frozen_why", None)
+            write_budget(b)
+            resume_frozen(tr("预约的预算窗口开始", "the booked window opened"))
+        return "budget window opened"
     due = dt.datetime.fromisoformat(r["due"])
     late = (dt.datetime.now().astimezone() - due).total_seconds()
     late_note = tr(f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）", f", {int(late // 60)} minutes late (the "
@@ -3610,6 +3873,9 @@ def send_text(name, w, text, by="secretary"):
     head = (tr("[claudesec] 秘书转来的消息（不是用户在你窗口里打的字）：",
                "[claudesec] A message passed on by the secretary (not the user typing in your window):")
             if by == "secretary" else
+            tr("[claudesec] claudesec 发来的系统消息（不是用户在你窗口里打的字）：",
+               "[claudesec] A notice from claudesec itself (not the user typing in your window):")
+            if by == "claudesec" else
             tr(f"[claudesec] 委托你的 worker {by} 发来的消息（不是用户在你窗口里打的字）：",
                f"[claudesec] A message from {by}, the worker that delegated to you (not the user typing in your window):"))
     subprocess.run(["tmux", "load-buffer", "-b", "claudesec-send", "-"], input=f"{head}\n{text}", text=True, check=True)
@@ -3715,6 +3981,7 @@ def archived_delegation(name):
 
 
 def cmd_delegate(args):
+    refuse_while_frozen(f"NOT DELEGATED: delegate {args.name}")
     workers = read_registry()[1]
     boss = args.boss
     if boss not in workers:
@@ -4463,6 +4730,7 @@ HOOKS = {
     "cursor-prompt": hook_cursor_prompt,
     "cursor-stop": hook_cursor_stop,
     "cursor-finish": hook_cursor_finish,
+    "worker-budget": hook_worker_budget,
     "cursor-exit": hook_cursor_exit,
     "cursor-launch": hook_cursor_launch,
 }
@@ -4489,6 +4757,9 @@ def main():
     s.add_argument("--agent", choices=["claude", "cursor"], default="claude")
     s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("budget"); s.add_argument("--until"); s.add_argument("--from", dest="start")
+    s.add_argument("--usd", type=float); s.add_argument("--add", type=float); s.add_argument("--off", action="store_true")
+    s.set_defaults(fn=cmd_budget)
     s = sub.add_parser("cost"); s.add_argument("name", nargs="?"); s.add_argument("--today", action="store_true")
     s.add_argument("--since"); s.add_argument("--until"); s.set_defaults(fn=cmd_cost)
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)

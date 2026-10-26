@@ -459,7 +459,7 @@ class English(Dashboard):
             "asks": {"status": "NEED_DECISION", "task": "t", "pending_ask": "A or B?", "window": "@1"},
             "zz": {"status": "SHELVED", "task": "t"}}}))
         title, blocks = self.cs.status_blocks(48)
-        self.assertEqual(plain(title).split(), ["Workers", "you", "1", "shelved", "1"])
+        self.assertEqual(plain(title).split(), ["Workers", "$today", "you", "1", "shelved", "1"])  # $ is today's
         body = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
         self.assertIn("needs your call", body[0])
         self.assertTrue(body[-1].startswith("shelved 1"))

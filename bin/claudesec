@@ -864,14 +864,13 @@ def status_blocks(cols, now=None):
     counts = [sum(1 for r in rows if r[0] == g) for g in range(4)]
     labels = tr(("等你", "出错", "在做", "做完", "搁置"), ("you", "errors", "working", "done", "shelved"))
     right = "".join(f"{label} {n}  " for label, n in zip(labels, counts) if n)
-    title = bar(tr(" 任务进展", " Workers"), right + f"{labels[4]} {len(shelved)} ", cols)
+    title = bar(tr(" 任务进展 $今天", " Workers $today"), right + f"{labels[4]} {len(shelved)} ", cols)
     blocks = []
     name_w = min(max((width(r[2]) for r in rows), default=0), 16)
     word_w = max((width(r[4]) for r in rows), default=0)
     tok_w = max((len(usage_word(r[8])) for r in rows), default=0)
     model_w = max((width(r[9]) for r in rows), default=0)
-    spent = worker_cost(active)
-    moneys = {r[2]: money_word(spent.get(r[2]), active[r[2]].get("budget_usd")) for r in rows}
+    moneys = worker_moneys(active)
     money_w = max((width(m) for m in moneys.values()), default=0)
     for i, (group, _, name, mark, word, color, summary, age, use, model) in enumerate(rows):
         if i and group != rows[i - 1][0]:
@@ -2502,6 +2501,18 @@ def money_word(usd, budget=None):
     return f"{spent} / {money(float(budget))}" if budget else spent
 
 
+def worker_moneys(workers):
+    """{name: $ column}: today's spend (the user, 2026-10-26: a worker's lifetime total read as
+    today's), or, for one with a budget, its spend against the budget, which counts it all.
+    `claudesec cost` has the totals."""
+    today = dt.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    spent_today = worker_cost(workers, since=today)
+    budgeted = {n: w for n, w in workers.items() if w.get("budget_usd")}
+    spent_all = worker_cost(budgeted) if budgeted else {}
+    return {n: money_word(spent_all.get(n), w["budget_usd"]) if n in budgeted else money_word(spent_today.get(n))
+            for n, w in workers.items()}
+
+
 def usage_word(use):
     """A worker's token column: everything that went through the model, cache reads included."""
     return "-" if use is None else short_count(sum(use))
@@ -3041,10 +3052,10 @@ def cmd_status(args):
 
 def print_workers(focus, workers):
     alive = alive_windows()
-    rows = [("", "worker", *tr(("模型", "状态", "距今", "token", "$", "最近", "等你？"),
-                               ("model", "status", "ago", "tokens", "$", "latest", "you?")))]
+    rows = [("", "worker", *tr(("模型", "状态", "距今", "token", "$今天", "最近", "等你？"),
+                               ("model", "status", "ago", "tokens", "$ today", "latest", "you?")))]
     usage = worker_usage(workers)
-    spent = worker_cost(workers)
+    moneys = worker_moneys(workers)
     for name, w in workers.items():
         status = w["status"]
         if status in LABELS:
@@ -3062,7 +3073,7 @@ def print_workers(focus, workers):
         if w.get("delegated_by"):
             summary = tr(f"[为 {w['delegated_by']}] ", f"[for {w['delegated_by']}] ") + summary
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
-                     status, age, usage_word(usage[name]), money_word(spent[name], w.get("budget_usd")),
+                     status, age, usage_word(usage[name]), moneys[name],
                      summary[:48], tr("← 是", "← yes") if w["status"] in WAITING else ""))
     print_rows(rows)
 

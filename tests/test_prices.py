@@ -109,3 +109,14 @@ class Cost(unittest.TestCase):
         self.assertEqual(self.cs.parse_moment("16:00", at).day, 25)  # later today hasn't come: yesterday's
         self.assertEqual(self.cs.parse_moment("3h", at), at - dt.timedelta(hours=3))
         self.assertEqual(self.cs.parse_moment("2026-10-25", at).date(), dt.date(2026, 10, 25))
+
+
+class MoneyColumn(Cost):
+    def test_today_by_default_and_budget_against_all(self):
+        (self.project / "s1.jsonl").write_text(
+            self.line("old", "claude-opus-5-5", out=10**6, ts="2026-01-01T01:00:00Z")
+            + self.line("new", "claude-opus-5-5", out=10**5, ts=__import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc).isoformat()))
+        m = self.cs.worker_moneys({"a": {"session": "s1"}, "b": {"session": "s1", "budget_usd": 50}})
+        self.assertEqual(m["a"], "$2.0")  # today only: 0.1M output at $20
+        self.assertEqual(m["b"], "$22.0 / $50.0")  # against the budget: all of it

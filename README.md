@@ -77,6 +77,13 @@ If you already have your own save hook, make it skip the sessions marked `on` in
 To check: `python3 contrib/resurrect-agent-commands.py --check` should show claudesec's panes as
 `(not saved: @resurrect-skip)`.
 
+### Shift+Enter for a new line
+
+`claudesec` turns on tmux's `extended-keys` (and `extkeys` for `xterm*` terminals), so Shift+Enter
+reaches Claude Code inside tmux; reattach once after the first start. The terminal you run tmux in must
+send Shift+Enter apart from Enter: Ghostty, kitty, WezTerm, foot and iTerm2 do (Ghostty with no setup);
+GNOME Terminal and other VTE terminals don't, whatever tmux does. There, Alt+Enter or Ctrl+J make a new line.
+
 ## Use
 
     claudesec                  # switch to tmux session "claudesec" (created if missing, resuming the last secretary)

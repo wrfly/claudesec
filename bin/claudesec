@@ -29,6 +29,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
   claudesec wait N                       the delegator waits for N's final report (background Bash)
   claudesec status                       one-screen table of workers
+  claudesec cost [NAME] [--today | --since T --until T]   spend by worker and model, at list prices
+                                    (T: 3h / 2d ago, 09:00 today, 2026-10-25, or ISO)
   claudesec log NAME [-n N]              last N report entries of a worker
   claudesec interrupt NAME               send Escape to a worker's window
   claudesec close NAME                   kill a worker's window, drop it from the registry
@@ -792,23 +794,27 @@ def short_model(model):
     return m[1] + (f" {ctx[1]}" if ctx else "")
 
 
-def status_line(cols, focused, name, mark, word, color, summary, age, tokens, model, widths):
-    """A worker's folded line: name (summary) status age tokens model, the last four in columns
+def status_line(cols, focused, name, mark, word, color, summary, age, tokens, model, widths, money=""):
+    """A worker's folded line: name (summary) status age tokens $ model, the last ones in columns
     at the right. Short of room, the tokens go first (the unfolded lines have them), then the
-    model; then the summary shrinks to nothing. The name and status stay."""
-    name_w, word_w, tok_w, model_w = widths
+    model, then the $; then the summary shrinks to nothing. The name and status stay."""
+    name_w, word_w, tok_w, model_w, *rest = widths
+    money_w = rest[0] if rest else width(money)
     head = [(BOLD + ";" + color if color else BOLD, mark), ("", " "),
             (BOLD + (";4" if focused else ""), cut(name, name_w).ljust(name_w))]
     status = [("", "  "), (color, word + " " * (word_w - width(word)))]
-    tails = [[("", "  "), (DIM, f"{age:>3}")], [("", "  "), (DIM, f"{tokens:>{tok_w}}")]]
+    tails = {"age": [("", "  "), (DIM, f"{age:>3}")], "tokens": [("", "  "), (DIM, f"{tokens:>{tok_w}}")]}
+    if money_w:
+        tails["money"] = [("", "  "), (DIM, f"{money:>{money_w}}")]
     if model_w:
-        tails.append([("", "  "), (DIM, model + " " * (model_w - width(model)))])
+        tails["model"] = [("", "  "), (DIM, model + " " * (model_w - width(model)))]
+    drop = [k for k in ("tokens", "model", "money") if k in tails]
     while True:
-        right = status + [seg for t in tails for seg in t]
+        right = status + [seg for t in tails.values() for seg in t]
         room = cols - sum(width(t) for _, t in head + right)
-        if room >= 12 or len(tails) == 1:
+        if room >= 12 or not drop:
             break
-        tails.pop(1)  # tokens, then the model
+        del tails[drop.pop(0)]
     if room >= 8:  # " (" + at least a few characters + ")"
         text = cut(summary, room - 3)
         text = text if text == summary else cut(summary, room - 4) + "…"
@@ -856,11 +862,14 @@ def status_blocks(cols, now=None):
     word_w = max((width(r[4]) for r in rows), default=0)
     tok_w = max((len(usage_word(r[8])) for r in rows), default=0)
     model_w = max((width(r[9]) for r in rows), default=0)
+    spent = worker_cost(active)
+    moneys = {r[2]: money_word(spent.get(r[2]), active[r[2]].get("budget_usd")) for r in rows}
+    money_w = max((width(m) for m in moneys.values()), default=0)
     for i, (group, _, name, mark, word, color, summary, age, use, model) in enumerate(rows):
         if i and group != rows[i - 1][0]:
             blocks.append(fixed([]))
         head = status_line(cols, name == focus, name, mark, word, color, summary, age, usage_word(use), model,
-                           (name_w, word_w, tok_w, model_w))
+                           (name_w, word_w, tok_w, model_w, money_w), money=moneys[name])
         more = [[("", "  ")] + line for line in wrap([(DIM, summary)], cols - 2)]
         if model:
             more.append([("", "  "), (DIM, tr(f"模型 {model}", f"model {model}"))])
@@ -2443,6 +2452,36 @@ def short_count(n):
     return str(n)
 
 
+def worker_cost(workers, since=None, until=None):
+    """{worker name: USD spent, or None}: None for a Cursor worker, one with no session yet, or
+    one whose tokens are all on unpriced models."""
+    sids = {n: w.get("session") for n, w in workers.items() if w.get("session") and not is_cursor(w)}
+    buckets = session_buckets(set(sids.values()))
+    out = {}
+    for name in workers:
+        total = None
+        for key, v in (buckets.get(sids.get(name)) or {}).items():
+            if not in_period(key, since, until):
+                continue
+            _, model, speed = key.split("|")
+            usd = cost_of(v, model, speed)
+            if usd is not None:
+                total = (total or 0) + usd
+        out[name] = total
+    return out
+
+
+def money(usd):
+    """$0.42, $6.2, $123: dollars in about five characters."""
+    return f"${usd:.2f}" if usd < 1 else f"${usd:.1f}" if usd < 100 else f"${usd:.0f}"
+
+
+def money_word(usd, budget=None):
+    """A worker's $ column: what it spent, against its budget when it has one ("$6.2 / $10")."""
+    spent = "-" if usd is None else money(usd)
+    return f"{spent} / {money(float(budget))}" if budget else spent
+
+
 def usage_word(use):
     """A worker's token column: everything that went through the model, cache reads included."""
     return "-" if use is None else short_count(sum(use))
@@ -2980,9 +3019,10 @@ def cmd_status(args):
 
 def print_workers(focus, workers):
     alive = alive_windows()
-    rows = [("", "worker", *tr(("模型", "状态", "距今", "token", "最近", "等你？"),
-                               ("model", "status", "ago", "tokens", "latest", "you?")))]
+    rows = [("", "worker", *tr(("模型", "状态", "距今", "token", "$", "最近", "等你？"),
+                               ("model", "status", "ago", "tokens", "$", "latest", "you?")))]
     usage = worker_usage(workers)
+    spent = worker_cost(workers)
     for name, w in workers.items():
         status = w["status"]
         if status in LABELS:
@@ -3000,7 +3040,8 @@ def print_workers(focus, workers):
         if w.get("delegated_by"):
             summary = tr(f"[为 {w['delegated_by']}] ", f"[for {w['delegated_by']}] ") + summary
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
-                     status, age, usage_word(usage[name]), summary[:48], tr("← 是", "← yes") if w["status"] in WAITING else ""))
+                     status, age, usage_word(usage[name]), money_word(spent[name], w.get("budget_usd")),
+                     summary[:48], tr("← 是", "← yes") if w["status"] in WAITING else ""))
     print_rows(rows)
 
 
@@ -3230,6 +3271,70 @@ def show_every(secs):
 def show_time(iso):
     t = dt.datetime.fromisoformat(iso)
     return f"{t.astimezone():%m-%d %H:%M}" + paren(f"{t.astimezone(dt.timezone.utc):%H:%MZ}").rstrip()
+
+
+def parse_moment(when, at=None):
+    """A moment for a cost period, which lies in the past: like parse_when, but HH:MM is today's
+    (not the next one), YYYY-MM-DD is that day's start, and 2h / 3d (or -2h) count back from now."""
+    at = at or dt.datetime.now().astimezone()
+    w = when.strip()
+    m = re.fullmatch(r"-?(\d+)([mhd])", w)
+    if m:
+        return at - dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m[2]]: int(m[1])})
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", w):
+        return dt.datetime.fromisoformat(w).replace(tzinfo=at.tzinfo)
+    t = parse_when(w, at)
+    if re.fullmatch(r"\d{1,2}:\d{2}[Zz]?", w) and t > at:
+        t -= dt.timedelta(days=1)  # the HH:MM that has been, today
+    return t
+
+
+def cmd_cost(args):
+    """What claudesec's sessions cost, by worker and model: every session it ran (the secretary,
+    shelved and closed workers, subagents with theirs), in the period asked for. Computed from the
+    transcripts and the price table; nothing is asked of a model."""
+    now = dt.datetime.now().astimezone()
+    try:
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0) if args.today else \
+            parse_moment(args.since, now) if args.since else None
+        until = parse_moment(args.until, now) if args.until else None
+    except ValueError as e:
+        sys.exit(str(e))
+    usage = usage_by_owner(since, until)
+    if args.name:
+        usage = {k: v for k, v in usage.items() if k == args.name}
+    span = (tr("今天", "today") if args.today else
+            f"{since:%m-%d %H:%M} – {until:%m-%d %H:%M}" if since and until else
+            tr(f"{since:%m-%d %H:%M} 起", f"since {since:%m-%d %H:%M}") if since else
+            tr(f"截至 {until:%m-%d %H:%M}", f"until {until:%m-%d %H:%M}") if until else tr("全部", "all time"))
+    if not usage:
+        print(tr(f"{span}：没有花费记录。", f"{span}: nothing spent."))
+        return
+    head = tr(("worker", "模型", "输入", "缓存写5m", "缓存写1h", "缓存读", "输出", "USD"),
+              ("worker", "model", "input", "write 5m", "write 1h", "read", "output", "USD"))
+    rows, grand, unpriced = [head], 0.0, set()
+    per_owner = []
+    for owner, per in usage.items():
+        total = sum(c for c in (cost_of(v, *k.split("|")) for k, v in per.items()) if c is not None)
+        per_owner.append((total, owner, per))
+    for total, owner, per in sorted(per_owner, key=lambda x: -x[0]):
+        for i, (key, v) in enumerate(sorted(per.items(), key=lambda kv: -sum(kv[1]))):
+            model, speed = key.split("|")
+            usd = cost_of(v, model, speed)
+            if usd is None:
+                unpriced.add(model)
+            rows.append((owner if i == 0 else "", short_model(model) + (" fast" if speed == "fast" else ""),
+                         *map(short_count, v), tr("未计价", "unpriced") if usd is None else money(usd)))
+        if len(per) > 1:
+            rows.append(("", tr("小计", "subtotal"), "", "", "", "", "", money(total)))
+        grand += total
+    rows.append((tr("合计", "total"), "", "", "", "", "", "", money(grand)))
+    print(tr(f"花费（{span}，按官方单价折算，不含未计价的模型）：", f"Spend ({span}, at list prices, unpriced models left out):"))
+    print_rows(rows)
+    if unpriced:
+        print(tr("未计价（单价表里没有，不算进合计；可在 config.json 的 prices 里补）：",
+                 "Unpriced (not in the price table, left out of the total; add them under prices in config.json): ")
+              + ", ".join(sorted(unpriced)))
 
 
 def cmd_remind(args):
@@ -4384,6 +4489,8 @@ def main():
     s.add_argument("--agent", choices=["claude", "cursor"], default="claude")
     s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("cost"); s.add_argument("name", nargs="?"); s.add_argument("--today", action="store_true")
+    s.add_argument("--since"); s.add_argument("--until"); s.set_defaults(fn=cmd_cost)
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)
     s.set_defaults(fn=cmd_log)
     s = sub.add_parser("interrupt"); s.add_argument("name"); s.set_defaults(fn=cmd_interrupt)

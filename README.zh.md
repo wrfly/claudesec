@@ -64,6 +64,7 @@ claudesec 的 pane 显示 `(not saved: @resurrect-skip)`。
     claudesec --new            # 秘书从头开始（新会话）
     claudesec --restart        # 重新加载秘书的 prompt 和 hook，对话和 worker 都不受影响
     claudesec -d               # 只在后台起好，不切过去
+    claudesec cost --today      # 今天各 worker、各模型花了多少（按官方单价折算；claudesec cost 名字 --since 3h）
     claudesec dashboard off    # 关掉秘书右侧的队列 / 进展 / 通知面板（on 打开）
     claudesec notice add --from W "去 W 窗口说 push"   # 要用户去做的事；notice done N 标完成
     claudesec show 46          # 决策队列或通知 #46 的全文（面板里点一下那条也会展开）

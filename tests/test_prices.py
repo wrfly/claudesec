@@ -46,3 +46,66 @@ class Prices(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Cost(unittest.TestCase):
+    """`claudesec cost` and the $ column."""
+
+    def setUp(self):
+        import os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "state"
+        self.home.mkdir()
+        self.cs = load(self.home)
+        self.saved = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.root / "config")
+        self.project = self.root / "config" / "projects" / "-p"
+        self.project.mkdir(parents=True)
+        (self.home / "config.json").write_text(json.dumps({"language": "en"}))
+
+    def tearDown(self):
+        import os
+        if self.saved is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.saved
+        self.tmp.cleanup()
+
+    def line(self, mid, model, w1h=0, out=0, ts="2026-10-26T01:00:00Z"):
+        return json.dumps({"type": "assistant", "timestamp": ts, "message": {"id": mid, "model": model, "usage": {
+            "input_tokens": 0, "cache_creation_input_tokens": w1h, "cache_read_input_tokens": 0,
+            "output_tokens": out, "cache_creation": {"ephemeral_1h_input_tokens": w1h}}}}) + "\n"
+
+    def test_cost_lists_priced_and_unpriced_by_worker(self):
+        (self.project / "s1.jsonl").write_text(self.line("a", "claude-opus-5-5", w1h=10**6, out=10**6)
+                                               + self.line("b", "deepseek-v4-pro", out=500))
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "w": {"status": "PROGRESS", "session": "s1", "dir": "/tmp", "task": "t", "budget_usd": 50}}}))
+        import contextlib
+        import io
+        import sys
+        out, saved = io.StringIO(), sys.argv
+        sys.argv = ["claudesec", "cost"]
+        try:
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+        finally:
+            sys.argv = saved
+        text = out.getvalue()
+        self.assertIn("$28.0", text)  # 1M 1h writes at $8 + 1M output at $20
+        self.assertIn("unpriced", text)
+        self.assertIn("deepseek-v4-pro", text.splitlines()[-1])
+        spent = self.cs.worker_cost({"w": {"session": "s1"}})["w"]
+        self.assertAlmostEqual(spent, 28.0)
+        self.assertEqual(self.cs.money_word(spent, 50), "$28.0 / $50.0")
+        self.assertEqual(self.cs.money_word(None), "-")
+
+    def test_moments_for_a_cost_period_lie_in_the_past(self):
+        import datetime as dt
+        at = dt.datetime(2026, 10, 26, 15, 0).astimezone()
+        self.assertEqual(self.cs.parse_moment("09:00", at).hour, 9)
+        self.assertEqual(self.cs.parse_moment("09:00", at).day, 26)
+        self.assertEqual(self.cs.parse_moment("16:00", at).day, 25)  # later today hasn't come: yesterday's
+        self.assertEqual(self.cs.parse_moment("3h", at), at - dt.timedelta(hours=3))
+        self.assertEqual(self.cs.parse_moment("2026-10-25", at).date(), dt.date(2026, 10, 25))

@@ -81,8 +81,8 @@ To check: `python3 contrib/resurrect-agent-commands.py --check` should show clau
 
 `claudesec` turns on tmux's `extended-keys` (and `extkeys` for `xterm*` terminals), so Shift+Enter
 reaches Claude Code inside tmux; reattach once after the first start. The terminal you run tmux in must
-send Shift+Enter apart from Enter: Ghostty, kitty, WezTerm, foot and iTerm2 do (Ghostty with no setup);
-GNOME Terminal and other VTE terminals don't, whatever tmux does. There, Alt+Enter or Ctrl+J make a new line.
+send Shift+Enter apart from Enter: Ghostty and foot do with no setup (kitty and WezTerm speak their own
+keyboard protocol, which tmux 3.4 doesn't pass on, and need a key mapping); GNOME Terminal and other VTE terminals don't, whatever tmux does. There, Alt+Enter or Ctrl+J make a new line.
 
 ## Use
 

@@ -62,8 +62,8 @@ claudesec 的 pane 显示 `(not saved: @resurrect-skip)`。
 ### Shift+Enter 换行
 
 `claudesec` 启动时会打开 tmux 的 `extended-keys`（并给 `xterm*` 终端加 `extkeys`），Shift+Enter 才能穿过 tmux 到达 Claude Code；
-第一次启动后要断开 tmux 再接回来一次。外面跑 tmux 的终端还得能把 Shift+Enter 和 Enter 分开发：Ghostty、kitty、WezTerm、foot、
-iTerm2 可以（Ghostty 不用配置）；GNOME Terminal 等 VTE 系的终端不行，tmux 怎么设都没用，在那里用 Alt+Enter 或 Ctrl+J 换行。
+第一次启动后要断开 tmux 再接回来一次。外面跑 tmux 的终端还得能把 Shift+Enter 和 Enter 分开发：Ghostty、foot 不用配置就行
+（kitty、WezTerm 用的是自家键盘协议，tmux 3.4 不转，要另配按键映射）；GNOME Terminal 等 VTE 系的终端不行，tmux 怎么设都没用，在那里用 Alt+Enter 或 Ctrl+J 换行。
 
 ## 使用
 

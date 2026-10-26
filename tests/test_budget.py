@@ -122,3 +122,44 @@ class Budget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerBudgetCommands(Budget):
+    """spawn --budget refuses Cursor; budget --worker raises it and lets a stopped worker go on."""
+
+    def run_cli(self, *argv, stdin=""):
+        out, saved_argv, saved_stdin = io.StringIO(), sys.argv, sys.stdin
+        sys.argv, sys.stdin = ["claudesec", *argv], io.StringIO(stdin)
+        try:
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+        return out.getvalue()
+
+    def test_budget_is_for_claude_workers_only(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("spawn", "c", "--agent", "cursor", "--budget", "5", stdin="t")
+        self.assertIn("only for Claude Code workers", str(e.exception.code))
+        with self.assertRaises(SystemExit) as e:
+            self.run_cli("delegate", "w", "--name", "c", "--budget", "5", stdin="t")
+        self.assertIn("NOT DELEGATED", str(e.exception.code))
+
+    def test_raising_a_budget_lets_the_stopped_worker_go_on(self):
+        reg = json.loads((self.home / "registry.json").read_text())
+        reg["workers"]["w"]["budget_usd"] = 10
+        (self.home / "registry.json").write_text(json.dumps(reg))
+        self.cs.set_worker_budget_marker("w", 10)
+        self.spent = 10.5
+        self.hook()  # stopped
+        self.assertTrue((self.cs.worker_dir("w") / "frozen-own").exists())
+        told = []
+        self.cs.send_text = lambda name, w, text, by="secretary": told.append((name, by))
+        self.cs.alive_windows = lambda: {"@1"}
+        out = self.run_cli("budget", "--worker", "w", "--add", "5")
+        self.assertIn("$15.0", out)
+        self.assertEqual(json.loads((self.home / "registry.json").read_text())["workers"]["w"]["budget_usd"], 15)
+        self.assertEqual(told, [("w", "claudesec")])
+        self.assertFalse((self.cs.worker_dir("w") / "frozen-own").exists())
+        self.run_cli("budget", "--worker", "w", "--off")
+        self.assertFalse((self.cs.worker_dir("w") / "budget_usd").exists())

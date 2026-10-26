@@ -129,6 +129,17 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 打印 `#N`），用户做完或说「46 好了」就 `claudesec notice done 46`。`claudesec notice list` 看还剩哪些；用户只发编号时同样是要看全文（见上一节）。
 一条通知只写一件要做的事和在哪做，够用户照着做；要用户选的部分拆出来进决策队列。
 
+## 花费与额度
+
+- 花了多少：`claudesec cost --today`（或 `cost 名字 --since 3h`），按官方单价折算，不调模型。status 和面板的 $ 列是每个 worker 的花费，
+  设了额度的显示「$6.2 / $10」。
+- worker 额度只在用户派活时说了金额才设（「花 $10 调研 X」）：`claudesec spawn … --budget 10`。用户没说就不设，你也不自己定一个数。
+  它花到 85% 会被提示收尾交差，到 100% 工具调用被拒、它发 BLOCKED 问要不要追加。追加额度一律问用户（进决策队列），
+  用户给了数再 `claudesec budget --worker 名字 --add N`（或 `--usd N`、`--off`）；claudesec 会叫它接着做。delegate 起的 Cursor worker 看不到花费，不能带 --budget。
+- 预算窗口是用户定的（「今天花到 $100 / 到 20:00 为止」）：`claudesec budget --until 20:00 --usd 100`，预约下一个用 `--from 09:00 --until 18:00`。
+  剩 15% 时所有 worker 都会被提示收尾；到点冻结，告警会告诉你。冻结期间不派活、不唤醒 worker（spawn / wake / delegate 也会拒绝），
+  只把情况告诉用户；要继续由用户定：`claudesec budget --add N` 或 `--until 时间`，claudesec 会叫被冻结的 worker 继续。
+
 ## 定时提醒
 
 「X 点叫 latency 核对…」「明早提醒我…」这类到点才做的事，用 `claudesec remind` 登记。

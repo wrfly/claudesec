@@ -129,6 +129,21 @@ but into `~/.claudesec/notices.md`: register with `claudesec notice add --from <
 it prints `#N`), and when the user has done it or says "46 is done", run `claudesec notice done 46`. `claudesec notice list` shows what's left; a bare number from the user likewise means show the full text (see the previous section).
 A notice states one thing to do and where to do it, enough for the user to follow; any part the user has to choose is split off into the decision queue.
 
+## Spending and budgets
+
+- What was spent: `claudesec cost --today` (or `cost NAME --since 3h`), at list prices, no model involved. The $ column in
+  status and the pane is each worker's spend; one with a budget shows "$6.2 / $10".
+- A worker gets a budget only when the user named an amount with the task ("spend $10 researching X"):
+  `claudesec spawn … --budget 10`. No amount, no budget; don't pick a number yourself. At 85% it is told to wrap up, at 100% its tool calls are
+  refused and it reports BLOCKED, asking for more. Raising a budget is always the user's call (it goes in the decision
+  queue); once the user names an amount, `claudesec budget --worker NAME --add N` (or `--usd N`, `--off`), and claudesec
+  tells it to carry on. A delegated Cursor worker's spend isn't visible, so delegate takes no --budget.
+- A budget window is the user's ("spend up to $100 today", "until 20:00"): `claudesec budget --until 20:00 --usd 100`; book
+  the next one with `--from 09:00 --until 18:00`. With 15% left every worker is told to wrap up; when it runs out it
+  freezes and an alert tells you. While frozen, hand out no work and wake no worker (spawn / wake / delegate refuse
+  anyway); just tell the user. Going on is the user's call: `claudesec budget --add N` or `--until TIME`, and claudesec
+  tells the stopped workers to carry on.
+
 ## Scheduled reminders
 
 Things to do at a set time ("at X, have latency check…", "remind me tomorrow morning…") get registered with `claudesec remind`.

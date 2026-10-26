@@ -2218,23 +2218,49 @@ def transcript(sid):
 
 
 USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+# What a response is billed for, in order: input, cache write (5-minute TTL), cache write (1-hour TTL),
+# cache read, output. The two writes cost different prices (1.25x and 2x input).
+USAGE_PARTS = 5
+
+
+def response_parts(usage):
+    """A response's usage as the USAGE_PARTS counts. A transcript older than the TTL split
+    counts every cache write as 5-minute, the default."""
+    write = int(usage.get("cache_creation_input_tokens") or 0)
+    split = usage.get("cache_creation") or {}
+    w1h = int(split.get("ephemeral_1h_input_tokens") or 0)
+    w5m = int(split.get("ephemeral_5m_input_tokens") or 0) if split else write
+    return [int(usage.get("input_tokens") or 0), w5m, w1h, int(usage.get("cache_read_input_tokens") or 0),
+            int(usage.get("output_tokens") or 0)]
+
+
+def usage_key(entry, message):
+    """A bucket: the local hour the response came in, its model and its speed."""
+    try:
+        hour = dt.datetime.fromisoformat(str(entry.get("timestamp", "")).replace("Z", "+00:00")).astimezone()
+        hour = hour.strftime("%Y-%m-%dT%H")
+    except ValueError:
+        hour = "unknown"
+    speed = (message.get("usage") or {}).get("speed") or "standard"
+    return f"{hour}|{message.get('model') or 'unknown'}|{speed}"
 
 
 def file_usage(path, seen):
     """Token usage in a transcript, read on from where `seen` (this file's cache entry) left off:
-    {"offset", "total": [4 sums], "last_id", "last": [4]}. A response streamed in several
-    content blocks writes one line per block, each with the same message id and usage, so a line
-    with the previous one's id replaces its usage instead of adding to it."""
+    {"offset", "buckets": {hour|model|speed: [USAGE_PARTS]}, "last_id", "last_key", "last"}. A response
+    streamed in several content blocks writes one line per block, each with the same message id
+    and usage, so a line with the previous one's id replaces its usage instead of adding to it."""
     size = path.stat().st_size
-    if not seen or seen["offset"] > size:  # new, or rewritten
-        seen = {"offset": 0, "total": [0] * 4, "last_id": None, "last": [0] * 4}
+    if not seen or seen["offset"] > size or "buckets" not in seen:  # new, rewritten, or an older format
+        seen = {"offset": 0, "buckets": {}, "last_id": None, "last_key": None, "last": [0] * USAGE_PARTS}
     if seen["offset"] == size:
         return seen
     with open(path, "rb") as f:
         f.seek(seen["offset"])
         data = f.read(size - seen["offset"])
     data = data[:data.rfind(b"\n") + 1]  # a line still being written waits for the next look
-    total, last_id, last = list(seen["total"]), seen["last_id"], list(seen["last"])
+    buckets = {k: list(v) for k, v in seen["buckets"].items()}
+    last_id, last_key, last = seen["last_id"], seen["last_key"], list(seen["last"])
     for line in data.splitlines():
         if b'"usage"' not in line:
             continue
@@ -2243,16 +2269,17 @@ def file_usage(path, seen):
             m = e.get("message")
             if e.get("type") != "assistant" or not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
                 continue
-            use = [int(m["usage"].get(k) or 0) for k in USAGE_KEYS]
-            if m.get("id") and m.get("id") == last_id:
-                total = [t - l for t, l in zip(total, last)]
-            total = [t + u for t, u in zip(total, use)]
-            last_id, last = m.get("id"), use
-    return {"offset": seen["offset"] + len(data), "total": total, "last_id": last_id, "last": last}
+            use, key = response_parts(m["usage"]), usage_key(e, m)
+            if m.get("id") and m.get("id") == last_id and last_key in buckets:
+                buckets[last_key] = [t - l for t, l in zip(buckets[last_key], last)]
+            buckets[key] = [t + u for t, u in zip(buckets.get(key, [0] * USAGE_PARTS), use)]
+            last_id, last_key, last = m.get("id"), key, use
+    return {"offset": seen["offset"] + len(data), "buckets": buckets, "last_id": last_id,
+            "last_key": last_key, "last": last}
 
 
-def session_usage(sids):
-    """{session id: [input, cache write, cache read, output]} over each session's transcript and its
+def session_buckets(sids):
+    """{session id: {hour|model|speed: [USAGE_PARTS]}} over each session's transcript and its
     subagents'; None for one with no transcript. Cached in usage.json by file and offset, so
     the dashboard's redraws only read what was appended since."""
     path = HOME / "usage.json"
@@ -2266,19 +2293,87 @@ def session_usage(sids):
         if not main:
             out[sid] = None
             continue
-        total = [0] * 4
+        merged = {}
         for f in [main, *sorted((main.parent / sid / "subagents").glob("*.jsonl"))]:
             with contextlib.suppress(OSError):
                 seen = file_usage(f, cache.get(str(f)))
                 changed |= seen != cache.get(str(f))
                 cache[str(f)] = seen
-                total = [t + u for t, u in zip(total, seen["total"])]
-        out[sid] = total
+                for key, v in seen["buckets"].items():
+                    merged[key] = [t + u for t, u in zip(merged.get(key, [0] * USAGE_PARTS), v)]
+        out[sid] = merged
     if changed:
         tmp = path.with_name(f".usage.{os.getpid()}.tmp")
         with contextlib.suppress(OSError):
             tmp.write_text(json.dumps(cache))
             os.replace(tmp, path)
+    return out
+
+
+def in_period(key, since=None, until=None):
+    """Whether a bucket's hour falls in [since, until) (local datetimes, hour precision)."""
+    hour = key.split("|", 1)[0]
+    if hour == "unknown":
+        return since is None and until is None
+    start = dt.datetime.strptime(hour, "%Y-%m-%dT%H").astimezone()
+    return (since is None or start >= since.replace(minute=0, second=0, microsecond=0)) and \
+        (until is None or start < until)
+
+
+def session_usage(sids, since=None, until=None):
+    """{session id: [input, cache write, cache read, output]}, both cache writes summed; None for
+    one with no transcript."""
+    out = {}
+    for sid, buckets in session_buckets(sids).items():
+        if buckets is None:
+            out[sid] = None
+            continue
+        total = [0] * USAGE_PARTS
+        for key, v in buckets.items():
+            if in_period(key, since, until):
+                total = [t + u for t, u in zip(total, v)]
+        out[sid] = [total[0], total[1] + total[2], total[3], total[4]]
+    return out
+
+
+def managed_sessions():
+    """{session id: who it belongs to} for every Claude Code session claudesec has run: the
+    secretary's, its workers' (shelved too), and those of workers since archived and closed (by
+    their history files). A subagent's transcript sits under its session and counts with it.
+    Cursor workers have no transcript here and aren't counted."""
+    out = {}
+    with contextlib.suppress(OSError, ValueError):
+        for path in (HOME / "history").glob("*/*.md"):
+            text = path.read_text()
+            if not text.startswith("---\n"):
+                continue
+            meta = {}
+            for line in text.split("\n---\n", 1)[0].splitlines()[1:]:
+                key, _, value = line.partition(": ")
+                with contextlib.suppress(ValueError):
+                    meta[key] = json.loads(value)
+            if meta.get("session") and meta.get("worker") not in (None, "subagent") \
+                    and "cursor" not in (meta.get("tags") or []):
+                out[meta["session"]] = meta["worker"]
+    for name, w in read_registry()[1].items():
+        if w.get("session") and not is_cursor(w):
+            out[w["session"]] = name
+    with contextlib.suppress(OSError):
+        out[(HOME / "secretary.session").read_text().strip()] = config()["secretary_name"]
+    return out
+
+
+def usage_by_owner(since=None, until=None):
+    """{owner: {model|speed: [USAGE_PARTS]}} over every session claudesec has run, in the period."""
+    owners = managed_sessions()
+    out = {}
+    for sid, buckets in session_buckets(set(owners)).items():
+        for key, v in (buckets or {}).items():
+            if not in_period(key, since, until) or not any(v):
+                continue  # e.g. Claude Code's own "<synthetic>" error entries: nothing billed
+            _, model, speed = key.split("|")
+            per = out.setdefault(owners[sid], {})
+            per[f"{model}|{speed}"] = [t + u for t, u in zip(per.get(f"{model}|{speed}", [0] * USAGE_PARTS), v)]
     return out
 
 

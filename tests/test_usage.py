@@ -79,3 +79,60 @@ class Usage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def billed(mid, ts, model="claude-opus-5-5", speed="standard", inp=0, w5=0, w1=0, read=0, out=0):
+    return {"type": "assistant", "timestamp": ts, "message": {"id": mid, "model": model, "usage": {
+        "input_tokens": inp, "cache_creation_input_tokens": w5 + w1, "cache_read_input_tokens": read,
+        "output_tokens": out, "speed": speed,
+        "cache_creation": {"ephemeral_5m_input_tokens": w5, "ephemeral_1h_input_tokens": w1}}}}
+
+
+class UsageBuckets(Usage):
+    """By hour, model and speed, cache writes split by TTL, for every session claudesec ran."""
+
+    def hour(self, iso):
+        import datetime as dt
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%dT%H")
+
+    def test_buckets_split_ttl_model_speed_and_hour(self):
+        t = self.project / "sid.jsonl"
+        self.write(t, billed("m1", "2026-10-26T01:10:00Z", w1=100, out=1),
+                   billed("m1", "2026-10-26T01:10:01Z", w1=100, out=9),  # same response, later block
+                   billed("m2", "2026-10-26T02:30:00Z", model="claude-haiku-4-5-20251001", w5=50, read=7),
+                   billed("m3", "2026-10-26T02:40:00Z", speed="fast", inp=3, out=4))
+        b = self.cs.session_buckets(["sid"])["sid"]
+        h1, h2 = self.hour("2026-10-26T01:10:00Z"), self.hour("2026-10-26T02:30:00Z")
+        self.assertEqual(b, {f"{h1}|claude-opus-5-5|standard": [0, 0, 100, 0, 9],
+                             f"{h2}|claude-haiku-4-5-20251001|standard": [0, 50, 0, 7, 0],
+                             f"{h2}|claude-opus-5-5|fast": [3, 0, 0, 0, 4]})
+        # the 4-number total sums both writes
+        self.assertEqual(self.cs.session_usage(["sid"]), {"sid": [3, 150, 7, 13]})
+
+    def test_a_transcript_without_the_ttl_split_counts_writes_as_5_minute(self):
+        e = reply("m1", 1, 40, 0, 1)
+        e["timestamp"], e["message"]["model"] = "2026-10-26T01:00:00Z", "claude-opus-5-5"
+        self.write(self.project / "sid.jsonl", e)
+        (v,) = self.cs.session_buckets(["sid"])["sid"].values()
+        self.assertEqual(v, [1, 40, 0, 0, 1])
+
+    def test_every_session_claudesec_ran_is_counted_by_owner_and_period(self):
+        import datetime as dt
+        home = self.root / "state"
+        self.write(self.project / "s-live.jsonl", billed("a", "2026-10-26T01:00:00Z", out=10))
+        self.write(self.project / "s-live" / "subagents" / "agent-x.jsonl", billed("b", "2026-10-26T01:05:00Z", out=5))
+        self.write(self.project / "s-gone.jsonl", billed("c", "2026-10-25T01:00:00Z", out=7))
+        self.write(self.project / "s-sec.jsonl", billed("d", "2026-10-26T01:00:00Z", out=1))
+        (home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "live": {"status": "PROGRESS", "session": "s-live", "dir": "/tmp", "task": "t"}}}))
+        (home / "history" / "2026-10").mkdir(parents=True)
+        (home / "history" / "2026-10" / "2026-10-25-gone.md").write_text(self.cs.frontmatter(
+            worker="gone", session="s-gone", tags=["x"]) + "body\n")
+        (home / "secretary.session").write_text("s-sec\n")
+        owners = self.cs.managed_sessions()
+        self.assertEqual(owners, {"s-gone": "gone", "s-live": "live", "s-sec": "secretary"})
+        every = self.cs.usage_by_owner()
+        self.assertEqual(every["live"]["claude-opus-5-5|standard"][4], 15)  # its subagent counts with it
+        self.assertEqual(every["gone"]["claude-opus-5-5|standard"][4], 7)
+        since = dt.datetime.fromisoformat("2026-10-26T00:00:00+00:00").astimezone()
+        self.assertNotIn("gone", self.cs.usage_by_owner(since=since))

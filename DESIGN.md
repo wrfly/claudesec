@@ -107,12 +107,18 @@ DECISIONS: 自己做的取舍，每条「选了 X 而非 Y，因为 Z」  (DONE/
 
 ### 2.4 秘书 → 用户：推送与查询
 
-**推送**只在 `BLOCKED` `NEED_DECISION` `DONE` `FAILED`。`PROGRESS` 静默落盘，而且根本不送到秘书：
-Claude worker 发给秘书的 PROGRESS 由 SendMessage 的 PreToolUse hook（`hook worker-send`）记日志、注册表后拒掉，
-拒绝理由告诉 worker 这是正常的、别重发；Cursor worker 的 `report` 对 PROGRESS 只记录、不发告警。
+**推送**只在 `BLOCKED` `NEED_DECISION` `DONE` `FAILED`。`PROGRESS` 静默落盘，不作为消息送到秘书，
+而是秘书自己的下一轮开始时（UserPromptSubmit hook `secretary-prompt`）以 additionalContext 附上「[claudesec 进度]」，
+秘书心里有数，用户看不到，也不逼秘书说话。路径：worker（Claude 和 Cursor 都一样）用 Bash 跑 `claudesec report 名字`
+发 PROGRESS → `record_report` 记日志、注册表，再追加到 `progress-inbox.jsonl`（委托出去的 worker 不进，它们的汇报回委托人）
+→ 秘书的 hook 把 inbox 整个取走（rename 再读，取走的就不再给），每条一行 DID / NEXT，最多 20 条。
+Claude worker 的 `report` 只收 PROGRESS，别的类型照旧走 SendMessage。
+SendMessage 发的 PROGRESS 仍由 PreToolUse hook（`hook worker-send`）记下（同样进 inbox）后拒掉，兜旧习惯，
+拒绝理由教它改用 `report`。
 （10-27 前是照常投递、靠秘书不说话：可 Claude Code 在秘书窗口里显示一条「Message from X」，秘书空着一轮不答，
-harness 又逼它写一句「X 发来的是进度汇报，不用打扰您」，用户嫌吵。代价：「X 的一切都告诉我」这条元指令没了，
-要看进度就 status / log。）
+harness 又逼它写一句「X 发来的是进度汇报，不用打扰您」，用户嫌吵。10-27 改成 SendMessage 拒掉、秘书完全收不到，
+又有两个毛病：被拒的调用在 worker 窗口里显示成红色「Error:」，用户以为出错；秘书对进度一无所知。10-28 改成现在这样。
+「X 的一切都告诉我」这条元指令仍没有：PROGRESS 不推给用户。）
 worker 的 hook 在它启动时由 settings.json 装上，之后不换：`--restart` 只重启秘书，比某个 hook 早启动的 worker
 要等它 shelve 再 wake（或换模型重开）才有。10-27 planconc 就是这样，它的 PROGRESS 仍送到秘书；秘书提示里写了照样一行带过。
 多条同时到 → 合并成一条。格式：`[worker] 类型：一句话`。
@@ -407,7 +413,7 @@ worker 干活（可开 subagent，结果不外泄）
 | 风险 | 对策 |
 |---|---|
 | 秘书自己干活 | 铁律；用户一句「派出去」纠正 |
-| 秘书上下文爆 | registry + log 落盘；PROGRESS 不进上下文 |
+| 秘书上下文爆 | registry + log 落盘；PROGRESS 只以每条一行、每轮至多 20 条进上下文 |
 | 过度升级成 worker（窗口泛滥） | 门槛（1.2）；拿不准用 subagent；收据让用户否决 |
 | worker 悄悄结束不汇报 | hook 兜底；秘书 `notify_when_idle` 第二保险 |
 | worker 停在 API 错误上不汇报 | StopFailure hook 告警，秘书叫它继续 |

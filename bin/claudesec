@@ -4175,20 +4175,24 @@ def hook_worker_session_start(name):
 
 def hook_worker_send(name):
     """PreToolUse on SendMessage: a PROGRESS for the secretary is recorded (log, registry, the
-    progress pane) and not sent. Delivered, it showed in the secretary's window as a message, and
-    a turn that answered it with nothing got pushed by Claude Code to say something anyway."""
+    progress pane, the secretary's progress inbox) and not sent. Delivered, it showed in the
+    secretary's window as a message, and a turn that answered it with nothing got pushed by Claude
+    Code to say something anyway. A worker's rules have it send PROGRESS with `report` instead,
+    since a refused call shows in its window as "Error:"; this catches the old habit."""
     data = hook_input()
     inp = data.get("tool_input") or {}
     text = str(inp.get("message", ""))
     if not str(inp.get("to", "")).startswith(config()["secretary_name"]) or report_type(parse_report(text)) != "PROGRESS":
         return
     record_report(name, text)
+    how = f"{hook_cmd()} report {shlex.quote(name)} <<'EOF'"
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
         "permissionDecisionReason": tr(
-            "[claudesec] 这条 PROGRESS 已记下（日志、注册表、进度面板），按规矩不送给秘书，免得打扰用户。"
-            "这不是出错，不要重发，接着干活。",
-            "[claudesec] This PROGRESS is recorded (log, registry, the progress pane) and by design not sent to "
-            "the secretary, so the user isn't disturbed. Not an error: don't resend it, carry on.")}},
+            f"[claudesec] 这条 PROGRESS 已经替你记下，秘书下一轮会看到，不要重发，接着干活。"
+            f"以后 PROGRESS 别用 SendMessage，在 Bash 里跑 `{how}` + 汇报原文 + `EOF`。",
+            f"[claudesec] This PROGRESS is recorded for you and the secretary sees it on its next turn: don't "
+            f"resend it, carry on. From now on send PROGRESS not with SendMessage but in Bash: `{how}`, "
+            f"the report, `EOF`.")}},
         ensure_ascii=False))
 
 
@@ -4221,6 +4225,9 @@ def record_report(name, text):
         (worker_dir(name) / "reported").write_text(typ)
     if typ == "DONE":
         (HOME / "stale-due").touch()  # what it was waiting on may be settled now; the sweep looks soon
+    if typ == "PROGRESS" and w is not None and not w.get("delegated_by"):
+        with open(HOME / PROGRESS_INBOX, "a") as f:
+            f.write(json.dumps({"at": now(), "name": name, "text": text}, ensure_ascii=False) + "\n")
     after = worker_dir(name) / AFTER_REPORT
     if typ in TERMINAL:
         after.write_text("reported")  # "idle" once that turn ends; see back_at_work
@@ -4234,10 +4241,14 @@ def record_report(name, text):
 def cmd_report(args):
     """A Cursor worker's report (it has no SendMessage): recorded like a Claude Code worker's,
     then delivered to the secretary through the alert channel, which wakes it; a delegated
-    worker's goes to its delegator instead (see cmd_wait)."""
+    worker's goes to its delegator instead (see cmd_wait). A PROGRESS, from either kind, is only
+    recorded: the secretary reads it at its next turn (hook_secretary_prompt)."""
     if args.name not in read_registry()[1]:
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
+    if not is_cursor(read_registry()[1][args.name]) and report_type(parse_report(text)) != "PROGRESS":
+        sys.exit(f"NOT REPORTED: `report` takes only a PROGRESS from a Claude Code worker. Send a "
+                 f"{report_type(parse_report(text))} with SendMessage(to: \"{config()['secretary_name']}\").")
     # Cursor's subagents (Task tool) inherit the worker's environment and rules, and send
     # reports of their own. Only the worker's counts: a subagent's DONE ends the delegator's
     # wait and gets the worker archived before it is done. Cursor puts the conversation's id in
@@ -4262,8 +4273,8 @@ def cmd_report(args):
         if typ == "DONE":
             (worker_dir(args.name) / "finish").write_text(now())  # archived and closed when the turn ends
         print(f"reported to {boss}")
-    elif typ == "PROGRESS":  # as a Claude Code worker's (hook_worker_send): not to wake the secretary for
-        print("recorded: a PROGRESS goes to the log and the progress pane, not to the secretary")
+    elif typ == "PROGRESS":  # not to wake the secretary for: it reads them at its next turn
+        print("recorded: the secretary sees this PROGRESS on its next turn, without the user being shown it")
     elif secretary_alive():
         raise_alert(tr(f"{CURSOR_REPORT}「{args.name}」：\n{text}", f"{CURSOR_REPORT_EN} \"{args.name}\":\n{text}"))
         print(f"reported to {config()['secretary_name']}")
@@ -4844,12 +4855,65 @@ def hook_secretary_session_start():
 NOT_USER = ("<cross-session-message", "<task-notification", "[claudesec", "<system-reminder")
 
 
+PROGRESS_INBOX = "progress-inbox.jsonl"
+
+
+def take_progress():
+    """The workers' PROGRESS reports since the secretary last took them, as lines for its context."""
+    inbox = HOME / PROGRESS_INBOX
+    taking = inbox.with_name(f"{inbox.name}.{os.getpid()}")
+    try:
+        os.replace(inbox, taking)  # one taker; a report recorded meanwhile starts a new inbox
+    except OSError:
+        return []
+    try:
+        entries = [json.loads(l) for l in taking.read_text().splitlines() if l.strip()]
+    except (OSError, ValueError):
+        entries = []
+    taking.unlink(missing_ok=True)
+    lines = []
+    for e in entries:
+        r = parse_report(str(e.get("text", "")))
+        parts = [r.get(k, "").replace("\n", " ") for k in ("DID", "NEXT")]
+        body = tr("；下一步：", "; next: ").join(p for p in parts if p) or str(e.get("text", "")).replace("\n", " ")
+        lines.append(f"- [{e.get('name')} {str(e.get('at', ''))[11:16]}] {body[:300]}")
+    if len(lines) > PROGRESS_KEEP:
+        lines = [tr(f"- （更早的 {len(lines) - PROGRESS_KEEP} 条略，见 `claudesec log 名字`）",
+                    f"- ({len(lines) - PROGRESS_KEEP} earlier ones left out; see `claudesec log NAME`)"),
+                 *lines[-PROGRESS_KEEP:]]
+    return lines
+
+
+PROGRESS_KEEP = 20
+
+
 def hook_secretary_prompt():
-    """The first thing the user says on a given day starts that day's review. Tied to the user
-    showing up, not to a clock: no review on days off, and one, not several, after a break."""
+    """Every turn of the secretary's starts with the workers' PROGRESS since its last: it knows
+    how they are getting on without a message in its window, which the user would see and which
+    Claude Code pushes it to answer. And the first thing the user says on a given day starts that
+    day's review. Tied to the user showing up, not to a clock: no review on days off, and one,
+    not several, after a break."""
     data = hook_input()
-    if str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
-        return
+    context = []
+    with contextlib.suppress(Exception):  # a broken inbox mustn't hold up the message
+        progress = take_progress()
+        if progress:
+            context.append("\n".join([tr("[claudesec 进度] 上一轮以来 worker 的 PROGRESS。只给你掌握进度：不用转告用户，"
+                                          "不用回复 worker，也不用为它说话；用户问起进度时用得上。",
+                                          "[claudesec progress] The workers' PROGRESS since your last turn. Only for you to "
+                                          "know how they're doing: don't pass it on to the user, don't answer the workers, "
+                                          "don't say anything about it; it's for when the user asks."), *progress]))
+    if not str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
+        daily = first_sight_today()
+        if daily:
+            context.insert(0, daily)
+    if context:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "additionalContext": "\n\n".join(context)}}, ensure_ascii=False))
+
+
+def first_sight_today():
+    """The day's review and sweep when this is the user's first message today, else None."""
     today = dt.date.today().isoformat()
     seen = HOME / "user-seen.date"
     try:
@@ -4857,7 +4921,7 @@ def hook_secretary_prompt():
     except OSError:
         last = ""
     if last == today:
-        return
+        return None
     seen.write_text(today + "\n")
     context = tr(f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
                  "收据一行，再回应用户这条消息。",
@@ -4872,8 +4936,7 @@ def hook_secretary_prompt():
         context += "\n\n" + "\n".join([tr("[巡检] 决策队列和待办事项里可能过期的条目，回应用户之前先清一遍：",
                                             "[sweep] Queue items and to-dos that may be out of date; clear them before "
                                             "answering the user:"), *stale_lines(found), tr(STALE_ADVICE, STALE_ADVICE_EN)])
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},
-                     ensure_ascii=False))
+    return context
 
 
 def done_heading(text):

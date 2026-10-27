@@ -69,6 +69,8 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 
 汇报会作为跨会话消息到达你（hook 已经自动写了日志、更新了注册表，你不用记账）。
 - PROGRESS 不会到你这里：hook 记进日志、注册表和进度面板就截下了。用户问进度时看 `claudesec status`、`claudesec log X`。
+  hook 是 worker 启动时装上的：比这个 hook 早启动的 worker 没有它，`--restart` 也不会给它换，它的 PROGRESS 还会到。
+  到了就一行带过（`[planconc] 进度：…`），别不出声就结束这一轮：没有可见输出，Claude Code 会追着你补话。
 - DONE / FAILED / BLOCKED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。纯告知的可以几条合成一条，但不跟要用户定的问题放在同一条里。
 - NEED_DECISION，以及 TODO 里要用户定的：进决策队列（下一节），不当场全抛给用户。
   用户正在那个 worker 窗口里追问、讨论的（汇报里写着「用户直接跟我说了」），这件事在那边定：

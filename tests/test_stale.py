@@ -163,6 +163,28 @@ class Stale(unittest.TestCase):
             sys.argv = saved
         meta = json.loads((self.home / "queue-meta.json").read_text())
         self.assertEqual(meta["8"]["added"], dt.date.today().isoformat())
+        self.assertEqual(meta["8"]["at"][:10], dt.date.today().isoformat())
+
+    def test_an_item_added_after_its_worker_closed_isnt_waiting_on_it(self):
+        # #200 [deploy], 2026-10-27: asked a day after a worker called deploy was archived
+        (self.home / "config.json").write_text(json.dumps({"language": "zh", "stale_days": 0}))
+        (self.home / "queue-meta.json").write_text(json.dumps({
+            "1": {"added": "2026-10-21"},   # the day after gone's record: a later use of the name
+            "6": {"added": "2026-10-20"}}))  # the same day, no time: can't tell, still pointed out
+        self.assertEqual(self.found()[("notice", 6)], ["closed"])
+        self.assertNotIn(("queue", 1), self.found())
+
+    def test_to_the_second_when_both_times_are_known(self):
+        (self.home / "config.json").write_text(json.dumps({"language": "zh", "stale_days": 0}))
+        hist = self.home / "history" / "2026-10"
+        (hist / "2026-10-20-gone-2.md").write_text(  # the name used again, archived later that day
+            self.cs.frontmatter(date="2026-10-20", archived="2026-10-20T15:00:00+08:00", project="",
+                                worker="gone", session=None, status="DONE") + "## 任务\nt\n")
+        (self.home / "queue-meta.json").write_text(json.dumps({
+            "1": {"added": "2026-10-20", "at": "2026-10-20T16:00:00+08:00"},
+            "6": {"added": "2026-10-20", "at": "2026-10-20T14:00:00+08:00"}}))
+        self.assertEqual(self.found()[("notice", 6)], ["closed"])  # added while it was open
+        self.assertNotIn(("queue", 1), self.found())
 
 
 if __name__ == "__main__":

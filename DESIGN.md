@@ -113,6 +113,8 @@ Claude worker 发给秘书的 PROGRESS 由 SendMessage 的 PreToolUse hook（`ho
 （10-27 前是照常投递、靠秘书不说话：可 Claude Code 在秘书窗口里显示一条「Message from X」，秘书空着一轮不答，
 harness 又逼它写一句「X 发来的是进度汇报，不用打扰您」，用户嫌吵。代价：「X 的一切都告诉我」这条元指令没了，
 要看进度就 status / log。）
+worker 的 hook 在它启动时由 settings.json 装上，之后不换：`--restart` 只重启秘书，比某个 hook 早启动的 worker
+要等它 shelve 再 wake（或换模型重开）才有。10-27 planconc 就是这样，它的 PROGRESS 仍送到秘书；秘书提示里写了照样一行带过。
 多条同时到 → 合并成一条。格式：`[worker] 类型：一句话`。
 元指令可调：「别打扰我」全攒着。
 
@@ -674,6 +676,10 @@ status 列出未到点的提醒。
 - 查哪些：决策队列的「待问」「待答」和待办事项的「待办」，有编号的。「搁置」「记录」是用户说了以后再提的，不查。
 - 三种理由，每种一个 key，记在 `stale.json`（按条目），同一条同一个理由只提一次，条目不在了就忘掉：
   - `closed`：标的 `[worker]` 不在注册表、历史里有它（`claudesec close` 过），附归档日期。
+    条目在它归档之后才加入的不算：那是这个名字的又一次使用，跟那个 worker 无关（10-27：#200 [deploy] 是秘书刚问的，
+    只因 10-26 归档过一个 deploy 就被报了，还在 Stop hook 拦了秘书一次）。两边都有时刻（`queue-meta.json` 的 `at`、
+    归档 frontmatter 的 `archived`，都从 10-27 起记）就比到秒；否则按天比，同一天的分不出先后，照旧提。
+    同名归档过几次的取最近一次。标签只是出处、条目本身跟 worker 死活无关的（「可选：去看一眼 X 页面」），机械上分不出，照样提一次。
   - `merged:N,…`：条目里写的 `!N` 全部已合。在标的 worker 的目录及其下一层的 git 仓库里找远端分支上的 merge commit
     「See merge request: !N」（Codebase 和 GitLab 都这么写），按仓库存储去重（共享一个仓库的 worktree 只读一次）。
     只看上次 fetch 到的，不 fetch：拿不到的结果是漏报，不会误报成已合。!N 是各仓库各自的编号，所以提示里写出在哪个仓库合的，
@@ -687,7 +693,7 @@ status 列出未到点的提醒。
   没标 worker 的条目查 MR（不知道是哪个仓库）。
 
 已验证（单测 tests/test_stale.py）：三种理由、搁置和记录不查、提一次不重复、过 14 天再提、条目清掉后忘掉、`stale_days: 0`、
-当天第一条消息附上并不再告警、DONE / close 触发、待办记加入日期。手跑：拿 10-23 的 queue.md 备份和真实注册表、历史，
+当天第一条消息附上并不再告警、DONE / close 触发、待办记加入日期和时刻、归档后加入的不算关闭（按天、按秒）。手跑：拿 10-23 的 queue.md 备份和真实注册表、历史，
 挑出 3 条标了已关闭 worker 的；造的条目里 !354 !355 认出已在 alert-atlas 合入，用时约 0.2 秒。
 
 ### Cursor worker（`spawn --agent cursor`）

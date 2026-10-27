@@ -711,8 +711,8 @@ def paren(text):
 
 
 def queue_meta():
-    """{number: {"added": date}} for queue items, kept beside queue.md so hand edits of the file
-    don't lose it. Items from before it have no date."""
+    """{number: {"added": date, "at": time}} for queue items and to-dos, kept beside queue.md so
+    hand edits of the file don't lose it. Items from before it have no date, older ones no time."""
     with contextlib.suppress(OSError, ValueError):
         return json.loads((HOME / "queue-meta.json").read_text())
     return {}
@@ -720,7 +720,8 @@ def queue_meta():
 
 def note_added(num):
     meta = queue_meta()
-    meta.setdefault(str(num), {})["added"] = dt.date.today().isoformat()
+    now = dt.datetime.now().astimezone()
+    meta.setdefault(str(num), {}).update(added=now.date().isoformat(), at=now.isoformat(timespec="seconds"))
     tmp = HOME / f".queue-meta.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(meta, indent=1) + "\n")
     os.replace(tmp, HOME / "queue-meta.json")
@@ -3251,7 +3252,8 @@ def cmd_archive(args):
         status = final.get("TYPE", w["status"])
         trace = "\n".join(f"=== {h}\n{b}" for h, b in entries)
         path.write_text(
-            frontmatter(date=w["started_at"][:10], project=w["dir"], worker=args.name, model=w["model"],
+            frontmatter(date=w["started_at"][:10], archived=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                        project=w["dir"], worker=args.name, model=w["model"],
                         session=w.get("session"), status=status, files=files, tags=tags,
                         **({"delegated_by": w["delegated_by"]} if w.get("delegated_by") else {})) +
             tr(f"## 任务\n{w['task']}\n\n"
@@ -3942,8 +3944,9 @@ MERGED = re.compile(r"See merge request:?\s*\S*?!(\d+)\b")
 
 
 def worker_places():
-    """{name: (directory, closed on)} of every worker claudesec knows: the registry's (closed
-    None), and from the history files those closed since (the date of their record)."""
+    """{name: (directory, closed at)} of every worker claudesec knows: the registry's (closed
+    None), and from the history files those closed since (when it was archived; the date of the
+    record for those archived before that was written down)."""
     out = {}
     with contextlib.suppress(OSError):
         for path in sorted((HOME / "history").glob("*/*.md")):
@@ -3955,8 +3958,9 @@ def worker_places():
                 key, _, value = line.partition(": ")
                 with contextlib.suppress(ValueError):
                     meta[key] = json.loads(value)
-            if meta.get("worker") not in (None, "subagent"):
-                out[meta["worker"]] = (meta.get("project") or "", path.name[:10])
+            closed = meta.get("archived") or path.name[:10]
+            if meta.get("worker") not in (None, "subagent") and closed >= out.get(meta["worker"], ("", ""))[1]:
+                out[meta["worker"]] = (meta.get("project") or "", closed)  # the name's latest use
     for name, w in read_registry()[1].items():
         out[name] = (w["dir"], None)
     return out
@@ -3996,6 +4000,19 @@ def merged_mrs(directory, cache):
     return found
 
 
+def added_after(added, closed):
+    """Whether an item added at added ({"added": date, "at": time} or {}) came after a worker
+    closed at closed (a time, or a date): to the second when both are known, else by the day,
+    a same-day one not counting. Such an item can't be waiting on that worker: its tag is a
+    later use of the name (the secretary, 2026-10-27: #200 [deploy], added a day after a deploy
+    worker was archived, was pointed out as its worker being closed)."""
+    if added.get("at") and len(closed) > 10:
+        with contextlib.suppress(ValueError):
+            return dt.datetime.fromisoformat(added["at"]) > dt.datetime.fromisoformat(closed)
+    when = (added.get("at") or added.get("added") or "")[:10]
+    return bool(when) and when > closed[:10]
+
+
 def stale_items():
     """[(where, number, tag, text, [(key, reason)])] for the open items that may be out of date:
     where "queue" (待问, 待答) or "notice" (待办). The key tells one reason from another, so each
@@ -4011,9 +4028,9 @@ def stale_items():
             continue
         reasons = []
         place, closed = places.get(tag, (None, None)) if tag else (None, None)
-        if closed:
-            reasons.append(("closed", tr(f"标的 worker {tag} 已关闭（{closed} 归档）",
-                                         f"the worker it names, {tag}, is closed (archived {closed})")))
+        if closed and not added_after(meta.get(str(n), {}), closed):
+            reasons.append(("closed", tr(f"标的 worker {tag} 已关闭（{closed[:10]} 归档）",
+                                         f"the worker it names, {tag}, is closed (archived {closed[:10]})")))
         mrs = sorted({int(m) for m in re.findall(r"(?<![\w!])!(\d+)\b", text)})
         if mrs and place:
             merged = merged_mrs(place, cache)

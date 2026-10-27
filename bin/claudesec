@@ -11,8 +11,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     --agent cursor: Cursor's `agent` CLI instead of Claude Code;
                                     --for: the worker that delegated it, named in its reports)
   claudesec report NAME < report.txt     a Cursor worker's report to the secretary
-  claudesec remind WHEN TARGET TEXT [--every 1d]   wakes the secretary at WHEN (+30m, 09:05Z, 17:05, ISO)
-                                    with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
+  claudesec remind WHEN TARGET TEXT [--every 1d]   a scheduled task (定时任务): wakes the secretary at WHEN
+                                    (+30m, 09:05Z, 17:05, ISO) with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
   claudesec queue add [--asked|--later] TEXT   a decision queue item with the next number (printed: #N);
                                     --asked: in 待答 (asked, waiting), --later: in 搁置 (put off)
   claudesec queue move N backlog|todo|doing|done|ideas [--note T]   item #N to 搁置 / 待问 / 待答 / 已处理 / 记录
@@ -20,9 +20,11 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec queue list [--older DAYS]    open items with how long they have waited
   claudesec queue doctor [--fix]         check queue.md (line-number prefixes, doubled sections, …)
   claudesec queue number                 number the open queue items written without one
-  claudesec notice add [--from W] TEXT   something for the user to do (not decide); notice done N, notice list
-  claudesec show N                       the whole of queue item or notice #N
-  claudesec dashboard on|off              queue and progress panes beside the secretary (on by default)
+  claudesec notice add [--from W] TEXT   a to-do (待办事项): something for the user to do, not decide;
+                                    notice done N, notice list
+  claudesec show N                       the whole of queue item or to-do #N
+  claudesec dashboard on|off              panes beside the secretary, top to bottom: to-dos, decisions,
+                                    progress, scheduled tasks (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to a Cursor worker
   claudesec model NAME MODEL [--force]   switch a worker's model: restart it on MODEL, conversation kept
@@ -397,16 +399,16 @@ def cmd_start(args):
         os.execvp("tmux", ["tmux", "attach-session", "-t", f"={sess}"])
 
 
-# ---------- dashboard: queue and progress beside the secretary ----------
+# ---------- dashboard: to-dos, decisions, progress and scheduled tasks beside the secretary ----------
 # Panes in the secretary's window, told apart by the pane option @claudesec-role (secretary /
-# queue / status). Laid out by `arrange_dashboard`, run at every start and when a client resizes;
+# notices / queue / status / reminders). Laid out by `arrange_dashboard`, run at every start and when a client resizes;
 # each dashboard pane redraws itself every few seconds, scrolls on the wheel and keys, and exits
 # with the secretary.
 
 DASH_MIN = 110    # window columns below which the secretary keeps the whole window
 DASH_SHARE = 36   # percent of the window the dashboard column takes
 DASH_REFRESH = 3
-DASH_PANES = ("queue", "status", "notices")  # top to bottom
+DASH_PANES = ("notices", "queue", "status", "reminders")  # top to bottom (the user, 2026-10-27)
 DASH_SIDE = "right"  # of the secretary; config.json "dashboard_side": "left" puts the column there
 
 
@@ -849,8 +851,9 @@ def status_line(cols, focused, name, mark, word, color, summary, age, tokens, mo
 
 
 def status_blocks(cols, now=None):
-    """The progress pane: (title bar, blocks). A worker folds to its status line; unfolded it
-    adds its last report (the question, for those waiting on the user)."""
+    """The progress pane: (title bar, blocks, footer). A worker folds to its status line; unfolded
+    it adds its last report (the question, for those waiting on the user). Today's spend is the
+    footer, on the pane's last row (the user, 2026-10-27)."""
     focus, workers = read_registry()
     alive = alive_windows()
     active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
@@ -905,16 +908,25 @@ def status_blocks(cols, now=None):
         lines = wrap(segs, cols, cols - 2)
         blocks += [fixed([]), foldable(("shelved",), [lines[0]] + [[("", "  ")] + l for l in lines[1:]],
                                        fit(segs, cols))]
+    spend = spend_today_line()
+    return title, blocks, [[(DIM, cut(spend, cols))]] if spend else []
+
+
+def reminders_blocks(cols):
+    """The scheduled-tasks pane (reminders not due yet, soonest first): (title bar, blocks)."""
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
-    if pending:
-        blocks += [fixed([]), fixed(heading(tr(f"提醒 {len(pending)}", f"Reminders {len(pending)}"), cols))]
-        for r in pending:
-            t = dt.datetime.fromisoformat(r["due"]).astimezone()
-            segs = [(DIM, f"{t:%m-%d %H:%M}"), ("", " "), (CYAN, r["target"]), ("", "  "),
-                    ("", " ".join(r["text"].split()))]
-            lines = wrap(segs, cols, cols - 2)
-            blocks.append(foldable(("r", r["due"], r["target"], r["text"]),
-                                   [lines[0]] + [[("", "  ")] + l for l in lines[1:]], fit(segs, cols)))
+    title = bar(tr(" 定时任务", " Scheduled"), tr(f"{len(pending)} 个 ", f"{len(pending)} "), cols)
+    if not pending:
+        return title, [fixed([(DIM, tr("没有定时任务。", "Nothing scheduled."))])]
+    blocks = []
+    for r in pending:
+        t = dt.datetime.fromisoformat(r["due"]).astimezone()
+        every = [(DIM, " " + show_every(r["every"]))] if r.get("every") else []
+        segs = [(DIM, f"{t:%m-%d %H:%M}"), *every, ("", " "), (CYAN, r["target"]), ("", "  "),
+                ("", " ".join(r["text"].split()))]
+        lines = wrap(segs, cols, cols - 2)
+        blocks.append(foldable(("r", r["due"], r["target"], r["text"]),
+                               [lines[0]] + [[("", "  ")] + l for l in lines[1:]], fit(segs, cols)))
     return title, blocks
 
 
@@ -998,7 +1010,7 @@ def show_dashboard(what):
     # own screen (nothing piles up in tmux's history), no cursor, clicks and the wheel as SGR reports
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
     top, opened, shown, content, due, sec = 0, set(), None, None, 0, None
-    code, reload = code_stamp(), False
+    code, reload, relaid = code_stamp(), False, False
     try:
         while True:
             size = shutil.get_terminal_size()
@@ -1010,8 +1022,14 @@ def show_dashboard(what):
                 sec = next((p for p, role, _ in panes if role == "secretary"), None)
                 if sec is None:
                     return
+                if me and not relaid:  # reloaded on code with other panes: lay the column out anew
+                    relaid = True
+                    stamp = tmux("show-options", "-pqv", "-t", me, "@claudesec-layout", check=False).strip()
+                    if stamp and stamp != dash_layout(config()):
+                        tmux("run-shell", "-b", f"{hook_cmd()} dashboard layout", check=False)
                 try:
-                    content = (size, *{"queue": queue_blocks, "notices": notices_blocks}.get(what, status_blocks)(size.columns - 1))
+                    content = (size, *{"queue": queue_blocks, "notices": notices_blocks,
+                                        "reminders": reminders_blocks}.get(what, status_blocks)(size.columns - 1))
                 except Exception as e:  # a half-written file, a bad entry: show it, try again
                     content = (size, [(REV, tr(f" 读状态出错，{DASH_REFRESH} 秒后重试 ",
                                                 f" Can't read the state; again in {DASH_REFRESH}s "))],
@@ -1304,7 +1322,7 @@ def cmd_queue(args):
             notice = any((m := QUEUE_ITEM.match(line)) and m[1] == num for line in
                          ((HOME / "notices.md").read_text().splitlines() if (HOME / "notices.md").exists() else []))
             sys.exit(tr(f"queue move：{path} 里没有 #{num}。", f"queue move: no item #{num} in {path}. ")
-                     + (tr(f"#{num} 是通知：`claudesec notice done {num}`。", f"#{num} is a notice: `claudesec notice done {num}`.")
+                     + (tr(f"#{num} 是待办事项：`claudesec notice done {num}`。", f"#{num} is a to-do: `claudesec notice done {num}`.")
                         if notice else tr("`claudesec queue list` 列出未定的条目；文件可能坏了的话 `claudesec queue doctor`。",
                                           "`claudesec queue list` lists the open items; if the file may be damaged, "
                                           "`claudesec queue doctor`.")))
@@ -1350,13 +1368,13 @@ def cmd_queue(args):
 # nothing to choose, so they stay out of the decision queue. notices.md, two sections; the
 # numbers come from the queue's sequence.
 
-NOTICE_INTRO = """# 通知消息
+NOTICE_INTRO = """# 待办事项
 
 秘书维护。要用户去做、但不用用户拍板的事：去某个 worker 窗口说 push、在 VNC 里装扩展、登录一下。
 要用户定的仍然进决策队列。每条一行 `- #编号 [worker] 要做什么`；`claudesec notice add` 登记（编号和
 决策队列共用一个序列），用户做完 `claudesec notice done 编号`。
 """
-NOTICE_INTRO_EN = """# Notices
+NOTICE_INTRO_EN = """# To do
 
 Kept by the secretary: things the user has to do that need no decision (say push in a worker's
 window, install the extension over VNC, log in somewhere). Decisions still go to the queue. One line
@@ -1453,20 +1471,18 @@ def cmd_show(args):
             m = QUEUE_ITEM.match(line)
             if m and m[1] == num:
                 where = names.get(section, ("?", "?"))[0 if lang() == "zh" else 1]
-                kind = tr("决策队列", "decision queue") if path.name == "queue.md" else tr("通知", "notices")
+                kind = tr("决策队列", "decision queue") if path.name == "queue.md" else tr("待办事项", "to-dos")
                 print(f"#{num}（{kind} · {where}）\n{m[2].strip()}")
                 return
     sys.exit(tr(f"没有 #{num}：queue.md 和 notices.md 里都找不到", f"no #{num} in queue.md or notices.md"))
 
 
 def notices_blocks(cols):
-    """The notices pane: (title bar, blocks, footer): today's spend in the footer, on the last row."""
+    """The to-do pane (notices.md's open items): (title bar, blocks)."""
     items = open_notices()
-    title = bar(tr(" 通知消息", " Notices"), f"{NOTICE_SECTIONS['open'][0 if lang() == 'zh' else 1]} {len(items)} ", cols)
-    spend = spend_today_line()  # pinned to the pane's bottom edge (the user, 2026-10-26)
-    footer = [[(DIM, cut(spend, cols))]] if spend else []
+    title = bar(tr(" 待办事项", " To do"), tr(f"{len(items)} 件 ", f"{len(items)} "), cols)
     if not items:
-        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])], footer
+        return title, [fixed([(DIM, tr("没有要你去做的事。", "Nothing for you to do."))])]
     blocks, num_w = [], max(len(str(n or "·")) for n, _, _ in items)
     for n, tag, text in items:
         head = [(BOLD, str(n or "·").rjust(num_w)), ("", " ")]
@@ -1474,7 +1490,7 @@ def notices_blocks(cols):
         lines = wrap(name + [("", text)], cols - num_w - 1)
         full = [head + lines[0]] + [[("", " " * (num_w + 1))] + line for line in lines[1:]]
         blocks.append(foldable(("n", n, tag, text), full, fit(head + name + [("", text)], cols)))
-    return title, blocks, footer
+    return title, blocks
 
 
 def cmd_run(args):
@@ -3083,7 +3099,7 @@ def cmd_status(args):
     print_reminders()
     items = open_notices()
     if items:
-        print(tr("\n通知（要用户去做的事；claudesec notice done 编号）：", "\nNotices (for the user to do; claudesec notice done N):"))
+        print(tr("\n待办事项（要用户去做的事；claudesec notice done 编号）：", "\nTo do (for the user; claudesec notice done N):"))
         for n, t, text in items:
             print(f"  #{n} " + (f"[{t}] " if t else "") + text)
     load = ""
@@ -3719,7 +3735,7 @@ def cmd_remind(args):
     if args.list or not args.words:
         items = read_reminders() if args.all else [r for r in read_reminders() if r["status"] == "pending"]
         if not items:
-            print(tr("没有提醒。", "No reminders.") if args.all else tr("没有未到点的提醒。", "No reminders due."))
+            print(tr("没有定时任务。", "Nothing scheduled.") if args.all else tr("没有未到点的定时任务。", "Nothing scheduled ahead."))
             return
         rows = [("id", *tr(("时间", "重复", "给", "状态", "内容"), ("when", "repeat", "for", "status", "text")))]
         for r in sorted(items, key=by_due):
@@ -3767,7 +3783,7 @@ def deliver_reminder(r):
     late = (dt.datetime.now().astimezone() - due).total_seconds()
     late_note = tr(f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）", f", {int(late // 60)} minutes late (the "
                    "secretary wasn't running then)") if late > 3 * REMINDER_CHECK_SECS + 60 else ""
-    raise_alert(tr(f"[提醒 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}",
+    raise_alert(tr(f"[定时任务 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}",
                    f"[reminder {r['id']}] due {show_time(r['due'])}{late_note}, for {r['target']}: {r['text']}"))
     if r["target"] in read_registry()[1]:
         append_log(r["target"], "reminder", r["text"])
@@ -3799,7 +3815,7 @@ def fire_due_reminders():
             how = deliver_reminder(r)
         except Exception as e:  # keep checking the others; tell the secretary this one went wrong
             how = f"failed: {e}"
-            raise_alert(tr(f"[提醒 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}",
+            raise_alert(tr(f"[定时任务 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}",
                            f"[reminder {r['id']}] couldn't be delivered ({e}); for {r['target']}: {r['text']}"))
         with reminders() as data:
             for x in data["items"]:
@@ -3889,8 +3905,8 @@ def check_reminders(run_pid):
 def print_reminders():
     pending = sorted((r for r in read_reminders() if r["status"] == "pending"), key=by_due)
     if pending:
-        print(tr("\n提醒（未到点；claudesec remind --cancel ID 取消）：",
-                 "\nReminders (not due yet; claudesec remind --cancel ID drops one):"))
+        print(tr("\n定时任务（未到点；claudesec remind --cancel ID 取消）：",
+                 "\nScheduled (not due yet; claudesec remind --cancel ID drops one):"))
         rows = [("id", *tr(("时间", "重复", "给", "内容"), ("when", "repeat", "for", "text")))]
         for r in pending:
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
@@ -4612,8 +4628,8 @@ def hook_secretary_session_start():
                     + tr("；", "; ").join(l.strip()[2:] for l in open_items["ideas"])]
     notices = open_notices()
     if notices:
-        out += ["", tr(f"通知 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
-                       f"Notices {HOME / 'notices.md'} has {len(notices)} things for the user to do (not decisions; "
+        out += ["", tr(f"待办事项 {HOME / 'notices.md'} 里有 {len(notices)} 件要用户去做的事（不是决策；用户做完 `claudesec notice done 编号`）：",
+                       f"The to-do list {HOME / 'notices.md'} has {len(notices)} things for the user to do (not decisions; "
                        "when the user has done one, `claudesec notice done N`):"),
                 *(f"- #{n} " + (f"[{t}] " if t else "") + text for n, t, text in notices)]
     print("\n".join(out)[:9500])

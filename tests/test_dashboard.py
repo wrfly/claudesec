@@ -77,13 +77,13 @@ class Dashboard(unittest.TestCase):
 
     # ---- layout
 
-    def test_three_panes_whenever_the_window_is_wide_enough(self):
+    def test_four_panes_whenever_the_window_is_wide_enough(self):
         for cols in (110, 126, 200):
             self.calls, self.window_width = [], cols
             self.cs.arrange_dashboard("claudesec")
-            self.assertEqual(self.roles_made(), ["queue", "status", "notices"], cols)
+            self.assertEqual(self.roles_made(), ["notices", "queue", "status", "reminders"], cols)
         splits = [a for a in self.calls if a[0] == "split-window"]
-        self.assertEqual([a[a.index("-l") + 1] for a in splits], ["36%", "66%", "50%"])  # thirds
+        self.assertEqual([a[a.index("-l") + 1] for a in splits], ["36%", "75%", "66%", "50%"])  # quarters
         self.assertNotIn("-b", splits[0])  # right of the secretary
 
     def test_the_column_goes_left_when_configured(self):
@@ -92,11 +92,11 @@ class Dashboard(unittest.TestCase):
         self.cs.arrange_dashboard("claudesec")
         self.assertIn("-b", [a for a in self.calls if a[0] == "split-window"][0])
 
-    def test_two_panes_from_before_become_three(self):
+    def test_panes_from_before_become_the_four(self):
         self.panes += [("%5", "queue", "1"), ("%6", "status", "2")]
         self.cs.arrange_dashboard("claudesec")
         self.assertIn(("kill-pane", "-t", "%5"), self.calls)
-        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
+        self.assertEqual(self.roles_made(), ["notices", "queue", "status", "reminders"])
 
     def test_none_in_a_narrow_window(self):
         self.window_width = 109
@@ -107,7 +107,7 @@ class Dashboard(unittest.TestCase):
         self.panes.append(("%5", "both", "1"))
         self.cs.arrange_dashboard("claudesec")
         self.assertIn(("kill-pane", "-t", "%5"), self.calls)
-        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
+        self.assertEqual(self.roles_made(), ["notices", "queue", "status", "reminders"])
 
     def current(self, *roles):
         layout = self.cs.dash_layout(self.cs.config())
@@ -115,18 +115,18 @@ class Dashboard(unittest.TestCase):
                 for i, role in enumerate(roles)]
 
     def test_nothing_changes_when_all_panes_are_there(self):
-        self.panes += self.current("queue", "status", "notices")
+        self.panes += self.current("notices", "queue", "status", "reminders")
         self.cs.arrange_dashboard("claudesec")
         self.assertFalse([a for a in self.calls if a[0] in ("kill-pane", "split-window")])
 
     def test_panes_an_older_version_laid_out_are_rebuilt(self):
         # the right roles, but no layout stamp: built before panes carried one
-        self.panes += [(p, role, i, cmd) for p, role, i, cmd, _ in self.current("queue", "status", "notices")]
+        self.panes += [(p, role, i, cmd) for p, role, i, cmd, _ in self.current("notices", "queue", "status", "reminders")]
         self.cs.arrange_dashboard("claudesec")
-        self.assertEqual([a[2] for a in self.calls if a[0] == "kill-pane"], ["%5", "%6", "%7"])
-        self.assertEqual(self.roles_made(), ["queue", "status", "notices"])
+        self.assertEqual([a[2] for a in self.calls if a[0] == "kill-pane"], ["%5", "%6", "%7", "%8"])
+        self.assertEqual(self.roles_made(), ["notices", "queue", "status", "reminders"])
         stamps = [a for a in self.calls if a[0] == "set-option" and "@claudesec-layout" in a]
-        self.assertEqual(len(stamps), 3)
+        self.assertEqual(len(stamps), 4)
 
     def test_an_unmarked_dashboard_pane_is_still_one(self):
         # what the user hit: a lone `dashboard show queue` pane without its role mark survived
@@ -363,7 +363,7 @@ class Dashboard(unittest.TestCase):
             "zz": {"status": "SHELVED", "task": "t"},
         }
         (self.home / "registry.json").write_text(json.dumps({"focus": "busy", "workers": workers}))
-        title, blocks = self.cs.status_blocks(48)
+        title, blocks, _ = self.cs.status_blocks(48)
         self.assertEqual(plain(title).rstrip(), " 等你 1  出错 1  在做 2  做完 1  搁置 1")
         self.assertEqual(self.cs.width(plain(title)), 48)
         self.assertEqual(plain(self.cs.status_blocks(60)[0]).split()[0], "任务进展")
@@ -413,6 +413,65 @@ class Dashboard(unittest.TestCase):
         self.assertGreater(di(b"\x1b[F")[0], 1000)
 
 
+class SidePanes(unittest.TestCase):
+    """The column from the top: to-dos, decisions, progress, scheduled tasks; today's spend on
+    the progress pane's last row (the user, 2026-10-27)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.cs = load(self.home)
+        (self.home / "config.json").write_text(json.dumps({"language": "zh"}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def workers(self, n):
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            f"w{i}": {"status": "PROGRESS", "task": "t", "last_summary": "s", "window": "@1"} for i in range(n)}}))
+
+    def test_todays_spend_is_pinned_to_the_last_row_of_the_progress_pane(self):
+        self.cs.spend_today_line = lambda: "今天花费：秘书 $1.0 · 全部 $3.0"
+        for n in (0, 2, 40):  # none, a few, more than fit: the footer stays below the scroll note
+            self.workers(n)
+            title, blocks, footer = self.cs.status_blocks(80)
+            body, _ = self.cs.unfold(blocks, set())
+            lines, _, rowmap = self.cs.dash_view(title, body, 20, 0, footer)
+            self.assertEqual(len(lines), 20)
+            self.assertEqual(plain(lines[-1]), "今天花费：秘书 $1.0 · 全部 $3.0")
+            self.assertIsNone(rowmap[-1])  # a click there opens nothing
+            if n == 40:
+                self.assertIn("↓", plain(lines[-2]))
+        self.cs.spend_today_line = lambda: ""
+        self.assertEqual(self.cs.status_blocks(80)[2], [])
+
+    def reminders(self):
+        now = dt.datetime.now().astimezone()
+        due = lambda h: (now + dt.timedelta(hours=h)).isoformat()
+        items = [{"id": "r3", "due": due(5), "target": "secretary", "text": "看 !344", "status": "pending"},
+                 {"id": "r1", "due": due(1), "target": "plan-scale", "text": "复核", "status": "pending",
+                  "every": 86400},
+                 {"id": "r2", "due": due(2), "target": "secretary", "text": "旧的", "status": "fired"}]
+        (self.home / "reminders.json").write_text(json.dumps({"next": 4, "items": items}))
+
+    def test_scheduled_tasks_have_their_own_pane_soonest_first(self):
+        self.reminders()
+        title, blocks = self.cs.reminders_blocks(60)
+        self.assertEqual(plain(title).split(), ["定时任务", "2", "个"])
+        body = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
+        self.assertEqual(len(body), 2)
+        self.assertIn("每 1d plan-scale 复核", body[0])
+        self.assertIn("secretary 看 !344", body[1])
+        self.workers(1)  # and the progress pane no longer lists them
+        status = "".join(plain(l) for l in self.cs.unfold(self.cs.status_blocks(60)[1], set())[0])
+        self.assertNotIn("复核", status)
+
+    def test_no_scheduled_tasks(self):
+        title, blocks = self.cs.reminders_blocks(60)
+        self.assertEqual(plain(title).split(), ["定时任务", "0", "个"])
+        self.assertEqual([plain(l) for l in self.cs.unfold(blocks, set())[0]], ["没有定时任务。"])
+
+
 class English(Dashboard):
     """The same panes and commands with "language": "en"; Chinese queue files still read."""
     LANG = "en"
@@ -458,7 +517,7 @@ class English(Dashboard):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
             "asks": {"status": "NEED_DECISION", "task": "t", "pending_ask": "A or B?", "window": "@1"},
             "zz": {"status": "SHELVED", "task": "t"}}}))
-        title, blocks = self.cs.status_blocks(48)
+        title, blocks, _ = self.cs.status_blocks(48)
         self.assertEqual(plain(title).split(), ["Workers", "$today", "you", "1", "shelved", "1"])  # $ is today's
         body = [plain(l) for l in self.cs.unfold(blocks, set())[0]]
         self.assertIn("needs your call", body[0])

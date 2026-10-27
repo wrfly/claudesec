@@ -451,7 +451,7 @@ claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor] [--for W
 claudesec delegate ME --name N [--dir D] [--ack 理由] <<< 任务书   worker 把小活交给 Cursor worker
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
 claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
-claudesec remind WHEN TARGET 内容 [--every 1d]   定时提醒，到点叫醒秘书；--list [--all]、--cancel ID
+claudesec remind WHEN TARGET 内容 [--every 1d]   定时任务，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec review [--print]       开当天的复盘 worker（整理秘书记忆、提提示词 diff）
 claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
@@ -561,10 +561,16 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 ### 主窗口面板（`claudesec dashboard`）
 
-秘书窗口左边是秘书，右边一列三块面板（窗口宽的 36%，上下三等分；顺序是 `DASH_PANES`，`dashboard_side: "left"` 把这一列放到左边）：
-上面 `dashboard show queue` 显示 queue.md 的「待问 / 待答」（空的那块不显示；「搁置」折成最后一行；不显示「已处理」），
-中间 `dashboard show status` 显示 worker、搁置的名字、未到点提醒，下面 `dashboard show notices` 显示 notices.md 的「待办」：
-要用户去做、但不用拍板的事（去某窗口说 push、在 VNC 里装扩展）。通知和决策队列共用编号序列（queue.last），用户说「46」不会有歧义。
+秘书窗口左边是秘书，右边一列四块面板（窗口宽的 36%，上下四等分；顺序是 `DASH_PANES`，`dashboard_side: "left"` 把这一列放到左边）。
+从上到下（用户 2026-10-27 定的）：
+1. 待办事项，`dashboard show notices`：notices.md 的「待办」，要用户去做、但不用拍板的事（去某窗口说 push、在 VNC 里装扩展）。
+   待办和决策队列共用编号序列（queue.last），用户说「46」不会有歧义。
+2. 决策队列，`dashboard show queue`：queue.md 的「待问 / 待答」（空的那块不显示；「搁置」折成最后一行；不显示「已处理」）。
+3. 任务进展，`dashboard show status`：worker、搁置的名字。最后一行钉着今天的花费（秘书和全部），内容滚动时也不动；
+   面板矮于 5 行时不显示这一行。
+4. 定时任务，`dashboard show reminders`：未到点的 `claudesec remind`，最早的在上，周期的标「每 1d」。
+命令名还是 `notice` / `remind`，只有显示的叫法改了。面板组成变了的版本，旧面板换代（代码变了自动重载）后发现自己的
+`@claudesec-layout` 跟新版不同，就在后台跑一次 `dashboard layout` 重排，不用等终端变尺寸或 --restart。
 - 默认每条折叠成一行（放不下的截成「…」）；点一条展开看全文、再点收起，点标题栏（或 Tab）全部展开 / 收起。
   点完焦点自动还给秘书 pane（tmux 的点击会先把焦点切到面板，不还的话用户接着打字会打进面板里）。
   组与组之间空一行。展开状态在面板进程里，按条目内容记，刷新不丢。
@@ -632,7 +638,7 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   重复 layout 不动已有 pane；新开窗口和 --restart 后面板都在、--restart 只换秘书 pane；杀掉秘书 pane 后面板退出、窗口关闭；
   resize hook 的命令能正确重排。没验证：真用户终端里拖动窗口大小时 client-resized 的触发（tmux 文档行为）。
 
-### 定时提醒（`claudesec remind`）
+### 定时任务（`claudesec remind`）
 
 秘书原先拿后台 Bash 的 sleep 当定时器，秘书重启、compact 就丢，status 里也看不到。现在：
 - 存储：`~/.claudesec/reminders.json`（加锁读写，同 registry）。每条有 id（r1、r2…）、到点时间（带时区的 ISO）、
@@ -644,7 +650,7 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   秘书重启后新的检查进程等旧的交出锁再接手。到点的先标 fired 再投递，所以最多投一次。
   秘书没在跑（包括整机重启）时不检查：提醒还在文件里，下次启动时补发，并注明迟到多久。没有用 launchd：
   投递的去处是秘书或 worker，它们都要 claudesec 在跑才有意义。
-- 投递：一律写告警叫醒秘书（「[提醒 rN]」开头），由秘书路由，不直接找 worker。用户定的：「肯定是先找你呀，
+- 投递：一律写告警叫醒秘书（「[定时任务 rN]」开头），由秘书路由，不直接找 worker。用户定的：「肯定是先找你呀，
   你维护的脚本，你是我的秘书」。也因为秘书能 SendMessage 给在跑的 Claude Code worker，claudesec 自己不能；
   转不转、告不告诉用户（「别打扰我」）也是秘书的判断。曾做过直投 worker 的 --direct（搁置的 wake、Cursor 用 send），
   按用户这句去掉了。

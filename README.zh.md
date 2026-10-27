@@ -35,7 +35,7 @@
 | `secretary_name` | `"secretary"` | 秘书的会话名，worker 用它发汇报 |
 | `tmux_session` | `"claudesec"` | 秘书和 worker 所在的 tmux session |
 | `cursor` | `"auto"` | Cursor worker（`spawn --agent cursor`、worker 的 `claudesec delegate`）能不能用。`"auto"`：机器上有 `agent` 命令就能用；`false` 关掉；`true` 要用（没装 `agent` 仍不可用）。不可用时这两个命令拒绝并说明原因，秘书和 worker 的规则里也不出现交给 Cursor 的内容。`claudesec status` 末尾显示当前状态。改完 `claudesec --restart`，worker 下次启动或唤醒时生效 |
-| `dashboard` | `true` | 秘书窗口右侧的三块面板，从上到下：决策队列（待问、待答，搁置的折成最后一行）、任务进展（worker 的状态、距今、token 用量，搁置，未到点提醒）、通知消息（`claudesec notice` 登记的、要用户去做的事），3 秒刷新。`dashboard_side: "left"` 把这一列放到秘书左边。每条默认折叠成一行，点一条展开看全文，点标题栏全部展开 / 收起；各自用鼠标滚轮上下滚（焦点在面板上时也可以用 ↑↓ / PgUp PgDn / g G）。窗口宽 ≥110 列显示，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
+| `dashboard` | `true` | 秘书窗口右侧的四块面板，从上到下：待办事项（`claudesec notice` 登记的、要用户去做的事）、决策队列（待问、待答，搁置的折成最后一行）、任务进展（worker 的状态、距今、token 用量和今天的花费，搁置的；最后一行是秘书和全部今天的花费）、定时任务（`claudesec remind` 登记、还没到点的），3 秒刷新。`dashboard_side: "left"` 把这一列放到秘书左边。每条默认折叠成一行，点一条展开看全文，点标题栏全部展开 / 收起；各自用鼠标滚轮上下滚（焦点在面板上时也可以用 ↑↓ / PgUp PgDn / g G）。窗口宽 ≥110 列显示，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
 | `language` | 不设 | `"zh"` 或 `"en"`，见[语言](#语言) |
 | `claude_config_dir` | 自动 | Claude Code 的配置目录。如果 `CLAUDE_CONFIG_DIR` 只在 claude 的启动脚本里设，从 tmux 起的 claudesec 进程看不到它；hook 第一次运行时会自动记到这里。想一开始就对，手动写上（比如 `"/home/me/.agentlodge/claude"`）|
 
@@ -81,9 +81,9 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
     claudesec budget --until 20:00 --usd 100   # 给所有 worker 设一个花费窗口：剩 15% 提示收尾，到点冻结
     claudesec budget --add 50 | --until 23:00 | --from 09:00 --until 18:00 | --off   # 追加、预约下一个窗口、关掉
     claudesec cost --today      # 今天各 worker、各模型花了多少（按官方单价折算；claudesec cost 名字 --since 3h）
-    claudesec dashboard off    # 关掉秘书右侧的队列 / 进展 / 通知面板（on 打开）
+    claudesec dashboard off    # 关掉秘书右侧的待办 / 队列 / 进展 / 定时任务面板（on 打开）
     claudesec notice add --from W "去 W 窗口说 push"   # 要用户去做的事；notice done N 标完成
-    claudesec show 46          # 决策队列或通知 #46 的全文（面板里点一下那条也会展开）
+    claudesec show 46          # 决策队列或待办事项 #46 的全文（面板里点一下那条也会展开）
     claudesec queue list --older 7   # 等了一周以上的未定条目
     claudesec queue doctor     # 检查 queue.md（行号前缀、重复分区、编号重复）；--fix 修
     claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Cursor worker 换模型就用它

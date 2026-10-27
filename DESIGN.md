@@ -662,6 +662,29 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 到点出告警；run 换代后旧检查进程退出、新的接手；改成 22 分钟前到点的提醒补发时带「迟到 22 分钟」；
 status 列出未到点的提醒。
 
+### 巡检：可能过期的决策和待办（`claudesec stale`）
+
+用户 2026-10-27：「你得帮我主动看一下待办事项和决策队列，有过期的自动清理，不要每次都让我追问。」先试过给秘书登记每天的
+定时任务，用户说这该是 claudesec 内置的。于是 claudesec 做机械判断、挑出来提示秘书，秘书核实后清；claudesec 自己不删。
+- 查哪些：决策队列的「待问」「待答」和待办事项的「待办」，有编号的。「搁置」「记录」是用户说了以后再提的，不查。
+- 三种理由，每种一个 key，记在 `stale.json`（按条目），同一条同一个理由只提一次，条目不在了就忘掉：
+  - `closed`：标的 `[worker]` 不在注册表、历史里有它（`claudesec close` 过），附归档日期。
+  - `merged:N,…`：条目里写的 `!N` 全部已合。在标的 worker 的目录及其下一层的 git 仓库里找远端分支上的 merge commit
+    「See merge request: !N」（Codebase 和 GitLab 都这么写），按仓库存储去重（共享一个仓库的 worktree 只读一次）。
+    只看上次 fetch 到的，不 fetch：拿不到的结果是漏报，不会误报成已合。!N 是各仓库各自的编号，所以提示里写出在哪个仓库合的，
+    让秘书判断是不是同一个。只合了一部分的不提。
+  - `age:k`：放了 ≥ `stale_days`（默认 7）天，k = 天数 // stale_days，所以每多 7 天再提一次。待答从「已问」那天算，
+    其余从加入那天算（`queue-meta.json`；`notice add` 现在也记）。没有日期的不按天数提。
+- 什么时候看：提醒检查器每 5 分钟一次；worker 报 DONE、`claudesec close` 时写 `stale-due`，检查器下一轮（≤15 秒）就看。
+  新理由写成「[巡检]」告警叫醒秘书。用户当天第一次发消息时（UserPromptSubmit，跟复盘同一个触发点），把当前全部候选附进
+  注入的上下文，让秘书回应之前先清一遍。
+- 没做：自动删（用户说的「自动清理」由秘书执行，claudesec 只提供能机械判断的部分）；查 MR 关闭未合（git 里看不出）；
+  没标 worker 的条目查 MR（不知道是哪个仓库）。
+
+已验证（单测 tests/test_stale.py）：三种理由、搁置和记录不查、提一次不重复、过 14 天再提、条目清掉后忘掉、`stale_days: 0`、
+当天第一条消息附上并不再告警、DONE / close 触发、待办记加入日期。手跑：拿 10-23 的 queue.md 备份和真实注册表、历史，
+挑出 3 条标了已关闭 worker 的；造的条目里 !354 !355 认出已在 alert-atlas 合入，用时约 0.2 秒。
+
 ### Cursor worker（`spawn --agent cursor`）
 
 跑的是 Cursor 的 `agent` CLI。Claude Code 那一套它都没有：没有按会话装的 hook（`--settings`）、没有

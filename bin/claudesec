@@ -23,6 +23,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec notice add [--from W] TEXT   a to-do (待办事项): something for the user to do, not decide;
                                     notice done N, notice list
   claudesec show N                       the whole of queue item or to-do #N
+  claudesec stale                        open queue items and to-dos that look out of date (closed worker,
+                                    merged MRs, waited stale_days); the secretary is told of new ones
   claudesec dashboard on|off              panes beside the secretary, top to bottom: to-dos, decisions,
                                     progress, scheduled tasks (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
@@ -113,6 +115,7 @@ DEFAULT_CONFIG = {
     "runaway_pool_share": 0.3,
     "runaway_usd": 20,
     "runaway_quiet_minutes": 60,
+    "stale_days": 7,                  # an open queue item or to-do this old is pointed out to the secretary
     "cursor_max_running": None,       # local Cursor workers at work at once; spawn / wake / delegate past it
                                       # refuse. None: half the CPU cores (at least 1); 0: no limit
     "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
@@ -1428,6 +1431,7 @@ def cmd_notice(args):
     if args.action == "add":
         text = " ".join(args.words).strip() or sys.exit("notice add: what should the user do?")
         n = take_queue_number("")
+        note_added(n)  # its age, for the sweep
         item = f"- #{n} " + (f"[{args.source}] " if args.source else "") + text
         at = next(i for i, l in enumerate(lines) if l.startswith("## ") and notice_section(l) == "open")
         end = next((i for i in range(at + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
@@ -3181,6 +3185,7 @@ def cmd_close(args):
     if w.get("window"):
         tmux("kill-window", "-t", w["window"], check=False)
     note = "" if w.get("archived") else tr("（注意：未归档）", " (note: not archived)")
+    (HOME / "stale-due").touch()  # items tagged with it may be orphans now
     print(f"closed {args.name}{note}")
 
 
@@ -3888,7 +3893,7 @@ def check_reminders(run_pid):
     """Runs alongside the secretary, for as long as its `claudesec run` is the current one.
     The lock hands over from an older checker whose secretary is gone. Runaway spending is
     looked at here too, less often."""
-    last_runaway = 0.0
+    last_runaway = last_stale = 0.0
     with open(HOME / "reminders-checker.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
@@ -3899,6 +3904,11 @@ def check_reminders(run_pid):
                 last_runaway = time.monotonic()
                 with contextlib.suppress(Exception):  # a bad transcript line mustn't stop the reminders
                     check_runaway()
+            if time.monotonic() - last_stale >= STALE_CHECK_SECS or (HOME / "stale-due").exists():
+                last_stale = time.monotonic()
+                (HOME / "stale-due").unlink(missing_ok=True)
+                with contextlib.suppress(Exception):  # nor a broken queue.md or git checkout
+                    check_stale()
             time.sleep(REMINDER_CHECK_SECS)
 
 
@@ -3912,6 +3922,155 @@ def print_reminders():
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
                          r["target"], r["text"][:60]))
         print_rows(rows)
+
+
+# ---------- sweep: queue items and to-dos that may be out of date ----------
+# The user, 2026-10-27: "look at the to-dos and the decision queue yourself and clear out what has
+# expired; don't make me chase it every time". claudesec points out what it can tell mechanically
+# (the worker an item is tagged with is closed, every MR it names is merged, it has waited long);
+# the secretary checks each and clears it or keeps it. Nothing is removed here. Backlog and
+# ideas are the user's to bring up, and are left alone.
+
+STALE_CHECK_SECS = 300
+MERGED = re.compile(r"See merge request:?\s*\S*?!(\d+)\b")
+
+
+def worker_places():
+    """{name: (directory, closed on)} of every worker claudesec knows: the registry's (closed
+    None), and from the history files those closed since (the date of their record)."""
+    out = {}
+    with contextlib.suppress(OSError):
+        for path in sorted((HOME / "history").glob("*/*.md")):
+            text = path.read_text()
+            if not text.startswith("---\n"):
+                continue
+            meta = {}
+            for line in text.split("\n---\n", 1)[0].splitlines()[1:]:
+                key, _, value = line.partition(": ")
+                with contextlib.suppress(ValueError):
+                    meta[key] = json.loads(value)
+            if meta.get("worker") not in (None, "subagent"):
+                out[meta["worker"]] = (meta.get("project") or "", path.name[:10])
+    for name, w in read_registry()[1].items():
+        out[name] = (w["dir"], None)
+    return out
+
+
+def git_store(checkout):
+    """The repository a checkout's .git is or points to, worktrees resolved to the one they share."""
+    dot = checkout / ".git"
+    if dot.is_dir():
+        return dot.resolve()
+    with contextlib.suppress(OSError):
+        target = dot.read_text().strip().removeprefix("gitdir:").strip()
+        return (checkout / target).resolve().parent.parent if "/worktrees/" in target else (checkout / target).resolve()
+    return None
+
+
+def merged_mrs(directory, cache):
+    """{MR number: repository} merged in the git checkouts at or just under directory, by the
+    merge commits on origin's branches ("See merge request: !N"). By what was last fetched:
+    nothing is fetched here. Several repositories may have an !N; the first found is named."""
+    if directory in cache:
+        return cache[directory]
+    found, root = {}, Path(directory)
+    checkouts = [root] + (sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
+    stores = {git_store(c) for c in checkouts if (c / ".git").exists()} - {None}
+    for store in sorted(stores):
+        if store not in cache:  # a repository many worktrees share is read once
+            git = ["git", f"--git-dir={store}"]
+            url = subprocess.run(git + ["remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
+            log = subprocess.run(git + ["log", "--merges", "--since=180.days", "--remotes=origin", "--format=%B"],
+                                 capture_output=True, text=True).stdout if url else ""
+            name = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+            cache[store] = {int(m[1]): name for m in MERGED.finditer(log)}
+        for n, name in cache[store].items():
+            found.setdefault(n, name)
+    cache[directory] = found
+    return found
+
+
+def stale_items():
+    """[(where, number, tag, text, [(key, reason)])] for the open items that may be out of date:
+    where "queue" (待问, 待答) or "notice" (待办). The key tells one reason from another, so each
+    is pointed out once."""
+    cfg, meta, places, cache = config(), queue_meta(), worker_places(), {}
+    days = cfg.get("stale_days") or 0
+    items = [("queue", n, tag, body, section, note) for section, n, tag, body, note in queue_items(queue_text())
+             if section in ("todo", "doing")]
+    items += [("notice", n, tag, text, "todo", None) for n, tag, text in open_notices()]
+    out = []
+    for where, n, tag, text, section, note in items:
+        if not n:
+            continue
+        reasons = []
+        place, closed = places.get(tag, (None, None)) if tag else (None, None)
+        if closed:
+            reasons.append(("closed", tr(f"标的 worker {tag} 已关闭（{closed} 归档）",
+                                         f"the worker it names, {tag}, is closed (archived {closed})")))
+        mrs = sorted({int(m) for m in re.findall(r"(?<![\w!])!(\d+)\b", text)})
+        if mrs and place:
+            merged = merged_mrs(place, cache)
+            if all(m in merged for m in mrs):
+                repos = sorted({merged[m] for m in mrs})
+                reasons.append((f"merged:{','.join(map(str, mrs))}",
+                                tr(f"提到的 {'、'.join(f'!{m}' for m in mrs)} 都已合入（{'、'.join(repos)}）",
+                                   f"{', '.join(f'!{m}' for m in mrs)}, all it names, are merged ({', '.join(repos)})")))
+        age = item_age(n, section, note, meta)
+        if days and age is not None and age >= days:
+            reasons.append((f"age:{age // days}", tr(f"放了 {age} 天", f"waiting {age} days")))
+        if reasons:
+            out.append((where, n, tag, text, reasons))
+    return out
+
+
+def stale_lines(found):
+    return [tr(f"- {'决策队列' if where == 'queue' else '待办事项'} #{n} ", f"- {'queue' if where == 'queue' else 'to-do'} #{n} ")
+            + (f"[{tag}] " if tag else "") + cut(" ".join(text.split()), 70)
+            + tr("：", ": ") + tr("；", "; ").join(why for _, why in reasons)
+            for where, n, tag, text, reasons in found]
+
+
+STALE_ADVICE = ("逐条核实（`claudesec show 编号` 看全文）：确实过期的清掉，决策队列 `claudesec queue move 编号 done --note \"原因\"`、"
+                "待办 `claudesec notice done 编号`；还要的留着；拿不准的照常问用户。这是机械判断，只是提示，claudesec 没删任何东西。")
+STALE_ADVICE_EN = ("Check each (`claudesec show N` for the whole item): clear what has expired, `claudesec queue move N done "
+                   "--note \"why\"` for the queue and `claudesec notice done N` for to-dos; keep what is still wanted; ask the "
+                   "user about what you can't tell. A mechanical guess, only a hint: claudesec removed nothing.")
+
+
+def mark_stale(found):
+    """Remember what has been pointed out (stale.json), forgetting items no longer open; returns
+    the part of found not pointed out before."""
+    path = HOME / "stale.json"
+    try:
+        told = json.loads(path.read_text())
+    except (OSError, ValueError):
+        told = {}
+    fresh, keep = [], {}
+    for where, n, tag, text, reasons in found:
+        before = told.get(f"{where}:{n}", [])
+        new = [r for r in reasons if r[0] not in before]
+        if new:
+            fresh.append((where, n, tag, text, new))
+        keep[f"{where}:{n}"] = sorted(set(before) | {k for k, _ in reasons})
+    tmp = HOME / f".stale.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(keep, indent=1) + "\n")
+    os.replace(tmp, path)
+    return fresh
+
+
+def check_stale():
+    """Every few minutes, and soon after a DONE or a close: what newly looks out of date goes to
+    the secretary as an alert."""
+    fresh = mark_stale(stale_items())
+    if fresh:
+        raise_alert("\n".join([tr("[巡检] 这些条目可能已经过期：", "[sweep] These items may be out of date:"),
+                               *stale_lines(fresh), tr(STALE_ADVICE, STALE_ADVICE_EN)]))
+
+
+def cmd_stale(args):
+    found = stale_items()
+    print("\n".join(stale_lines(found)) if found else tr("没有看起来过期的条目。", "Nothing looks out of date."))
 
 
 # ---------- daily review: tidy the secretary's memory, propose prompt changes ----------
@@ -4018,6 +4177,8 @@ def record_report(name, text):
     (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
     if typ in TERMINAL:
         (worker_dir(name) / "reported").write_text(typ)
+    if typ == "DONE":
+        (HOME / "stale-due").touch()  # what it was waiting on may be settled now; the sweep looks soon
     after = worker_dir(name) / AFTER_REPORT
     if typ in TERMINAL:
         after.write_text("reported")  # "idle" once that turn ends; see back_at_work
@@ -4654,12 +4815,21 @@ def hook_secretary_prompt():
     if last == today:
         return
     seen.write_text(today + "\n")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext":
-        tr(f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
-           "收据一行，再回应用户这条消息。",
-           f"[claudesec] This is the first time you see the user today (last time: {last or 'no record'}): first "
-           "run `claudesec review` to start today's review worker, give a one-line receipt, then answer the "
-           "user's message.")}}, ensure_ascii=False))
+    context = tr(f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
+                 "收据一行，再回应用户这条消息。",
+                 f"[claudesec] This is the first time you see the user today (last time: {last or 'no record'}): first "
+                 "run `claudesec review` to start today's review worker, give a one-line receipt, then answer the "
+                 "user's message.")
+    found = []
+    with contextlib.suppress(Exception):  # a broken queue.md mustn't hold up the user's message
+        found = stale_items()
+        mark_stale(found)
+    if found:  # all of them, not only the new: the start of the day is when to tidy up
+        context += "\n\n" + "\n".join([tr("[巡检] 决策队列和待办事项里可能过期的条目，回应用户之前先清一遍：",
+                                            "[sweep] Queue items and to-dos that may be out of date; clear them before "
+                                            "answering the user:"), *stale_lines(found), tr(STALE_ADVICE, STALE_ADVICE_EN)])
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},
+                     ensure_ascii=False))
 
 
 def done_heading(text):
@@ -5115,6 +5285,7 @@ def main():
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
     s = sub.add_parser("show"); s.add_argument("number"); s.set_defaults(fn=cmd_show)
+    sub.add_parser("stale").set_defaults(fn=cmd_stale)
     s = sub.add_parser("notice"); s.set_defaults(fn=cmd_notice)
     notice = s.add_subparsers(dest="action", required=True)
     s = notice.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--from", dest="source")

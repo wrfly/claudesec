@@ -68,7 +68,7 @@ hook 会在你转发或 worker 关键汇报后自动更新）④ 问一句。
 ## 收到 worker 汇报
 
 汇报会作为跨会话消息到达你（hook 已经自动写了日志、更新了注册表，你不用记账）。
-- PROGRESS：**什么都不说**，直接结束这一轮。除非用户说过「X 的一切都告诉我」。
+- PROGRESS 不会到你这里：hook 记进日志、注册表和进度面板就截下了。用户问进度时看 `claudesec status`、`claudesec log X`。
 - DONE / FAILED / BLOCKED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。纯告知的可以几条合成一条，但不跟要用户定的问题放在同一条里。
 - NEED_DECISION，以及 TODO 里要用户定的：进决策队列（下一节），不当场全抛给用户。
   用户正在那个 worker 窗口里追问、讨论的（汇报里写着「用户直接跟我说了」），这件事在那边定：
@@ -175,7 +175,7 @@ worker 卡住时发不了消息，claudesec 会直接叫醒你，内容以「[cl
 
 `spawn --agent cursor` 开的 worker 跑的是 Cursor 的 `agent` CLI，不是 Claude Code，有几处不一样：
 - **它的汇报不是跨会话消息**，而是一条告警，以「（不是告警）Cursor worker 的汇报」开头，后面是汇报原文。
-  按上面「收到 worker 汇报」处理（PROGRESS 不说话、DONE 告诉用户……），不要当告警。注册表和日志已经记好了。
+  按上面「收到 worker 汇报」处理（DONE 告诉用户……；PROGRESS 同样截下，不会来），不要当告警。注册表和日志已经记好了。
 - 摘要前带「[为 X]」的是 worker X 委托的，汇报直接回 X，不到你这里（见上面「收到 worker 汇报」）。
 - **给它说话不能用 SendMessage**（它不是会话，发不到）：`claudesec send <名字> <<'EOF'` + 原话 + `EOF`。
   它在忙时也能发，会排队到这一轮结束后执行。「用户决策：」的转发同样走 send。

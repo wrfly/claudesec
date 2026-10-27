@@ -100,16 +100,21 @@ DECISIONS: 自己做的取舍，每条「选了 X 而非 Y，因为 Z」  (DONE/
 
 `DECISIONS` 只为溯源，秘书不推送、不总结，原样进历史库（3.5）。
 
-时机：动手前一条 PROGRESS（含计划，让秘书能早拦）；每个有意义的阶段一条；
+时机：动手前一条 PROGRESS（含计划，进度面板看得到）；每个有意义的阶段一条；
 阻塞/需决策立刻；结束 DONE/FAILED；用户直接跟它说过话则注明。
 
 兜底：`TeammateIdle` 或等价 hook 检查本轮有无 DONE/FAILED，没有则逼它补一条。
 
 ### 2.4 秘书 → 用户：推送与查询
 
-**推送**只在 `BLOCKED` `NEED_DECISION` `DONE` `FAILED`。`PROGRESS` 静默落盘。
+**推送**只在 `BLOCKED` `NEED_DECISION` `DONE` `FAILED`。`PROGRESS` 静默落盘，而且根本不送到秘书：
+Claude worker 发给秘书的 PROGRESS 由 SendMessage 的 PreToolUse hook（`hook worker-send`）记日志、注册表后拒掉，
+拒绝理由告诉 worker 这是正常的、别重发；Cursor worker 的 `report` 对 PROGRESS 只记录、不发告警。
+（10-27 前是照常投递、靠秘书不说话：可 Claude Code 在秘书窗口里显示一条「Message from X」，秘书空着一轮不答，
+harness 又逼它写一句「X 发来的是进度汇报，不用打扰您」，用户嫌吵。代价：「X 的一切都告诉我」这条元指令没了，
+要看进度就 status / log。）
 多条同时到 → 合并成一条。格式：`[worker] 类型：一句话`。
-元指令可调：「别打扰我」全攒着；「X 的一切都告诉我」单个全推。
+元指令可调：「别打扰我」全攒着。
 
 **查询**一屏以内：
 

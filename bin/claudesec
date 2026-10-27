@@ -229,6 +229,11 @@ def parse_report(text):
     return {k: v.strip() for k, v in fields.items()}
 
 
+def report_type(r):
+    """A parsed report's TYPE word: DONE, PROGRESS, ...; UNTYPED when it has none."""
+    return r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
+
+
 def width(s):
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
 
@@ -1813,7 +1818,8 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memo
     own = {"autoMemoryDirectory": memory} if memory else memory_settings(cwd)
     (d / "settings.json").write_text(json.dumps({**own, "hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook worker-session-start {q}"}]}],
-        "PreToolUse": budget,
+        "PreToolUse": [*budget, {"matcher": "SendMessage",
+                                 "hooks": [{"type": "command", "command": f"{cmd} hook worker-send {q}"}]}],
         "PermissionRequest": [{"matcher": "*", "hooks": [asking]}],
         "Notification": [{"matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
                           "hooks": [asking]}],
@@ -4150,6 +4156,25 @@ def hook_worker_session_start(name):
             reg["workers"][name]["session"] = data.get("session_id")
 
 
+def hook_worker_send(name):
+    """PreToolUse on SendMessage: a PROGRESS for the secretary is recorded (log, registry, the
+    progress pane) and not sent. Delivered, it showed in the secretary's window as a message, and
+    a turn that answered it with nothing got pushed by Claude Code to say something anyway."""
+    data = hook_input()
+    inp = data.get("tool_input") or {}
+    text = str(inp.get("message", ""))
+    if not str(inp.get("to", "")).startswith(config()["secretary_name"]) or report_type(parse_report(text)) != "PROGRESS":
+        return
+    record_report(name, text)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": tr(
+            "[claudesec] 这条 PROGRESS 已记下（日志、注册表、进度面板），按规矩不送给秘书，免得打扰用户。"
+            "这不是出错，不要重发，接着干活。",
+            "[claudesec] This PROGRESS is recorded (log, registry, the progress pane) and by design not sent to "
+            "the secretary, so the user isn't disturbed. Not an error: don't resend it, carry on.")}},
+        ensure_ascii=False))
+
+
 def hook_worker_report(name):
     data = hook_input()
     sec = config()["secretary_name"]
@@ -4163,7 +4188,7 @@ def record_report(name, text):
     """A worker's report: log, registry status and summary, focus, the 'reported' marker."""
     append_log(name, "worker→secretary", text)
     r = parse_report(text)
-    typ = r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
+    typ = report_type(r)
     with registry() as reg:
         w = reg["workers"].get(name)
         if w is not None:
@@ -4209,17 +4234,19 @@ def cmd_report(args):
                  f"your final answer to the agent that started you.")
     record_report(args.name, text)
     boss = read_registry()[1][args.name].get("delegated_by")
+    r = parse_report(text)
+    typ = report_type(r)
     if boss:
         # Straight back to the delegator, whose `claudesec wait` reads it off the log. The
         # secretary sees the status; it is woken only for what may need it or the user.
-        r = parse_report(text)
-        typ = r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
         if typ in ("FAILED", "BLOCKED"):
             why = (r.get("ISSUE") or r.get("DID") or text).splitlines()[0][:120]
             receipt(tr(f"{args.name}（为 {boss}）{typ}：{why}", f"{args.name} (for {boss}) {typ}: {why}"))
         if typ == "DONE":
             (worker_dir(args.name) / "finish").write_text(now())  # archived and closed when the turn ends
         print(f"reported to {boss}")
+    elif typ == "PROGRESS":  # as a Claude Code worker's (hook_worker_send): not to wake the secretary for
+        print("recorded: a PROGRESS goes to the log and the progress pane, not to the secretary")
     elif secretary_alive():
         raise_alert(tr(f"{CURSOR_REPORT}「{args.name}」：\n{text}", f"{CURSOR_REPORT_EN} \"{args.name}\":\n{text}"))
         print(f"reported to {config()['secretary_name']}")
@@ -5223,6 +5250,7 @@ HOOKS = {
     "worker-permission-done": hook_worker_permission_done,
     "secretary-watch": hook_secretary_watch,
     "secretary-watch-failed": hook_secretary_watch_failed,
+    "worker-send": hook_worker_send,
     "worker-report": hook_worker_report,
     "worker-stop": hook_worker_stop,
     "worker-stop-failure": hook_worker_stop_failure,

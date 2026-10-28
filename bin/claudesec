@@ -4055,10 +4055,12 @@ def stale_lines(found):
 
 
 STALE_ADVICE = ("逐条核实（`claudesec show 编号` 看全文）：确实过期的清掉，决策队列 `claudesec queue move 编号 done --note \"原因\"`、"
-                "待办 `claudesec notice done 编号`；还要的留着；拿不准的照常问用户。这是机械判断，只是提示，claudesec 没删任何东西。")
+                "待办 `claudesec notice done 编号`；还要用户定的现在就问，没人在等的想法 `claudesec queue move 编号 ideas` 挪进「记录」，"
+                "别只回一句「先留着」。这是机械判断，只是提示，claudesec 没删任何东西。")
 STALE_ADVICE_EN = ("Check each (`claudesec show N` for the whole item): clear what has expired, `claudesec queue move N done "
-                   "--note \"why\"` for the queue and `claudesec notice done N` for to-dos; keep what is still wanted; ask the "
-                   "user about what you can't tell. A mechanical guess, only a hint: claudesec removed nothing.")
+                   "--note \"why\"` for the queue and `claudesec notice done N` for to-dos; ask the user now about what still "
+                   "needs them, move ideas nobody waits on to Ideas with `claudesec queue move N ideas`; don't just keep them. "
+                   "A mechanical guess, only a hint: claudesec removed nothing.")
 
 
 def mark_stale(found):

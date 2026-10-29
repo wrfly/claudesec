@@ -180,6 +180,12 @@ tmux pane id，`SendMessage` 可互发。
 5. `--agent` 的正文会**替换**默认系统提示 → 不用 agent 文件，改用 `--append-system-prompt-file`。
 6. worker 等后台 subagent 时会结束本轮；Stop hook 若照常逼汇报，worker 只能发假 BLOCKED
    → Stop hook 输入里 `background_tasks` 非空时放行。
+7. （2026-10-30，claude 2.1.312）`remote_control` 开着时会话带 `--rc` 启动，AgentLodge 的启动脚本把它换成
+   `--dangerously-load-development-channels server:agentlodge`，Claude Code 每次启动都弹「WARNING: Loading development
+   channels」，默认选中「I am using this for local development」，回车进会话；另一项「Exit」和 Esc 都会退出 claude
+   → claudesec 只在框在屏幕底部时按回车（spawn / wake / adopt 的启动检查、看门狗、秘书自己的 `claudesec run`），不按 Esc。
+   网页发来的话以 `<channel source="agentlodge"` 开头进会话（排队的 prompt，isMeta）。没实测 UserPromptSubmit 对它触不触发：
+   触发就当用户的话（不在 NOT_USER 里），进度照常附上、算今天见过用户；不触发，进度留到下一轮，什么也不丢。
 
 ### 3.2 组件（已实现）
 

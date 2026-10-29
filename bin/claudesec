@@ -131,6 +131,13 @@ CURSOR_REPORT = "（不是告警）Cursor worker 的汇报，经告警通道送�
 CURSOR_REPORT_EN = "(not an alert) Cursor worker report, come by the alert channel; handle it as an ordinary report"
 WAITING = {"BLOCKED", "NEED_DECISION", "WAITING_PERMISSION"}
 LABELS = {"WAITING_PERMISSION": "等你批权限", "API_ERROR": "API 出错"}  # English: STATUS_LOOK
+
+
+def settled(status):
+    """The status to go back to: a dialog or an API error is the process's of the moment, gone
+    once it is answered, a turn ends or the process is shelved; never put back as is (with its
+    pending_ask cleared, it was an API_ERROR with nothing to say)."""
+    return status if status and status not in LABELS and status != "SHELVED" else "PROGRESS"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -890,9 +897,9 @@ def status_blocks(cols, now=None):
         if w.get("window") not in alive and group < 3 and w["status"] != "FAILED":
             word += tr(" · 窗口关了", " · window closed")
         if group == 0 or w["status"] == "API_ERROR":
-            summary = w.get("pending_ask") or w.get("last_summary") or w["task"]
+            summary = w.get("pending_ask") or w.get("last_summary") or w.get("task") or tr("（无摘要）", "(no summary)")
         else:
-            summary = w.get("last_summary") or w["task"]
+            summary = w.get("last_summary") or w.get("task") or tr("（无摘要）", "(no summary)")
         summary = " ".join(summary.split())
         if w.get("delegated_by"):
             summary = tr(f"为 {w['delegated_by']}：", f"for {w['delegated_by']}: ") + summary
@@ -1704,7 +1711,8 @@ def wake_orphans():
                 continue
             running = cursor_running(w) if is_cursor(w) else live_holder(w.get("session"))
             if not running and conversation_exists(w):
-                w.update(status_before=w["status"], status="SHELVED", window=None, shelved_by="exit")
+                w.update(status_before=settled(w.get("status_before") if w["status"] in LABELS else w["status"]),
+                         status="SHELVED", window=None, shelved_by="exit", pending_ask=None)
                 names.append(name)
     threads, failed = [], {}
     for name in names:
@@ -2939,7 +2947,8 @@ def cmd_shelve(args):
     summary = args.note or last_turn(sid) or tr("（无记录）", "(no record)")
     with registry() as reg:
         reg["workers"][name] = {**entry, "status": "SHELVED", "window": None, "session": sid,
-                                "status_before": entry.get("status"),
+                                "status_before": settled(entry.get("status_before") if entry.get("status") in LABELS
+                                                         else entry.get("status")),
                                 "shelved_by": getattr(args, "by", "user"),
                                 "dir": cwd, "shelved_at": now(), "note": args.note or "",
                                 "shelf_summary": summary, "pending_ask": None,
@@ -3030,7 +3039,7 @@ def cmd_wake(args):
         with registry() as reg:
             w = reg["workers"][name]
             if quiet:
-                w["status"] = w.get("status_before") or "PROGRESS"
+                w["status"] = settled(w.get("status_before"))
             elif not w.get("delegated_by"):  # a delegated one is its delegator's business
                 reg["focus"] = name
             w.pop("shelved_by", None)
@@ -3175,8 +3184,8 @@ def print_workers(focus, workers):
         if w.get("last_report_at"):
             secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
             age = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.1f}h"
-        summary = (w.get("pending_ask") if w["status"] in LABELS else
-                   w.get("last_summary") or w["task"]).replace("\n", " ")
+        summary = ((w.get("pending_ask") if w["status"] in LABELS else None) or w.get("last_summary")
+                   or w.get("task") or tr("（无摘要）", "(no summary)")).replace("\n", " ")
         if w.get("delegated_by"):
             summary = tr(f"[为 {w['delegated_by']}] ", f"[for {w['delegated_by']}] ") + summary
         rows.append(("*" if name == focus else "", name, w["model"].replace("claude-", ""),
@@ -4766,7 +4775,7 @@ def hook_cursor_stop():
     if w["status"] == "API_ERROR":
         with registry() as reg:
             w = reg["workers"][name]
-            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["status"] = settled(w.pop("status_before", None))
             w["pending_ask"] = None
     marker = d / "reported"
     nobody = not w.get("delegated_by") and not secretary_alive()
@@ -4807,7 +4816,7 @@ def hook_worker_stop(name):
     with registry() as reg:  # a turn that ends normally is past any API error
         w = reg["workers"].get(name)
         if w is not None and w["status"] == "API_ERROR":
-            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["status"] = settled(w.pop("status_before", None))
             w["pending_ask"] = None
     if data.get("background_tasks"):
         return  # waiting on its own background subagents; it will be woken and report then
@@ -5278,7 +5287,7 @@ def permission_answered(name):
     with registry() as reg:
         w = reg["workers"].get(name)
         if w is not None and w["status"] == "WAITING_PERMISSION":
-            w["status"] = w.pop("status_before", None) or "PROGRESS"
+            w["status"] = settled(w.pop("status_before", None))
             w["pending_ask"] = None
             append_log(name, "permission", "answered")
 

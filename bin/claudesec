@@ -46,6 +46,7 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec adopt SESSION [--as NAME] [--wait]   take over an idle session (name, bg job id or session id;
                                             keeps its history); an exited session by its session id
   claudesec shelve NAME [--note N] [--force]   stop a worker or outside session, keep only its record
+                                    (refused while it works, or when its last report is a PROGRESS; --force)
   claudesec wake NAME [--model M] [--dir D] [< instruction]   resume a shelved one in a new window (history
                                     kept); --dir: in D, for a worker whose directory moved
   claudesec redir OLD NEW                a directory moved (repo renamed): workers recorded in OLD go to NEW
@@ -227,6 +228,15 @@ def parse_report(text):
         elif key:
             fields[key] += "\n" + line
     return {k: v.strip() for k, v in fields.items()}
+
+
+def unfinished_progress(name):
+    """The worker's last report when it is a PROGRESS, nothing final (DONE / FAILED / BLOCKED /
+    NEED_DECISION) after it; else None."""
+    for header, body in reversed(read_log(name)):
+        if header.endswith("worker→secretary"):
+            return body if report_type(parse_report(body)) == "PROGRESS" else None
+    return None
 
 
 def report_type(r):
@@ -2876,6 +2886,14 @@ def cmd_shelve(args):
         sid, cwd, label = w.get("session"), w["dir"], name
         if not conversation_exists(w):
             sys.exit(f"{name}: no conversation recorded for it, so it could not be woken later. Not shelved.")
+        # Put away mid-task, the work it said it was doing is left hanging (tier-switch, 10-28). Not
+        # for the secretary's exit (wake-all brings it back) or a model switch (woken at once).
+        last = unfinished_progress(name)
+        if last and not args.force and getattr(args, "by", "user") not in ("exit", "model"):
+            sys.exit(f"{name} isn't done: its last report is a PROGRESS, with no DONE / FAILED / BLOCKED / "
+                     f"NEED_DECISION after it, so shelving it now would leave that work hanging. Its last "
+                     f"report:\n{cut(last, 1500)}\nAsk it to finish and report first, or pass --force if it "
+                     f"should stop anyway. Not shelved.")
         if is_cursor(w) and worker_busy(name, w) and not args.force:
             sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
         holder = None if is_cursor(w) else live_holder(sid)
@@ -4309,7 +4327,8 @@ def cmd_model(args):
     works for a Claude Code worker too. A busy worker is left alone (--force cuts it off)."""
     w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
     if w["status"] != "SHELVED":
-        err = quietly(cmd_shelve, name=args.name, note=f"switching to {args.model}", as_name=None, force=args.force)
+        err = quietly(cmd_shelve, name=args.name, note=f"switching to {args.model}", as_name=None, force=args.force,
+                      by="model")
         if err:
             sys.exit(f"model: {err}")
     with registry() as reg:

@@ -474,7 +474,9 @@ claudesec archive NAME --summary S --tags a,b [--files x,y]
 claudesec archive SLUG --subagent --task T --summary S [--tags] [--dir D] <<< subagent 返回值
 claudesec lesson TYPE 情况 用户原话
 claudesec sessions              不归 claudesec 管的 Claude 会话（读 Claude Code 的 sessions/<pid>.json）
-claudesec shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）
+claudesec shelve NAME [--note N] [--force]     停进程、关窗口，只留记录（worker 或外部会话）；最后一条汇报是
+                                               PROGRESS、之后没有 DONE/FAILED/BLOCKED/NEED_DECISION 的拒绝，贴出那条
+                                               （10-28 tier-switch 交差前被收）。秘书退出的 shelve-all、换模型不查
 claudesec wake NAME [--model M] [--dir D] [<<< 新指令]     --resume 拉起，历史保留
                                                 目录不在了：/tmp 下的（重启清掉的）重建成空目录；
                                                 redir 记过的搬家照着走；都不是就拒绝并提示 redir / --dir。

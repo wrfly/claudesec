@@ -119,3 +119,9 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`。
 `~/.claudesec/` 是这台机器的状态（注册表、历史、教训、决策队列），秘书的 Claude Code memory 是这台机器上的偏好，都不在 repo 里；
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。
+
+## 改 claudesec 本身
+
+`install.sh` 把 `~/.local/bin/claudesec` 软链到这份 checkout 的 `bin/claudesec`，秘书、每个 worker 的 hook、面板跑的都是这个文件此刻的内容：
+改到一半、rebase 停在冲突上，它们会一起挂掉。改代码、rebase、合并都在单独的 worktree 里做（`git worktree add ../claudesec-dev`），
+在那边跑完测试（`python3 -m unittest discover -s tests`），全部做完确认能用后，再一次性快进更新这份 checkout（`git merge --ff-only`）。

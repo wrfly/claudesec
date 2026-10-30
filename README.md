@@ -151,3 +151,12 @@ These are not in the repo:
 
 To bring the history along, copy `~/.claudesec/history/`. The session ids in its task files can be
 `--resume`d only on the original machine.
+
+## Working on claudesec itself
+
+`install.sh` links `~/.local/bin/claudesec` to this checkout's `bin/claudesec`, so the secretary, every
+worker's hooks and the dashboard run whatever that file holds at the moment: a half-done edit or a rebase
+stopped on a conflict breaks all of them at once. Make changes, rebases and merges in a separate
+worktree (`git worktree add ../claudesec-dev`), run the tests there
+(`python3 -m unittest discover -s tests`), and only then bring this checkout up to date, in one
+fast-forward (`git merge --ff-only`).

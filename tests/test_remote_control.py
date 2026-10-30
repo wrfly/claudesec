@@ -94,18 +94,18 @@ class RemoteControl(unittest.TestCase):
         cfg = self.config()
         self.assertFalse(self.cs.remote_control(cfg))
         self.assertFalse(self.cs.remote_control(cfg, secretary=True))
-        self.assertNotIn("--rc", self.cs.worker_command("w", self.home, cfg, "claude-opus-5-5"))
+        self.assertNotIn("--rc", self.cs.AGENTS["claude"].command("w", "claude-opus-5-5", self.home, cfg))
 
     def test_secretary_only(self):
         cfg = self.config(remote_control="secretary")
         self.assertTrue(self.cs.remote_control(cfg, secretary=True))
-        self.assertNotIn("--rc", self.cs.worker_command("w", self.home, cfg, "claude-opus-5-5"))
+        self.assertNotIn("--rc", self.cs.AGENTS["claude"].command("w", "claude-opus-5-5", self.home, cfg))
 
     def test_all_puts_it_on_workers_too(self):
         for want in ("all", True):
             cfg = self.config(remote_control=want)
             self.assertTrue(self.cs.remote_control(cfg, secretary=True))
-            cmd = self.cs.worker_command("w", self.home, cfg, "claude-opus-5-5", "--resume", "sid", prompt=False)
+            cmd = self.cs.AGENTS["claude"].command("w", "claude-opus-5-5", self.home, cfg, resume="sid", prompt=False)
             self.assertIn("--rc --resume sid", cmd)
 
     def test_the_secretary_starts_with_it(self):
@@ -145,7 +145,7 @@ class RemoteControl(unittest.TestCase):
         self.assertEqual(self.keys, [])
 
     def test_spawn_check_goes_past_it(self):
-        self.assertFalse(self.cs.stuck_on_dialog("plans", "@57"))
+        self.assertFalse(self.cs.stuck_on_dialog("plans", "@57", self.cs.AGENTS["claude"]))
         self.assertEqual(self.keys, ["Enter"])
 
     def test_watchdog_answers_it_without_an_alert(self):

@@ -65,7 +65,7 @@ class English(unittest.TestCase):
         self.assertEqual(self.cs.secretary_prompt().read_text(),
                          self.cs.render_prompt((prompts / "secretary.md").read_text()))
         for agent in ("claude", "cursor"):
-            d = self.cs.prepare_worker("w", {"secretary_name": "secretary"}, "hi", self.home, agent=agent)
+            d = self.cs.prepare_worker("w", {"secretary_name": "secretary"}, "hi", self.home, agent=self.cs.AGENTS[agent])
             self.assertTrue((d / "prompt.md").read_text().startswith("# 你是 ClaudeSec worker「w」"), agent)
 
     def test_first_messages(self):

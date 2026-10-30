@@ -32,7 +32,7 @@ class DelegateArchived(unittest.TestCase):
             session="chat-1", status="DONE", files=[], tags=["delegated", "cursor"]) + "## 任务\nx\n")
         (self.home / "history" / "INDEX.md").write_text(
             "- 2026-10-23 · wt · m1 · DONE · 为 boss：did M1 · #delegated #cursor → 2026-10/2026-10-23-m1.md\n")
-        self.cs.cursor_available = lambda: (True, "test")
+        self.cs.AGENTS["cursor"].available = lambda: (True, "test")
         self.calls = []
 
     def tearDown(self):

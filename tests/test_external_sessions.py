@@ -19,6 +19,11 @@ def load(home):
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    # An external agent's hooks file is global (~/.cursor/hooks.json, ~/.codex/hooks.json): a test
+    # that spawns or wakes one would point the user's real one at this checkout.
+    for cls in vars(mod).values():
+        if isinstance(cls, type) and issubclass(cls, mod.Agent):
+            cls.hooks_file = lambda self, h=Path(home): h / "agent-hooks" / f"{self.protocol}.json"
     return mod
 
 

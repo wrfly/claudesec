@@ -3,7 +3,7 @@
 材料：
 - 秘书的 memory：`{{MEMORY}}`，`MEMORY.md` 是索引（一行一条），其余每个文件一条记忆。
 - 教训：`{{LESSONS}}`。「已处理」一节以上是待复盘的，格式「日期 · 类型 · 情况 · 用户原话」。
-- 提示词：claudesec 仓库 `{{REPO}}` 里的 `prompts/secretary.md`、`prompts/worker.md`、`prompts/worker-cursor.md`。
+- 提示词：claudesec 仓库 `{{REPO}}` 里的 `prompts/secretary.md`、`prompts/worker.md`、`prompts/worker-external.md`。
 - 决策队列 `{{QUEUE}}`、历史索引 `{{INDEX}}`：判断哪些记忆已经过时时参考，不要改它们。
 
 ## 一、整理记忆（直接落盘，不用问）
@@ -21,7 +21,7 @@
    机器/项目专属的、这个用户个人的偏好（比如某类活爱交给谁做、回复用什么语言）留在 memory。纠正一次就写死成「从此所有 X 都…」是过拟合，要么写成判断标准，要么先不提。
 2. 每加一条，同时找能删、能合并的：重复的、已经被代码保证的、过时的。提示词只加不减会撑爆秘书的上下文。
 3. **「铁律」一节一个字都不许改。**
-   `<!-- if X --> … <!-- else --> … <!-- end X -->`（X 为 cursor / codex / delegate）包着的是只在机器上有 Cursor / Codex worker 时才给出的内容（delegate：两者有其一），改的时候保留标记。
+   `<!-- if X --> … <!-- else --> … <!-- end X -->`（X 为 agents/ 下的 agent 名，如 cursor / codex / ttadk，或 delegate）包着的是只在机器上有那种 agent 时才给出的内容（delegate：有一种能被 `claudesec delegate` 开出来），可以嵌套，改的时候保留标记。
 4. 按仓库的 worktree 规则开新 worktree，分支 `review/{{DATE}}`；改完跑通 python3 -m unittest discover -s tests，commit，**不要 push**。
    `git diff origin/main` 存到 `{{REVIEWS}}/{{DATE}}.diff`。
 5. 汇报 NEED_DECISION：DID 写记忆改了什么（几条合并、删了哪些）；ASK 列每一处提示词改动，一行一条，

@@ -44,11 +44,11 @@ class CursorErrors(unittest.TestCase):
             "up": {"agent": "cursor", "status": "PROGRESS", "window": "@1", "task": "t", "model": "m"}}}))
         (self.home / "workers" / "up").mkdir(parents=True)
         self.screen = "Error: Model Blocked"
-        self.cs.cursor_worker = lambda: "up"
+        self.cs.hooked_worker = lambda: "up"
         old = sys.stdin
         sys.stdin = io.StringIO(json.dumps({"status": "error", "model": "grok-4.7-high"}))
         try:
-            self.cs.hook_cursor_stop()
+            self.cs.hook_agent_stop("cursor")
         finally:
             sys.stdin = old
         w = self.cs.read_registry()[1]["up"]
@@ -60,7 +60,7 @@ class CursorErrors(unittest.TestCase):
     def test_send_refuses_a_pasted_model_switch(self):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
             "up": {"agent": "cursor", "status": "DONE", "window": "@1", "task": "t", "model": "m"}}}))
-        self.cs.cursor_running = lambda w: True
+        self.cs.agent_running = lambda w: True
         old = sys.stdin
         sys.stdin = io.StringIO("/model gpt-5.6-sol-high\n")
         try:

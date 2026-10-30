@@ -59,14 +59,14 @@ class CursorLimits(unittest.TestCase):
         self.workers(a={"agent": "cursor", "status": "PROGRESS", "window": "@1"},
                      b={"agent": "cursor", "status": "PROGRESS", "window": "@2"})
         with self.assertRaises(SystemExit) as e:
-            self.cs.cursor_room("delegating c", prefix="NOT DELEGATED: ")
+            self.cs.AGENTS["cursor"].room("delegating c", prefix="NOT DELEGATED: ")
         self.assertTrue(str(e.exception.code).startswith("NOT DELEGATED: delegating c: 2 Cursor workers"))
         self.assertIn("a, b", str(e.exception.code))
-        self.cs.cursor_room("wake a", but="a")  # carrying on one of them is fine
+        self.cs.AGENTS["cursor"].room("wake a", but="a")  # carrying on one of them is fine
         self.config({"cursor_max_running": 3})
-        self.cs.cursor_room("spawn c")
+        self.cs.AGENTS["cursor"].room("spawn c")
         self.config({"cursor_max_running": 0})  # 0: no limit
-        self.cs.cursor_room("spawn c")
+        self.cs.AGENTS["cursor"].room("spawn c")
 
     def test_the_commands_run_under_nice(self):
         # a shell runs these; nice in front of a VAR=value takes it for the program (d32e4aa: every

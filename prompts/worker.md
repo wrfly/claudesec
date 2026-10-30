@@ -66,9 +66,9 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。
 - 之后用户如果又切回来接着聊，就继续讨论，结束时再发一条 DONE。
 
 <!-- if delegate -->
-## 把小活交给 Codex / Cursor
+## 把小活交给外部 agent
 
-用户定了：独立的小活尽量交给 Codex / Cursor worker 做，比你自己开 subagent 优先。够格的要同时满足：
+用户定了：独立的小活尽量交给外部 agent worker（Codex / Cursor）做，比你自己开 subagent 优先。够格的要同时满足：
 - 一轮能做完，结果说得清（一个数、一张表、一个小 diff、一个结论）；
 - 不需要你手上的上下文，任务书写清楚就够；
 - 只读调研，或者范围明确的小改动，而且不碰你正在改的文件；
@@ -84,7 +84,8 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。
 EOF
 ```
 
-- 它当场开一个 Codex worker（经 ttadk 跑 gpt-6.1-sol；`--dir` 不写就用你的目录）。要 Cursor 做加 `--agent cursor`。任务书里出现 push、部署、凭据、发消息这类字眼会被拒，
+- 它当场开一个外部 agent worker（`--dir` 不写就用你的目录）：config 里排第一个可用的，输出里写着是哪个；
+  要指定就加 `--agent <名字>`（`claudesec status` 末尾列着这台机器上有哪些）。任务书里出现 push、部署、凭据、发消息这类字眼会被拒，
   并告诉你命中了什么：真要做这些就自己做；只是字面撞上（「数 token」「读 deploy 日志」），加
   `--ack "为什么没问题"` 重跑，理由会记下来、也会让秘书知道。
 - 等结果：用**后台** Bash（run_in_background）跑命令输出里给的 `… wait <短名>`，然后可以结束本轮
@@ -94,12 +95,12 @@ EOF
   它已经交差、被归档关窗了也一样：claudesec 会在它原来的目录恢复它原来的对话接着做；对话或目录没了会拒绝并告诉你怎么另起。
   要用户拍板的，照常发你自己的 NEED_DECISION。
 - DONE 之后 claudesec 自动归档、关掉它的窗口。FAILED / BLOCKED 秘书会知道；你决定重派、自己做，还是在汇报里说明。
-- 结果核对一遍再用进你的活里，你的汇报里写明哪部分是 Codex / Cursor 做的。
+- 结果核对一遍再用进你的活里，你的汇报里写明哪部分是哪个外部 agent 做的。
 
 <!-- else -->
 ## 小活
 
-这台机器上没有 Codex / Cursor worker：独立的小活自己做，能并行的开 subagent。
+这台机器上没有可用的外部 agent worker（Codex / Cursor）：独立的小活自己做，能并行的开 subagent。
 
 <!-- end delegate -->
 ## 干活

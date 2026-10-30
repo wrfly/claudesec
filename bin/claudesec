@@ -5,12 +5,12 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec [start] [--new|--restart] [-d]   open the secretary in its own tmux session "claudesec"
                                     (resumes the last secretary; --new starts fresh; --restart reloads
                                     prompt and hooks keeping the conversation; -d don't switch)
-  claudesec spawn NAME [--dir DIR] [--model M] [--discuss] [--agent claude|cursor] [--for WORKER] [--budget USD] < task.txt
+  claudesec spawn NAME [--dir DIR] [--model M] [--discuss] [--agent A] [--for WORKER] [--budget USD] < task.txt
                                     (no --dir: ~/.claudesec/work/NAME, made if missing;
                                     --discuss: a discussion window the user is switched into;
-                                    --agent cursor: Cursor's `agent` CLI instead of Claude Code;
+                                    --agent: claude (default) or one of agents/*.py: cursor, codex, ttadk;
                                     --for: the worker that delegated it, named in its reports)
-  claudesec report NAME < report.txt     a Cursor or Codex worker's report to the secretary
+  claudesec report NAME < report.txt     an external agent's worker's report to the secretary
   claudesec remind WHEN TARGET TEXT [--every 1d]   a scheduled task (定时任务): wakes the secretary at WHEN
                                     (+30m, 09:05Z, 17:05, ISO) with TEXT for TARGET (a worker or `secretary`); --list [--all], --cancel ID
   claudesec queue add [--asked|--later] TEXT   a decision queue item with the next number (printed: #N);
@@ -28,9 +28,10 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec dashboard on|off              panes beside the secretary, top to bottom: to-dos, decisions,
                                     progress, scheduled tasks (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
-  claudesec send NAME < message.txt      the secretary's message to a Cursor or Codex worker
+  claudesec send NAME < message.txt      the secretary's message to an external agent's worker
   claudesec model NAME MODEL [--force]   switch a worker's model: restart it on MODEL, conversation kept
-  claudesec delegate ME --name N [--dir D] [--ack WHY] < task.txt   a worker hands a small job to Cursor
+  claudesec delegate ME --name N [--dir D] [--agent A] [--ack WHY] < task.txt   a worker hands a small job
+                                    to an external agent (config delegate_agent: the first available)
   claudesec wait N                       the delegator waits for N's final report (background Bash)
   claudesec status                       one-screen table of workers
   claudesec budget --until T [--usd N] [--from T] | --add N | --off   a spending window for all workers;
@@ -109,14 +110,18 @@ DEFAULT_CONFIG = {
     # 1M High, but it runs with a 272K context. Only the full variant string, parameters in this
     # order, gets 1M.
     "cursor_worker_model": "gpt-5.6-sol[context=1m,reasoning=high,fast=false]",
-    "codex_worker_model": "gpt-6.1-sol",  # Codex workers run through ttadk; `ttadk models` lists what it has
-    # Codex workers' permissions, before their other arguments. The user's pick (2026-10-30): full
-    # access, never asking, as their Cursor's approvalMode "unrestricted".
+    "codex_worker_model": None,       # None: codex's own default
+    "ttadk_worker_model": "gpt-6.1-sol",  # `ttadk models` lists what it has; gpt-* runs Codex, the rest Claude Code
+    # Codex workers' permissions (plain or through ttadk), before their other arguments. The user's
+    # pick (2026-10-30): full access, never asking, as their Cursor's approvalMode "unrestricted".
     "codex_args": ["--dangerously-bypass-approvals-and-sandbox"],
-    "delegate_agent": "codex",        # what `claudesec delegate` starts unless told --agent: "codex", "cursor"
+    # What `claudesec delegate` starts unless told --agent: the first of these available here.
+    "delegate_agent": ["ttadk", "codex", "cursor"],
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
-    "cursor": "auto",                 # Cursor workers: "auto" = if the `agent` command is installed; true; false
-    "codex": "auto",                  # Codex workers: "auto" = if `ttadk` and `codex` are installed; true; false
+    # Each agent of agents/*.py: "auto" = if its commands are installed (and, for codex, logged in); true; false
+    "cursor": "auto",
+    "codex": "auto",
+    "ttadk": "auto",
     # Runaway alerts for workers without a budget of their own: spent more than this share of the
     # budget window's cap, or more than runaway_usd since a report runaway_quiet_minutes ago.
     "runaway_pool_share": 0.3,
@@ -1715,7 +1720,7 @@ def wake_orphans():
                 if w.get("shelved_by") == "exit":
                     names.append(name)
                 continue
-            running = cursor_running(w) if is_external(w) else live_holder(w.get("session"))
+            running = agent_running(w) if is_external(w) else live_holder(w.get("session"))
             if not running and conversation_exists(w):
                 w.update(status_before=settled(w.get("status_before") if w["status"] in LABELS else w["status"]),
                          status="SHELVED", window=None, shelved_by="exit", pending_ask=None)
@@ -1760,20 +1765,21 @@ def cmd_spawn(args):
         project = str((HOME / "work" / name).resolve())
     if args.for_worker and args.for_worker not in workers:
         sys.exit(f"--for {args.for_worker}: no such worker")
-    cursor, codex = args.agent == "cursor", args.agent == "codex"
+    agent = agent_named(args.agent)
+    model = args.model or agent.default_model(cfg) or "default"  # default: the agent's own
+    if agent.name == "claude" and ttadk_model(model):
+        sys.exit(f"--model {model}: not a Claude model, which Claude Code runs through ttadk: "
+                 f"`spawn --agent ttadk --model {model}`")
+    agent = agent.runtime(model)
     budget_usd = getattr(args, "budget", None)
-    if budget_usd is not None and (cursor or codex or budget_usd <= 0):
-        sys.exit(f"--budget: only for Claude Code workers (claudesec can't see what a {agent_label(args.agent)} "
-                 "agent spends), and above 0" if cursor or codex else "--budget must be above 0")
-    model = args.model or cfg[AGENT_MODEL.get(args.agent, "worker_model")]
-    model = model if cursor or codex else unpaid(model)
-    if codex:
-        require_codex("spawn --agent codex")
-    if cursor:
-        require_cursor("spawn --agent cursor")
-        if not args.for_worker:  # a delegation was checked by delegate, which says it its own way
-            cursor_room(f"spawn {name}")
-        check_cursor_http1()
+    if budget_usd is not None and (agent.external or budget_usd <= 0):
+        sys.exit(f"--budget: only for Claude Code workers (claudesec can't see what a {agent.label} "
+                 "agent spends), and above 0" if agent.external else "--budget must be above 0")
+    model = model if agent.external else unpaid(model)
+    agent.require(f"spawn --agent {args.agent}")
+    if not args.for_worker:  # a delegation was checked by delegate, which says it its own way
+        agent.room(f"spawn {name}")
+    agent.preflight()
 
     if args.discuss:
         initial = tr(f"用户想跟你讨论，秘书转来的原话：\n\n{task}\n\n"
@@ -1789,20 +1795,16 @@ def cmd_spawn(args):
                                                      "A task from the secretary (the user's own words):\n\n")
         initial += f"{task}\n"
     memory = getattr(args, "memory", None)
-    d = prepare_worker(name, cfg, initial, project, agent=args.agent, memory=memory)
+    d = prepare_worker(name, cfg, initial, project, agent=agent, memory=memory)
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
-    # A Cursor worker's window runs `hook cursor-launch`, which runs the agent: it retries or falls
-    # back when the model is refused, and records a failure instead of a STARTING that never ends.
-    # A Codex worker's runs its agent, then `hook agent-exit`, which records a failed exit.
-    cmd = (cursor_launch_command(name, model) if cursor else
-           codex_command(name, model, d=d) + f"; CLAUDESEC_RC=$? {hook_cmd()} hook agent-exit {shlex.quote(name)}"
-           if codex else worker_command(name, d, cfg, model))
+    cmd = agent.spawn_command(name, model, d, cfg)
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project, cmd).strip()
 
     with registry() as reg:
         reg["workers"][name] = {
-            "window": window, "dir": project, "model": model, "task": task, "agent": args.agent,
+            "window": window, "dir": project, "model": model, "task": task, "agent": agent.name,
+            **({"runtime": agent.runtime_name} if agent.runtime_name else {}),
             "delegated_by": args.for_worker, "memory": memory,
             "mode": "discuss" if args.discuss else "task",
             "status": "STARTING", "started_at": now(), "last_report_at": None,
@@ -1816,31 +1818,31 @@ def cmd_spawn(args):
     if args.discuss:
         # The user talks to a discussion worker directly, so take them there now.
         tmux("select-window", "-t", window, check=False)
-    if not stuck_on_dialog(name, window, wait=20 if codex else 8):  # ttadk takes a few seconds first
+    if not stuck_on_dialog(name, window, agent, wait=agent.start_wait):
         verb = "discussion window opened and switched to" if args.discuss else "spawned"
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent="claude", memory=None):
+def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=None):
     """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir.
-    memory: another auto memory dir than cwd's (the review worker tidies the secretary's).
-    A Cursor or Codex worker's hooks are global (see install_cursor_hooks, install_codex_hooks)."""
+    agent: the adapter it runs on, Claude Code if None; an external one's hooks are global (Agent.install).
+    memory: another auto memory dir than cwd's (the review worker tidies the secretary's)."""
+    agent = agent or AGENTS["claude"]
     # A reused name starts a fresh log; the old one stays next to it.
     if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
     d = worker_dir(name)
     for mark in ("reported", "finish", AFTER_REPORT):
         (d / mark).unlink(missing_ok=True)
-    external = agent in EXTERNAL_AGENTS
-    prompt = render_prompt((PROMPTS / ("worker-cursor.md" if external else "worker.md")).read_text())
+    prompt = render_prompt((PROMPTS / ("worker-external.md" if agent.external else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
-              .replace("{{CLAUDESEC}}", hook_cmd()).replace("{{AGENT}}", AGENT_IS.get(agent, "")))
+              .replace("{{CLAUDESEC}}", hook_cmd()).replace("{{AGENT}}", agent.describe))
     (d / "prompt.md").write_text(prompt)
     (d / "initial.md").write_text(initial)
     (d / "waiting-permission").unlink(missing_ok=True)
     (d / "busy").unlink(missing_ok=True)
-    if external:
-        install_cursor_hooks() if agent == "cursor" else install_codex_hooks()
+    if agent.external:
+        agent.install()
         return d
     cmd = hook_cmd()
     q = shlex.quote(name)
@@ -1894,317 +1896,364 @@ def remote_control(cfg, secretary=False):
 
 
 def ttadk_model(model):
-    """A model that isn't Claude (deepseek-…, glm-…, kimi-…, gpt-…): Claude Code runs it through
-    `ttadk claude`, which points it at ttadk's endpoint (`ttadk models` lists them)."""
+    """A model that isn't Claude (deepseek-…, glm-…, kimi-…, gpt-…). A Claude Code worker recorded
+    with one ran through `ttadk claude` before ttadk was an agent of its own (agent_of)."""
     return not re.match(r"(claude|opus|sonnet|haiku|fable|default|best|opusplan)\b", model or "claude")
 
 
-def worker_command(name, d, cfg, model, *extra, prompt=True):
-    # ttadk passes on what follows `--` and merges its endpoint's env into our --settings file.
-    # Remote control needs a claude.ai login, which a ttadk session doesn't use.
-    ttadk = ttadk_model(model)
-    return " ".join(shlex.quote(a) for a in [
-        *(["ttadk", "claude", "-m", model, "--skip-check", "--"] if ttadk else ["claude", "--model", model]),
-        "-n", name, "--permission-mode", cfg["worker_permission_mode"],
-        "--settings", str(d / "settings.json"),
-        "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(),
-        *(["--rc"] if remote_control(cfg) and not ttadk else []), *extra,
-    ]) + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if prompt else "")
+# ---------- agents: what runs in a worker's window ----------
+# Claude Code is built in; every other agent is an adapter in agents/<name>.py, a subclass of
+# Agent registered with @register_agent, loaded into this module at start-up (agents/README.md
+# says how to write one). A worker records its agent as "agent" (and, for one that runs others,
+# as ttadk does, "runtime"); agent_of(w) is the adapter it runs on.
+#
+# An agent that isn't Claude Code (external) has no SendMessage and no per-session hooks. Its
+# hooks are global, in its own config, each guarded by CLAUDESEC_WORKER, which only a claudesec
+# worker's command sets; they all come to the same three, `hook agent-start|agent-prompt|agent-stop
+# <protocol>`, the adapter translating its payloads and answers. It reports by running `claudesec
+# report`, which reaches the secretary through the alert channel; the secretary talks to it with
+# `claudesec send`, a paste into its window.
+
+AGENTS = {}
 
 
-# ---------- Cursor workers: the `agent` CLI in a window ----------
-# No per-session hooks, no SendMessage, no sessions/<pid>.json. Its hooks are global, so each one
-# first checks CLAUDESEC_WORKER, which only a claudesec worker's command sets; it reports by
-# running `claudesec report`, which reaches the secretary through the alert channel; the
-# secretary talks to it with `claudesec send`, a paste into its window.
-
-CURSOR_HOOKS = {"sessionStart": "cursor-session-start", "beforeSubmitPrompt": "cursor-prompt",
-                "stop": "cursor-stop"}
-CURSOR_NAGS = 3  # follow-ups asking for a report before the stop hook gives up and alerts
+def register_agent(cls):
+    AGENTS[cls.name] = cls()
+    return cls
 
 
-def install_cursor_hooks():
-    """Put claudesec's entries into ~/.cursor/hooks.json, keeping everything else; a backup is
-    written first whenever the file changes. Each entry does nothing outside a claudesec worker."""
-    path = Path.home() / ".cursor" / "hooks.json"
-    old = path.read_text() if path.exists() else ""
-    conf = json.loads(old) if old.strip() else {"version": 1, "hooks": {}}
-    hooks = conf.setdefault("hooks", {})
-    for event in list(hooks):  # also drops entries for events claudesec no longer hooks
-        hooks[event] = [e for e in hooks[event] if "CLAUDESEC_WORKER" not in e.get("command", "")]
-    for event, hook in CURSOR_HOOKS.items():
-        hooks.setdefault(event, []).append({"type": "command", "command":
-                        f'[ -z "${{CLAUDESEC_WORKER:-}}" ] || {shlex.quote(str(SELF))} hook {hook}'})
-    new = json.dumps(conf, indent=2, ensure_ascii=False) + "\n"
-    if new == old:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if old:
-        (path.parent / f"hooks.json.bak-claudesec-{int(time.time())}").write_text(old)
-    tmp = path.with_suffix(".claudesec-tmp")
-    tmp.write_text(new)
-    tmp.replace(path)
+def setting_off(value):
+    return value is False or str(value).lower() in ("false", "off", "no", "0")
 
 
-def cursor_launch_command(name, model):
-    """What a spawned Cursor worker's window runs. nice goes after the VAR=value assignments:
-    put before them, it takes the first one for the command to run, and the window dies at once."""
-    return (f"CLAUDESEC_MODEL={shlex.quote(model)} CLAUDESEC_HOME={shlex.quote(str(HOME))} {cursor_nice()}"
-            f"{shlex.quote(str(SELF))} hook cursor-launch {shlex.quote(name)}")
+class Agent:
+    """One kind of agent a worker runs. The defaults are an external agent's."""
+    name = ""             # `--agent NAME`; the registry's "agent"
+    label = ""            # in messages: "Cursor" worker, "Codex" agent
+    describe = ""         # {{AGENT}} in the worker rules: what the worker runs as
+    runtime_name = None   # the registry's "runtime", for an agent that runs others (ttadk)
+    external = True
+    commands = ()         # what must be installed for it
+    model_key = None      # the config key holding its default model
+    resume_cmd = ""       # reopens a conversation by hand, given its id
+    interrupt_key = "Escape"
+    send_busy = "queued until its turn ends"  # what becomes of a message sent while it works
+    protocol = None       # its hooks: `hook agent-start <protocol>`, payloads read by this adapter
+    hook_events = {}      # {its event: "start" | "prompt" | "stop"}
+    nags = 1              # reminders to report before its stop hook gives up and alerts
+    up = None             # a resumed agent's screen once it is up at its prompt
+    up_after = 2          # seconds before up counts (a screen still drawing)
+    start_wait = 8        # seconds a spawn watches its window for a dialog
+
+    # --- on this machine
+    def available(self):
+        """(usable, why). config.json "<name>": "auto" (the default: if what it needs is
+        installed), true, false."""
+        setting = config().get(self.name, "auto")
+        if setting_off(setting):
+            return False, tr(f"已关（config.json 里 \"{self.name}\": false）", f"off (\"{self.name}\": false in config.json)")
+        missing = [c for c in self.commands if not shutil.which(c)]
+        lack = (tr(f"这台机器上没有 {' / '.join(missing)} 命令", f"no {' / '.join(missing)} command on this machine")
+                if missing else self.lacking())
+        if lack:
+            return False, (tr("config.json 里开着，但", "on in config.json, but ") if setting is True else "") + lack
+        return True, tr(f"可用（{self.ready()}）", f"available ({self.ready()})")
+
+    def lacking(self):
+        """What else it needs and doesn't have here, or ""."""
+        return ""
+
+    def ready(self):
+        """What `claudesec status` says of it when it is available."""
+        return shutil.which(self.commands[0]) if self.commands else ""
+
+    def require(self, what):
+        ok, why = self.available()
+        if not ok:
+            sys.exit(f"{what}: {self.label} workers are not available here — {why}.")
+
+    def room(self, what, but=None, prefix=""):
+        """sys.exit when one more of it shouldn't start now."""
+
+    def preflight(self):
+        """Warnings before its agent starts."""
+
+    def status_note(self):
+        """More for its line in `claudesec status`."""
+        return ""
+
+    def default_model(self, cfg):
+        return cfg.get(self.model_key) if self.model_key else None
+
+    def runtime(self, model, recorded=None):
+        """The adapter that runs model: itself, but for an agent that runs others (ttadk).
+        recorded: the runtime a worker started on, which its conversation is bound to."""
+        return self
+
+    # --- the window
+    def env(self, name):
+        return f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))} "
+
+    def command(self, name, model, d, cfg, resume=None, prompt=True):
+        """The shell command that runs the worker's agent: a new conversation, or resume (its id);
+        with prompt, its first message is d/initial.md."""
+        raise NotImplementedError
+
+    def first_message(self, d):
+        return f' "$(cat {shlex.quote(str(d / "initial.md"))})"'
+
+    def spawn_command(self, name, model, d, cfg):
+        """What a spawned worker's window runs: its agent, then `hook agent-exit`, which records a failed exit."""
+        return self.command(name, model, d, cfg) + f"; CLAUDESEC_RC=$? {hook_cmd()} hook agent-exit {shlex.quote(name)}"
+
+    def answer_dialog(self, name, target, screen):
+        """Answer a start-up question its window can't leave open; truthy when it did."""
+        return False
+
+    def dialog_hint(self, screen):
+        """A line for the user about a dialog that only they may answer, or ""."""
+        return ""
+
+    def confirm_resume(self, name, pane, d, sid):
+        """Woken and up? An external agent's resumed conversation may report no session at start,
+        so the screen tells: self.up on it, and no question left."""
+        screen = ""
+        for i in range(30):
+            time.sleep(1)
+            screen = pane_text(pane, suggestion="drop")
+            if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
+                return "agent exited", screen
+            if self.answer_dialog(name, pane, screen):
+                continue
+            if self.dialog_hint(screen):
+                return "dialog", screen
+            if i >= self.up_after and self.up.search(screen.rstrip()) and not DIALOG_FOOTER.search(screen[-600:]):
+                return "ok", screen
+        return "agent did not come up within 30s", screen
+
+    def interrupt(self, name, w):
+        """Stop its turn; returns the key sent."""
+        tmux("send-keys", "-t", w["window"], self.interrupt_key)
+        return self.interrupt_key
+
+    # --- its conversations
+    def conversation_exists(self, sid):
+        return False
+
+    def follow(self, sid, cwd, old=None):
+        """Move a conversation to where a resume run in cwd looks for it (see follow_conversation)."""
+        return None
+
+    def resume_hint(self, sid):
+        return f"{self.resume_cmd} {sid}"
+
+    # --- its hooks (external agents)
+    def hooks_file(self):
+        return None
+
+    def empty_hooks(self):
+        return {}
+
+    def hook_entry(self, event, command):
+        return {"type": "command", "command": command}
+
+    def install(self):
+        """Put claudesec's entries into the agent's global hooks file, keeping everything else; a
+        backup is written first whenever the file changes. Each entry does nothing outside a
+        claudesec worker."""
+        path = self.hooks_file()
+        if not path:
+            return
+        old = path.read_text() if path.exists() else ""
+        conf = json.loads(old) if old.strip() else self.empty_hooks()
+        hooks = conf.setdefault("hooks", {})
+        for event in list(hooks):  # also drops entries for events claudesec no longer hooks
+            kept = [e for e in hooks[event] if "CLAUDESEC_WORKER" not in json.dumps(e)]
+            if kept or not hooks[event] or event in self.hook_events:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+        for event, kind in self.hook_events.items():
+            hooks.setdefault(event, []).append(self.hook_entry(event, f'[ -z "${{CLAUDESEC_WORKER:-}}" ] || '
+                                                                     f'{shlex.quote(str(SELF))} hook agent-{kind} {self.protocol}'))
+        new = json.dumps(conf, indent=2, ensure_ascii=False) + "\n"
+        if new == old:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if old:
+            (path.parent / f"{path.name}.bak-claudesec-{int(time.time())}").write_text(old)
+        tmp = path.with_suffix(".claudesec-tmp")
+        tmp.write_text(new)
+        tmp.replace(path)
+
+    def session_id(self, data):
+        return data.get("session_id")
+
+    def start_reply(self, rules):
+        """The session-start hook's answer, handing the agent the worker rules as context."""
+        raise NotImplementedError
+
+    def stop_event(self, data):
+        """(how the turn ended: "completed", "error" or anything else for cut off; reminders sent so far)."""
+        return "completed", 0
+
+    def stop_reply(self, reminder=None):
+        """The stop hook's answer: let the turn end (None), or send reminder and go on."""
+        return None
+
+    def error_text(self, w):
+        """What the agent said of an error that ended its turn."""
+        return ""
+
+    def hooks(self):
+        """`claudesec hook` events of its own: {event: function taking the worker name, or none}."""
+        return {}
 
 
-def cursor_command(name, model, *extra, d=None):
-    """The worker's agent command; with d, its first message comes from d/initial.md."""
-    env = f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))}"
-    return (env + " " + cursor_nice() + " ".join(shlex.quote(a) for a in ["agent", "--model", model, "--trust", *extra])
-            + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if d else ""))
+@register_agent
+class ClaudeCode(Agent):
+    name, label, external = "claude", "Claude Code", False
+    commands = ("claude",)
+    model_key = "worker_model"
+    resume_cmd = "claude --resume"
+
+    def available(self):
+        return True, ""
+
+    def launcher(self, model):
+        return ["claude", "--model", model]
+
+    remote_control = True  # its own claude.ai login; one through ttadk has none
+
+    def command(self, name, model, d, cfg, resume=None, prompt=True):
+        return " ".join(shlex.quote(a) for a in [
+            *self.launcher(model), "-n", name, "--permission-mode", cfg["worker_permission_mode"],
+            "--settings", str(d / "settings.json"),
+            "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(),
+            *(["--rc"] if remote_control(cfg) and self.remote_control else []),
+            *(["--resume", resume] if resume else []),
+        ]) + (self.first_message(d) if prompt else "")
+
+    def spawn_command(self, name, model, d, cfg):
+        return self.command(name, model, d, cfg)
+
+    def answer_dialog(self, name, target, screen):
+        return answer_channels_dialog(target, screen) or (name and answer_credit_dialog(name, target, screen))
+
+    def confirm_resume(self, name, pane, d, sid):
+        return confirm_resume(name, pane, d, sid)
+
+    def interrupt(self, name, w):
+        tmux("send-keys", "-t", w["window"], "Escape")
+        return "Escape"
+
+    def conversation_exists(self, sid):
+        return bool(sid and transcript(sid))
+
+    def follow(self, sid, cwd, old=None):
+        """Claude Code keeps transcripts by start directory (projects/<dir with - for every
+        non-alphanumeric>/); only one whose start directory is gone is moved."""
+        src = transcript(sid)
+        if not src:
+            return None
+        start = started_in(src)
+        dst = claude_project(cwd)
+        if src.parent == dst or not start or start == str(cwd) or Path(start).is_dir() or (dst / src.name).exists():
+            return None
+        dst.mkdir(parents=True, exist_ok=True)
+        if (src.parent / sid).is_dir() and not (dst / sid).exists():  # its subagents and tool results
+            (src.parent / sid).rename(dst / sid)
+        src.rename(dst / src.name)
+        return f"transcript {sid} moved from {src.parent.name} to {dst.name}"
 
 
-def is_cursor(w):
-    return (w or {}).get("agent") == "cursor"
+def agent_of(w):
+    """The adapter worker w runs on (a registry entry, or an archive's frontmatter)."""
+    w = w or {}
+    name = w.get("agent") or "claude"
+    if name == "claude" and ttadk_model(w.get("model")) and "ttadk" in AGENTS:
+        name = "ttadk"  # started on a model that isn't Claude before ttadk was an agent of its own
+    elif name == "codex" and not w.get("runtime") and "ttadk" in AGENTS:
+        name, w = "ttadk", {**w, "runtime": "codex"}  # Codex workers all ran through ttadk then
+    agent = AGENTS.get(name) or AGENTS["claude"]
+    return agent.runtime(w.get("model") or agent.default_model(config()), w.get("runtime"))
 
 
-def is_codex(w):
-    return (w or {}).get("agent") == "codex"
+def agent_named(name):
+    agent = AGENTS.get(name)
+    if not agent:
+        sys.exit(f"--agent {name}: no such agent (have {', '.join(AGENTS)})")
+    return agent
 
 
-EXTERNAL_AGENTS = ("cursor", "codex")
-AGENT_MODEL = {"cursor": "cursor_worker_model", "codex": "codex_worker_model"}
-AGENT_IS = {"cursor": "Cursor agent", "codex": "Codex（OpenAI 的 codex CLI，经 ttadk 启动）"}  # {{AGENT}} in the prompt
-
-
-def resume_hint(w):
-    """The command that reopens a worker's conversation by hand."""
-    cmd = {"cursor": "agent --resume", "codex": "ttadk codex -- resume"}.get((w or {}).get("agent"), "claude --resume")
-    return f"{cmd} {(w or {}).get('session')}"
+def agent_fields(w):
+    """What a registry entry or an archive records of the agent: nothing for Claude Code."""
+    agent = agent_of(w)
+    if agent.name == "claude":
+        return {}
+    return {"agent": agent.name, **({"runtime": agent.runtime_name} if agent.runtime_name else {})}
 
 
 def is_external(w):
     """Not Claude Code: no SendMessage, no per-session hooks; it reports with `claudesec report`
     and is talked to with `claudesec send`."""
-    return (w or {}).get("agent") in EXTERNAL_AGENTS
+    return agent_of(w).external
 
 
-def agent_label(w_or_agent):
-    agent = w_or_agent if isinstance(w_or_agent, str) or w_or_agent is None else w_or_agent.get("agent")
-    return {"cursor": "Cursor", "codex": "Codex"}.get(agent, "Claude Code")
+def external_record(meta):
+    """An archive's frontmatter is of an external agent's worker (whose session is no Claude Code
+    transcript). Older archives say so only in their tags."""
+    if meta.get("agent"):
+        return agent_of(meta).external
+    return any(t in AGENTS and AGENTS[t].external for t in meta.get("tags") or [])
 
 
-def agent_available(agent):
-    return codex_available() if agent == "codex" else cursor_available() if agent == "cursor" else (True, "")
+def resume_hint(w):
+    """The command that reopens a worker's conversation by hand."""
+    return agent_of(w).resume_hint((w or {}).get("session"))
 
 
-def cursor_available():
-    """(usable, why): whether Cursor workers can be started on this machine."""
-    setting = config().get("cursor", "auto")
-    if setting is False or str(setting).lower() in ("false", "off", "no", "0"):
-        return False, tr("已关（config.json 里 \"cursor\": false）", "off (\"cursor\": false in config.json)")
-    path = shutil.which("agent")
-    if path:
-        return True, tr(f"可用（{path}）", f"available ({path})")
-    return False, (tr("config.json 里开着，但", "on in config.json, but ") if setting is True else "") + \
-        tr("这台机器上没有 `agent` 命令（Cursor CLI）", "no `agent` command (Cursor CLI) on this machine")
+def conversation_exists(w):
+    return agent_of(w).conversation_exists((w or {}).get("session"))
 
 
-def require_cursor(what):
-    ok, why = cursor_available()
-    if not ok:
-        sys.exit(f"{what}: Cursor workers are not available here — {why}.")
+def agent_running(w):
+    """An external worker's agent is up in its window."""
+    if w.get("window") not in alive_windows():
+        return False  # no -t "" below: that would ask about the caller's own pane
+    return tmux("display", "-p", "-t", w["window"], "#{pane_dead}", check=False).strip() == "0"
 
 
-CURSOR_AT_WORK = {"STARTING", "PROGRESS"}
+def delegate_agents():
+    """The agents `claudesec delegate` may start, best first: config delegate_agent (a name or a
+    list of them), then the rest that report by command, in the order they were loaded."""
+    want = config().get("delegate_agent") or []
+    want = [want] if isinstance(want, str) else list(want)
+    names = [n for n in want if n in AGENTS] + [n for n in AGENTS if n not in want]
+    return [n for n in names if AGENTS[n].runtime(AGENTS[n].default_model(config())).external]
 
 
-def cursor_busy(but=None):
-    """Cursor workers whose agent is at work on this machine: a live window and a turn under way.
-    One idling at its prompt (done, waiting on the user) costs next to no CPU and doesn't count."""
-    alive = alive_windows()
-    return sorted(n for n, w in read_registry()[1].items()
-                  if is_cursor(w) and n != but and w["status"] in CURSOR_AT_WORK and w.get("window") in alive)
-
-
-def cursor_limit():
-    """cursor_max_running as it applies: a number set in config.json as is (0: no limit), else half
-    this machine's cores, at least one (the user, 2026-10-26: the devbox can run plenty)."""
-    value = config().get("cursor_max_running")
-    if value is None or str(value).lower() == "auto":
-        return max(1, (os.cpu_count() or 2) // 2)
-    return int(value)
-
-
-def cursor_room(what, but=None, prefix=""):
-    """Refuse when cursor_max_running Cursor workers are already at work: each agent is a local
-    process tree that can take whole cores (the user's CPU, 2026-10-24)."""
-    limit = cursor_limit()
-    busy = cursor_busy(but)
-    if limit and len(busy) >= limit:
-        sys.exit(f"{prefix}{what}: {len(busy)} Cursor workers are already at work ({', '.join(busy)}), the limit "
-                 f"(cursor_max_running in config.json) is {limit}. Wait for one to finish, or do it with a "
-                 f"subagent or yourself.")
-
-
-def cursor_nice():
-    """`nice -n N ` before a Cursor agent's command, or nothing."""
-    n = int(config().get("cursor_nice") or 0)
-    return f"nice -n {n} " if n > 0 and shutil.which("nice") else ""
-
-
-# ---------- Codex workers: OpenAI's codex CLI, run through ttadk, in a window ----------
-# Like Cursor's: global hooks, guarded by CLAUDESEC_WORKER; reports by `claudesec report`, talked
-# to with `claudesec send`. Its Stop hook blocks the turn's end as Claude Code's does. Codex runs
-# a hook only once the user has trusted it: the first worker's window asks ("Hooks need review"),
-# and the user answers that once; the commands never change, so neither does the trust.
-
-CODEX_HOOKS = {"SessionStart": "codex-session-start", "UserPromptSubmit": "codex-prompt", "Stop": "codex-stop"}
-# Before codex_args: no update offer at start (a dialog nobody would answer), no full-access
-# warning (the user chose full access), and the rules in full: SessionStart context past about
-# 2500 tokens would go to a file, with only a preview in the conversation.
-CODEX_FIXED_ARGS = ["-c", "check_for_update_on_startup=false", "-c", "notice.hide_full_access_warning=true"]
-
-
-def codex_home():
-    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-
-
-def install_codex_hooks():
-    """Put claudesec's entries into ~/.codex/hooks.json, keeping everything else; a backup is
-    written first whenever the file changes. Each entry does nothing outside a claudesec worker."""
-    path = codex_home() / "hooks.json"
-    old = path.read_text() if path.exists() else ""
-    conf = json.loads(old) if old.strip() else {}
-    hooks = conf.setdefault("hooks", {})
-    for event in list(hooks):  # also drops entries for events claudesec no longer hooks
-        hooks[event] = [g for g in hooks[event]
-                        if not any("CLAUDESEC_WORKER" in h.get("command", "") for h in g.get("hooks", []))]
-        if not hooks[event]:
-            del hooks[event]
-    for event, hook in CODEX_HOOKS.items():
-        entry = {"type": "command", "command": f'[ -z "${{CLAUDESEC_WORKER:-}}" ] || {shlex.quote(str(SELF))} hook {hook}'}
-        if event == "SessionStart":
-            entry["additionalContextLimit"] = 0  # the whole rules prompt, not a preview of it
-        hooks.setdefault(event, []).append({"hooks": [entry]})
-    new = json.dumps(conf, indent=2, ensure_ascii=False) + "\n"
-    if new == old:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if old:
-        (path.parent / f"hooks.json.bak-claudesec-{int(time.time())}").write_text(old)
-    tmp = path.with_suffix(".claudesec-tmp")
-    tmp.write_text(new)
-    tmp.replace(path)
-
-
-def codex_command(name, model, *extra, d=None):
-    """The worker's codex, through ttadk (its endpoint, no ChatGPT login); with d, its first
-    message comes from d/initial.md. extra goes last: `resume <id>` takes no options after it."""
-    env = f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))}"
-    return (env + " " + " ".join(shlex.quote(a) for a in [
-        "ttadk", "codex", "--mode", "ttadk-only", "-m", model, "--skip-check", "--",
-        *CODEX_FIXED_ARGS, *config().get("codex_args", []), *extra])
-        + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if d else ""))
-
-
-def codex_available():
-    """(usable, why): whether Codex workers can be started on this machine."""
-    setting = config().get("codex", "auto")
-    if setting is False or str(setting).lower() in ("false", "off", "no", "0"):
-        return False, tr("已关（config.json 里 \"codex\": false）", "off (\"codex\": false in config.json)")
-    missing = [c for c in ("ttadk", "codex") if not shutil.which(c)]
-    if not missing:
-        return True, tr(f"可用（ttadk，{config()['codex_worker_model']}）", f"available (ttadk, {config()['codex_worker_model']})")
-    return False, (tr("config.json 里开着，但", "on in config.json, but ") if setting is True else "") + \
-        tr(f"这台机器上没有 {' / '.join(missing)} 命令", f"no {' / '.join(missing)} command on this machine")
-
-
-def require_codex(what):
-    ok, why = codex_available()
-    if not ok:
-        sys.exit(f"{what}: Codex workers are not available here — {why}.")
-
-
-def codex_session_file(sid):
-    return next(iter(sorted((codex_home() / "sessions").glob(f"*/*/*/rollout-*-{sid}.jsonl"))), None) if sid else None
-
-
-CODEX_TRUST = re.compile(r"Do you trust the contents of this directory")
-CODEX_RESUME_DIR = re.compile(r"Choose working directory to resume this session")
-# Up and at its prompt: the banner of a new session, or (a resumed one shows its history, no
-# banner) the footer under the input, "gpt-6.1-sol default · ~/proj".
-CODEX_UP = re.compile(r"OpenAI Codex \(v|^\s+\S.* · [~/]\S*\s*\Z", re.M)
-
-
-def answer_codex_dialog(target, screen):
-    """Codex's start-up questions a worker's window can't leave open. Trust the directory (the
-    user's call, 2026-10-30: claudesec says yes for a worker); and on resume, the directory the
-    window was opened in, which wake chose (a moved directory, --dir), not the one recorded.
-    "Hooks need review" is not answered: trusting hooks is the user's to do. Returns whether it
-    answered one."""
-    if CODEX_TRUST.search(screen) and "Yes, continue" in screen:
-        tmux("send-keys", "-t", target, "1", check=False)
-    elif CODEX_RESUME_DIR.search(screen) and "Use current directory" in screen:
-        tmux("send-keys", "-t", target, "2", check=False)
-    else:
-        return False
-    time.sleep(1)
-    return True
-
-
-def confirm_codex_start(pane, d):
-    """A resumed codex runs SessionStart only with its first turn, so, as for Cursor, the screen
-    says it is up (CODEX_UP), with no question left on it."""
-    screen = ""
-    for i in range(30):
-        time.sleep(1)
-        screen = pane_text(pane, suggestion="drop")
-        if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
-            return "agent exited", screen
-        if answer_codex_dialog(pane, screen):
-            continue
-        if "Hooks need review" in screen:
-            return "dialog", screen
-        if i >= 2 and CODEX_UP.search(screen.rstrip()) and not DIALOG_FOOTER.search(screen[-600:]):
-            return "ok", screen
-    return "agent did not come up within 30s", screen
+def load_agents():
+    """Every agents/*.py into this module, in name order: they see everything claudesec defines,
+    and register with @register_agent. Files starting with _ are skipped."""
+    for path in sorted((REPO / "agents").glob("[!_]*.py")):
+        exec(compile(path.read_text(), str(path), "exec"), globals())
 
 
 def render_prompt(text):
     """Keep or drop the prompt's parts for what this machine has: <!-- if X --> A [<!-- else --> B]
-    <!-- end X -->, X one of cursor, codex, delegate (either of the two)."""
-    on = {"cursor": cursor_available()[0], "codex": codex_available()[0]}
-    on["delegate"] = on["cursor"] or on["codex"]
+    <!-- end X -->, X an agent (on when it is available here) or delegate (when `claudesec
+    delegate` has an agent to start). Blocks nest."""
+    on = {n: a.available()[0] for n, a in AGENTS.items()}
+    on["delegate"] = any(AGENTS[n].runtime(AGENTS[n].default_model(config())).available()[0] for n in delegate_agents())
 
     def pick(m):
-        return m.group(2) if on[m.group(1)] else (m.group(3) or "")
-    return re.sub(r"<!-- if (cursor|codex|delegate) -->\n(.*?)(?:<!-- else -->\n(.*?))?<!-- end \1 -->\n", pick, text, flags=re.S)
-
-
-def check_cursor_http1():
-    """Over HTTP/2 the agent stalls on agentn.us.api5.cursor.sh on the Mac's network, whatever the
-    model; say so rather than leave a worker that never answers. Only a warning: the file is the
-    user's. The devbox (Linux) talks HTTP/2 fine (two long tool-using runs, 2026-10-22)."""
-    if sys.platform != "darwin":
-        return
-    path = Path.home() / ".cursor" / "cli-config.json"
-    try:
-        on = (json.loads(path.read_text()).get("network") or {}).get("useHttp1ForAgent") is True
-    except (OSError, ValueError, AttributeError):
-        on = False
-    if not on:
-        print(f"WARNING: {path} does not set \"network\": {{\"useHttp1ForAgent\": true}}. Without it the "
-              "agent talks HTTP/2 to agentn.us.api5.cursor.sh and, on this network, stalls on "
-              "\"Connection stalled\" with any model, so the worker never gets through a turn. "
-              "To fix: back the file up, add that key under \"network\" (leave the rest as it is), "
-              "then restart the worker: close and spawn it again, or shelve and wake it.", flush=True)
-
-
-def cursor_chat_exists(chat):
-    return bool(chat) and any((Path.home() / ".cursor" / "chats").glob(f"*/{chat}"))
-
-
-def conversation_exists(w):
-    if is_codex(w):
-        return bool(codex_session_file(w.get("session")))
-    return cursor_chat_exists(w.get("session")) if is_cursor(w) else bool(w.get("session") and transcript(w["session"]))
+        return m.group(2) if on.get(m.group(1)) else (m.group(3) or "")
+    while True:  # an outer block first; what it keeps is gone over again
+        done = re.sub(r"<!-- if ([\w-]+) -->\n(.*?)(?:<!-- else -->\n(.*?))?<!-- end \1 -->\n", pick, text, flags=re.S)
+        if done == text:
+            return done
+        text = done
 
 
 SCRATCH_ROOTS = tuple({Path("/tmp"), Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve()})  # a reboot wipes these
@@ -2245,68 +2294,22 @@ def started_in(path):
 
 
 def follow_conversation(w, cwd, old=None):
-    """Move a shelved worker's conversation to where `--resume` run in cwd looks for it, once the
-    directory it was started in has moved away. Claude Code keeps transcripts by start directory
-    (projects/<dir with - for every non-alphanumeric>/), and only one whose start directory is
-    gone is moved. Cursor keeps chats by the md5 of the directory; one is moved only out of old,
-    the directory the worker is known to have left. Codex finds a session by id from anywhere,
-    and its resume asks which directory (answer_codex_dialog). Returns what was moved, or None."""
+    """Move a shelved worker's conversation to where a resume run in cwd looks for it, once the
+    directory it was started in has moved away; old: the directory the worker is known to have
+    left. Each agent keeps its own (Agent.follow). Returns what was moved, or None."""
     sid = w.get("session")
-    if not sid or is_codex(w):
-        return None
-    if is_cursor(w):
-        chats = Path.home() / ".cursor" / "chats"
-        src = chats / hashlib.md5(str(old).encode()).hexdigest() / sid if old else None
-        dst = chats / hashlib.md5(str(cwd).encode()).hexdigest() / sid
-        if not src or not src.is_dir() or src == dst or dst.exists():
-            return None
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        src.rename(dst)
-        return f"chat {sid} moved to {dst.parent}"
-    src = transcript(sid)
-    if not src:
-        return None
-    start = started_in(src)
-    dst = claude_project(cwd)
-    if src.parent == dst or not start or start == str(cwd) or Path(start).is_dir() or (dst / src.name).exists():
-        return None
-    dst.mkdir(parents=True, exist_ok=True)
-    if (src.parent / sid).is_dir() and not (dst / sid).exists():  # its subagents and tool results
-        (src.parent / sid).rename(dst / sid)
-    src.rename(dst / src.name)
-    return f"transcript {sid} moved from {src.parent.name} to {dst.name}"
-
-
-def cursor_running(w):
-    """A Cursor or Codex worker's agent is up in its window."""
-    if w.get("window") not in alive_windows():
-        return False  # no -t "" below: that would ask about the caller's own pane
-    return tmux("display", "-p", "-t", w["window"], "#{pane_dead}", check=False).strip() == "0"
+    return agent_of(w).follow(sid, cwd, old) if sid else None
 
 
 def worker_busy(name, w):
     """Mid-turn, or (Claude Code) waiting on background tasks: not to be stopped."""
     if is_external(w):
-        return cursor_running(w) and (HOME / "workers" / name / "busy").exists()
+        return agent_running(w) and (HOME / "workers" / name / "busy").exists()
     holder = live_holder(w.get("session"))
     return bool(holder) and session_status(holder)[0] in ("busy", "background")
 
 
-def confirm_cursor_start(pane, d):
-    """A resumed Cursor chat fires no sessionStart, so there is no session id to wait for:
-    the agent drawing its screen and staying up is as good as it gets."""
-    screen = ""
-    for i in range(20):
-        time.sleep(1)
-        screen = pane_text(pane, suggestion="drop")
-        if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
-            return "agent exited", screen
-        if i >= 4 and re.search(r"Cursor Agent|Add a follow-up|ctrl\+c to stop", screen):
-            return "ok", screen
-    return "agent did not come up within 20s", screen
-
-
-def stuck_on_dialog(name, target, wait=8):
+def stuck_on_dialog(name, target, agent, wait=8):
     """Catch dialogs that would stall a window nobody is looking at."""
     for _ in range(wait):
         time.sleep(1)
@@ -2316,16 +2319,13 @@ def stuck_on_dialog(name, target, wait=8):
             if w is None or w["status"] in TERMINAL:  # a quick job: done already, archived and closed
                 return False
             sys.exit(f"worker {name}: {target} exited right away")
-        if answer_channels_dialog(target, pane) or answer_credit_dialog(name, target, pane) \
-                or answer_codex_dialog(target, pane):
+        if agent.answer_dialog(name, target, pane):
             continue
-        if re.search(r"trust this folder|Do you trust|Enter to confirm|Do you want to|Hooks need review", pane):
+        hint = agent.dialog_hint(pane)
+        if hint or re.search(r"trust this folder|Do you trust|Enter to confirm|Do you want to", pane):
             tail = "\n".join(l for l in pane.splitlines() if l.strip())[-1200:]
-            hint = ("\nThis is Codex asking, once, to trust claudesec's hooks (worker rules and reports run "
-                    "through them): the user picks \"2. Trust all and continue\" in that window."
-                    if "Hooks need review" in pane else "")
             print(f"{name} started in {target}, but it is STUCK ON A DIALOG — tell the user to "
-                  f"switch to window '{name}' and answer it:\n{tail}{hint}")
+                  f"switch to window '{name}' and answer it:\n{tail}" + (f"\n{hint}" if hint else ""))
             return True
     return False
 
@@ -2648,7 +2648,7 @@ def managed_sessions():
                 with contextlib.suppress(ValueError):
                     meta[key] = json.loads(value)
             if meta.get("session") and meta.get("worker") not in (None, "subagent") \
-                    and meta.get("agent") not in EXTERNAL_AGENTS and not set(EXTERNAL_AGENTS) & set(meta.get("tags") or []):
+                    and not external_record(meta):
                 out[meta["session"]] = meta["worker"]
     for name, w in read_registry()[1].items():
         if w.get("session") and not is_external(w):
@@ -2928,7 +2928,7 @@ def cmd_adopt(args):
     (d / "exit").unlink(missing_ok=True)
     # No trailing shell: when claude exits the pane dies, and remain-on-exit keeps it (with the
     # error on screen) until resume is confirmed.
-    cmd = (worker_command(name, d, cfg, model, "--resume", sid)
+    cmd = (AGENTS["claude"].command(name, model, d, cfg, resume=sid)
            + f"; echo $? > {shlex.quote(str(d / 'exit'))}")
 
     # Stop every process holding the conversation before another one resumes it. A background
@@ -3151,7 +3151,7 @@ def cmd_wake(args):
     if w["status"] != "SHELVED":
         sys.exit(f"{name} is not shelved (status {w['status']})")
     sid, cwd = w["session"], w["dir"]
-    cursor, codex = is_cursor(w), is_codex(w)
+    agent = agent_of(w)
     if not conversation_exists(w):
         sys.exit(f"{name}: conversation {sid} is gone; it can't be resumed")
     left = w.get("moved_from")  # set by redir: the directory it was in before the move
@@ -3168,15 +3168,12 @@ def cmd_wake(args):
                      f"(a renamed repo): `claudesec redir {shlex.quote(cwd)} NEW_DIR` points every worker "
                      f"recorded there at the new place; `claudesec wake {name} --dir NEW_DIR` moves just this one.")
         left, cwd = (cwd if new != cwd else left), new
-    holder = None if cursor or codex else live_holder(sid)
-    if codex:
-        require_codex(f"wake {name}")
-    if cursor:
-        require_cursor(f"wake {name}")
-        if not getattr(args, "quiet", False):  # a quiet wake only reopens the conversation; no turn runs
-            cursor_room(f"wake {name}", but=name, prefix="NOT DELEGATED: " if getattr(args, "intro", None) and
-                        w.get("delegated_by") else "")
-        check_cursor_http1()
+    holder = None if agent.external else live_holder(sid)
+    agent.require(f"wake {name}")
+    if not getattr(args, "quiet", False):  # a quiet wake only reopens the conversation; no turn runs
+        agent.room(f"wake {name}", but=name, prefix="NOT DELEGATED: " if getattr(args, "intro", None) and
+                   w.get("delegated_by") else "")
+    agent.preflight()
     if holder:
         sys.exit(f"{name}: session {sid} is already running as pid {holder['pid']} ({holder.get('name')}); "
                  f"someone resumed it outside claudesec")
@@ -3191,40 +3188,35 @@ def cmd_wake(args):
                                                "Do it and report by the rules:")
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
-    if cursor or codex:  # typed into its window, it would pass for the user; and it reports by command
+    if agent.external:  # typed into its window, it would pass for the user; and it reports by command
         initial = (tr("[claudesec] claudesec 发来的系统消息（不是用户在你窗口里打的字）：\n",
                       "[claudesec] A notice from claudesec itself (not the user typing in your window):\n")
                    + initial.replace("用 SendMessage ", "用规则里的 report 命令")
                    .replace("with SendMessage", "with the report command in your rules"))
-    model = args.model or w.get("model") or cfg[AGENT_MODEL.get(w.get("agent"), "worker_model")]
-    model = model if cursor or codex else unpaid(model)
+    model = args.model or w.get("model") or agent.default_model(cfg) or "default"
+    model = model if agent.external else unpaid(model)
     followed = follow_conversation(w, cwd, old=left)
     if moved or followed or left:
         with registry() as reg:
             reg["workers"][name]["dir"] = cwd
             reg["workers"][name].pop("moved_from", None)
         append_log(name, "task", "; ".join(filter(None, [moved, followed])) or f"now in {cwd}")
-    d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=w.get("agent", "claude"),
-                       memory=w.get("memory"))
+    d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"))
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
-    cmd = ((cursor_command(name, model, "--resume", sid, d=None if quiet else d) if cursor else
-            codex_command(name, model, "resume", sid, d=None if quiet else d) if codex else
-            worker_command(name, d, cfg, model, "--resume", sid, prompt=not quiet))
-           + f"; echo $? > {shlex.quote(str(d / 'exit'))}")
+    cmd = agent.command(name, model, d, cfg, resume=sid, prompt=not quiet) + f"; echo $? > {shlex.quote(str(d / 'exit'))}"
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     window, pane = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id} #{pane_id}",
                         "-n", name, "-c", cwd, "sleep 3600").split()
     tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on", check=False)
-    with registry() as reg:  # a resumed Cursor chat reports no session id; it keeps its own (and Codex its)
+    with registry() as reg:  # an external agent keeps its session id (a resumed Cursor chat reports none)
         reg["workers"][name].update(window=window, model=model, status="STARTING",
-                                    session=sid if cursor or codex else None)
+                                    session=sid if agent.external else None)
     tmux("respawn-pane", "-k", "-t", pane, "-c", cwd, cmd)
     if instruction:
         append_log(name, f"{w.get('delegated_by') or 'secretary'}→worker", instruction)
 
-    verdict, screen = (confirm_cursor_start(pane, d) if cursor else confirm_codex_start(pane, d) if codex else
-                       confirm_resume(name, pane, d, sid))
+    verdict, screen = agent.confirm_resume(name, pane, d, sid)
     tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
     if verdict == "ok":
         tmux("set-option", "-p", "-u", "-t", pane, "remain-on-exit", check=False)
@@ -3236,7 +3228,7 @@ def cmd_wake(args):
                 reg["focus"] = name
             w.pop("shelved_by", None)
         append_log(name, "task", f"woken{' quietly' if quiet else ''} (session {sid}, {cwd})")
-        shown = name if cursor or codex else ensure_name(name, pane, sid)
+        shown = name if agent.external else ensure_name(name, pane, sid)
         if shown != name:
             sys.exit(f"wake INCOMPLETE: {name} resumed in window {window}, but other sessions address it as "
                      f"{shown!r}, so SendMessage(to: {name!r}) won't reach it. Run `/rename {name}` in that window.")
@@ -3246,8 +3238,8 @@ def cmd_wake(args):
               + (f". Directory: {moved}" if moved else ""))
         return
     if verdict == "dialog":
-        hint = ("\nThis is Codex asking, once, to trust claudesec's hooks: the user picks \"2. Trust all and "
-                "continue\" in that window." if "Hooks need review" in screen else "")
+        hint = agent.dialog_hint(screen)
+        hint = f"\n{hint}" if hint else ""
         print(f"{name} is resuming in {window}, but it is STUCK ON A DIALOG — tell the user to "
               f"switch to window '{name}' and answer it:\n{tail}{hint}")
         return
@@ -3352,11 +3344,11 @@ def cmd_status(args):
         print(tr("\n待办事项（要用户去做的事；claudesec notice done 编号）：", "\nTo do (for the user; claudesec notice done N):"))
         for n, t, text in items:
             print(f"  #{n} " + (f"[{t}] " if t else "") + text)
-    load = ""
-    if cursor_available()[0] and cursor_limit():
-        load = tr(f" · 在跑 {len(cursor_busy())}/{cursor_limit()}", f" · at work {len(cursor_busy())}/{cursor_limit()}")
-    print(tr("\nCursor worker：", "\nCursor workers: ") + cursor_available()[1] + load)
-    print(tr("Codex worker：", "Codex workers: ") + codex_available()[1])
+    print()
+    for agent in AGENTS.values():
+        if agent.name != "claude":
+            ok, why = agent.available()
+            print(tr(f"{agent.label} worker：", f"{agent.label} workers: ") + why + (agent.status_note() if ok else ""))
     sessions = external_sessions()
     if sessions:
         print(tr("\n不归 claudesec 管的 Claude 会话（空闲的可以 claudesec adopt 接管）：",
@@ -3402,13 +3394,7 @@ def cmd_interrupt(args):
     w = workers.get(args.name) or sys.exit(f"no worker {args.name}")
     if not w.get("window"):
         sys.exit(f"{args.name} has no window (status {w['status']})")
-    key = "C-c" if is_cursor(w) else "Escape"  # Cursor's Escape only drops a queued message
-    if is_cursor(w):  # its stop hook then sees status "error", same as a failed turn
-        (worker_dir(args.name) / "interrupted").write_text(now())
-    tmux("send-keys", "-t", w["window"], key)
-    if is_codex(w):  # an interrupted Codex turn runs no Stop hook: its end is marked here
-        (worker_dir(args.name) / "busy").unlink(missing_ok=True)
-        (worker_dir(args.name) / "ended-unreported").write_text(now())
+    key = agent_of(w).interrupt(args.name, w)
     print(f"sent {key} to {args.name}")
 
 
@@ -3418,7 +3404,7 @@ def cmd_peek(args):
     if w.get("window") not in alive_windows():
         sys.exit(f"{args.name} has no window (status {w['status']})")
     if is_external(w):
-        state = ("busy" if worker_busy(args.name, w) else "idle") if cursor_running(w) else "no live agent"
+        state = ("busy" if worker_busy(args.name, w) else "idle") if agent_running(w) else "no live agent"
     else:
         holder = live_holder(w.get("session"))
         state = status_label(holder) if holder else "no live claude"
@@ -3499,7 +3485,7 @@ def cmd_archive(args):
                         project=w["dir"], worker=args.name, model=w["model"],
                         session=w.get("session"), status=status, files=files, tags=tags,
                         **({"delegated_by": w["delegated_by"]} if w.get("delegated_by") else {}),
-                        **({"agent": w["agent"]} if is_external(w) else {})) +
+                        **agent_fields(w)) +
             tr(f"## 任务\n{w['task']}\n\n"
                f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
                f"## 结果\n{final.get('RESULT') or args.summary or '（worker 未给出 RESULT）'}\n\n"
@@ -3711,7 +3697,7 @@ def worker_budget_change(args):
     with registry() as reg:
         w = reg["workers"].get(name) or sys.exit(f"no worker {name}")
         if is_external(w):
-            sys.exit(f"{name} is a {agent_label(w)} worker; claudesec can't see what it spends, so it can't have a budget")
+            sys.exit(f"{name} is a {agent_of(w).label} worker; claudesec can't see what it spends, so it can't have a budget")
         if args.off:
             w.pop("budget_usd", None)
         elif args.add:
@@ -4485,7 +4471,7 @@ def record_report(name, text):
 
 
 def cmd_report(args):
-    """A Cursor or Codex worker's report (it has no SendMessage): recorded like a Claude Code worker's,
+    """An external agent's worker's report (it has no SendMessage): recorded like a Claude Code worker's,
     then delivered to the secretary through the alert channel, which wakes it; a delegated
     worker's goes to its delegator instead (see cmd_wait). A PROGRESS, from either kind, is only
     recorded: the secretary reads it at its next turn (hook_secretary_prompt)."""
@@ -4522,7 +4508,7 @@ def cmd_report(args):
     elif typ == "PROGRESS":  # not to wake the secretary for: it reads them at its next turn
         print("recorded: the secretary sees this PROGRESS on its next turn, without the user being shown it")
     elif secretary_alive():
-        kind = agent_label(read_registry()[1][args.name])
+        kind = agent_of(read_registry()[1][args.name]).label
         raise_alert(tr(f"{CURSOR_REPORT.format(kind)}「{args.name}」：\n{text}",
                        f"{CURSOR_REPORT_EN.format(kind)} \"{args.name}\":\n{text}"))
         print(f"reported to {config()['secretary_name']}")
@@ -4531,7 +4517,7 @@ def cmd_report(args):
 
 
 def send_text(name, w, text, by="secretary"):
-    """Paste text into a Cursor or Codex worker's window as one message. A pasted message looks to it
+    """Paste text into an external agent's worker's window as one message. A pasted message looks to it
     exactly like the user typing in its window, so it says where it comes from: delegated workers
     had been reporting 「用户直接跟我说了：…」 about their delegator's follow-ups."""
     head = (tr("[claudesec] 秘书转来的消息（不是用户在你窗口里打的字）：",
@@ -4551,7 +4537,7 @@ def send_text(name, w, text, by="secretary"):
 
 def cmd_model(args):
     """Switch a worker to another model: shelve it and wake it on the new one, the conversation
-    kept. The one way for a Cursor or Codex worker, whose agent takes the model only on its command line;
+    kept. The one way for an external agent's worker, whose agent takes the model only on its command line;
     works for a Claude Code worker too. A busy worker is left alone (--force cuts it off)."""
     w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
     if w["status"] != "SHELVED":
@@ -4569,30 +4555,30 @@ def cmd_model(args):
 
 
 def cmd_send(args):
-    """Secretary → Cursor or Codex worker: pasted into its window as one message. Sent while it
+    """Secretary → external agent's worker: pasted into its window as one message. Sent while it
     works, Cursor queues it until the turn ends; Codex takes it into the turn under way."""
     w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
     if not is_external(w):
         sys.exit(f"{args.name} is a Claude Code worker: use SendMessage(to: {args.name!r})")
-    if not cursor_running(w):
+    if not agent_running(w):
         sys.exit(f"{args.name} has no running agent (status {w['status']}); `claudesec wake {args.name}` it first")
     text = sys.stdin.read().strip() or sys.exit("empty message: pass it on stdin")
     if re.match(r"/model\b", text):  # pasted as text, it is a message to the model, not a command
-        sys.exit(f"NOT SENT: a pasted /model doesn't switch a {agent_label(w)} worker's model. Run "
+        sys.exit(f"NOT SENT: a pasted /model doesn't switch a {agent_of(w).label} worker's model. Run "
                  f"`claudesec model {args.name} <model>`: it restarts the agent on the new model, conversation kept.")
     send_text(args.name, w, text)
     mark_answered(args.name, text)
     with registry() as reg:
         reg["focus"] = args.name
-    busy = (" (it is busy: Codex takes it into the turn under way)" if is_codex(w) else
-            " (it is busy: queued until its turn ends)") if worker_busy(args.name, w) else ""
+    busy = f" (it is busy: {agent_of(w).send_busy})" if worker_busy(args.name, w) else ""
     print(f"sent to {args.name}{busy}")
 
 
-# ---------- delegation: a worker hands a small job to a Codex or Cursor worker ----------
+# ---------- delegation: a worker hands a small job to an external agent's worker ----------
 # All by script, so neither the task nor the result passes through the secretary's context:
-# `claudesec delegate` spawns (or messages) the worker on the spot (Codex unless config
-# delegate_agent or --agent says Cursor), the delegated worker's reports land in its log, and the delegator's `claudesec wait` reads them from there. The
+# `claudesec delegate` spawns (or messages) the worker on the spot (--agent, else the first of
+# config delegate_agent available here), the delegated worker's reports land in its log, and the
+# delegator's `claudesec wait` reads them from there. The
 # secretary sees it all in `claudesec status` and is woken only for what may need it: FAILED,
 # BLOCKED, a dialog, a guard overridden. A task that looks like it goes beyond a small job is
 # refused back to the delegator, who either does it itself or says why it's fine (--ack).
@@ -4649,7 +4635,7 @@ def archived_delegation(name):
 
 def cmd_delegate(args):
     if getattr(args, "budget", None) is not None:
-        sys.exit("NOT DELEGATED: --budget is for Claude Code workers; a delegated worker is a Codex or Cursor agent, "
+        sys.exit("NOT DELEGATED: --budget is for Claude Code workers; a delegated worker is an external agent, "
                  "whose spending claudesec can't see. Delegate without it, or do the work with a budgeted spawn.")
     refuse_while_frozen(f"NOT DELEGATED: delegate {args.name}")
     workers = read_registry()[1]
@@ -4660,23 +4646,33 @@ def cmd_delegate(args):
     name = args.name
     if not NAME_RE.match(name):
         sys.exit(f"bad name {name!r}: lowercase letters, digits, dashes")
-    # More work for one it delegated before goes to the same kind of agent; a new one, to the kind asked for.
+    # More work for one it delegated before goes to the agent it ran on; a new one, to the one asked
+    # for, else the first of config delegate_agent that is available here.
     past = None if name in workers else archived_delegation(name)
-    agent = (workers[name].get("agent") if name in workers else
-             past.get("agent") or next((t for t in (past.get("tags") or []) if t in EXTERNAL_AGENTS), "cursor") if past else
-             getattr(args, "agent", None) or config().get("delegate_agent") or "codex")
-    if agent not in EXTERNAL_AGENTS:
+    if name in workers:
+        agent = agent_of(workers[name])
+    elif past:
+        agent = agent_of(past if past.get("agent") else
+                         {**past, "agent": next((t for t in past.get("tags") or [] if t in AGENTS), "cursor")})
+    else:
+        names = [args.agent] if getattr(args, "agent", None) else delegate_agents()
+        picked = next((n for n in names if agent_named(n).available()[0]), names[0] if names else "claude")
+        agent = agent_named(picked)
+        agent = agent.runtime(args.model or agent.default_model(config()))
+        if not agent.external:
+            sys.exit(f"NOT DELEGATED: --agent {picked}"
+                     + (f" with model {args.model} runs Claude Code" if agent.name != "claude" else " is Claude Code")
+                     + ", which doesn't report by command. Use a subagent, or spawn a worker through the secretary.")
+    if not agent.external:
         sys.exit(f"{name} is taken and isn't a worker you delegated to; pick another --name")
-    label = agent_label(agent)
-    ok, why = agent_available(agent)
+    label = agent.label
+    ok, why = agent.available()
     if not ok:
+        others = [n for n in delegate_agents() if n != agent.name and AGENTS[n].available()[0]]
         sys.exit(f"NOT DELEGATED: {label} workers are not available here — {why}. "
-                 + ("Try --agent cursor, or do it yourself, " if agent == "codex" and cursor_available()[0] else
-                    "Try --agent codex, or do it yourself, " if agent == "cursor" and codex_available()[0] else
-                    "Do it yourself, ")
+                 + (f"Try --agent {others[0]}, or do it yourself, " if others else "Do it yourself, ")
                  + "or with a subagent if it runs alongside your work.")
-    if agent == "cursor":
-        cursor_room(f"delegating {name}", but=name, prefix="NOT DELEGATED: ")
+    agent.room(f"delegating {name}", but=name, prefix="NOT DELEGATED: ")
     hits = delegate_guard(task)
     if hits and not args.ack:
         append_log(boss, "delegate-refused", f"{name}: hits {', '.join(hits)}\n{task}")
@@ -4693,7 +4689,7 @@ def cmd_delegate(args):
     if w:
         if w.get("delegated_by") != boss or not is_external(w):
             sys.exit(f"{name} is taken and isn't a worker you delegated to; pick another --name")
-        if not cursor_running(w):
+        if not agent_running(w):
             sys.exit(f"{name} has no running agent any more (status {w['status']}); delegate under a new --name")
         if ack:
             append_log(name, "ack", ack)
@@ -4709,7 +4705,7 @@ def cmd_delegate(args):
         if by and by != boss:
             sys.exit(f"NOT DELEGATED: {name} was {by}'s delegation (archived {past['path']}); pick another --name")
         project, _ = where_now(past["project"])
-        if not (conversation_exists({"agent": agent, "session": past.get("session")}) and project):
+        if not (agent.conversation_exists(past.get("session")) and project):
             sys.exit(f"NOT DELEGATED: {name} already finished and was closed, and its conversation or its directory "
                      f"({past['project']}) is gone, so it can't pick this up. Delegate under a new --name with "
                      f"--dir {past['project']}, and put in the task what it needs from the first round "
@@ -4717,7 +4713,8 @@ def cmd_delegate(args):
         with registry() as reg:
             reg["workers"][name] = {
                 "window": None, "dir": project, "model": past.get("model"), "task": task,
-                "agent": agent, "delegated_by": boss, "mode": "task", "status": "SHELVED",
+                "agent": agent.name, **({"runtime": agent.runtime_name} if agent.runtime_name else {}),
+                "delegated_by": boss, "mode": "task", "status": "SHELVED",
                 "shelved_by": "archived", "session": past["session"], "started_at": now(),
                 "last_report_at": now(), "last_summary": "", "pending_ask": None,
                 "archived": str(past["path"].relative_to(HOME / "history")),
@@ -4746,23 +4743,21 @@ def cmd_delegate(args):
             sys.exit(f"--dir {project}: no such directory")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            err = quietly(cmd_spawn, name=name, dir=project, model=args.model, discuss=False, agent=agent,
+            err = quietly(cmd_spawn, name=name, dir=project, model=args.model, discuss=False, agent=agent.name,
                           for_worker=boss, task=task)
         if err:
             sys.exit(f"NOT DELEGATED: spawning {name} failed: {err}\n{out.getvalue()}")
         if ack:
             append_log(name, "ack", ack)
         if "STUCK ON A DIALOG" in out.getvalue():
-            receipt(tr(f"{boss} 委托 {name} 时 {label} 卡在对话框上，要用户切到窗口 {name} 处理"
-                       + ("（codex 第一次问要不要信任 claudesec 的 hooks：选「2. Trust all and continue」，只这一次）"
-                          if "Hooks need review" in out.getvalue() else ""),
+            hint = agent.dialog_hint(out.getvalue())
+            receipt(tr(f"{boss} 委托 {name} 时 {label} 卡在对话框上，要用户切到窗口 {name} 处理" + (f"（{hint}）" if hint else ""),
                        f"{boss} delegated {name}, and {label} is stuck on a dialog: the user has to handle it in window {name}"
-                       + (" (Codex asking, once, to trust claudesec's hooks: pick \"2. Trust all and continue\")"
-                          if "Hooks need review" in out.getvalue() else "")))
+                       + (f" ({hint})" if hint else "")))
         print(out.getvalue().rstrip())
         verb = "spawned"
     (worker_dir(name) / "delegation.json").write_text(json.dumps({"by": boss, "since": since, "log_start": start,
-                                                                   "agent": agent}))
+                                                                   "agent": agent.name, "label": label}))
     append_log(boss, "delegated", f"{name}{ack}\n{task}")
     if ack:
         receipt(tr(f"{boss} 委托了 {name}：{task.splitlines()[0][:80]}{ack}", f"{boss} delegated {name}: {task.splitlines()[0][:80]}{ack}"))
@@ -4791,7 +4786,7 @@ def cmd_wait(args):
             if header.endswith(" worker→secretary"):
                 typ = (parse_report(body).get("TYPE") or "").split()[:1]
                 if typ and typ[0] in TERMINAL:
-                    kind = agent_label(mark.get("agent", "cursor"))
+                    kind = mark.get("label") or agent_of({"agent": mark.get("agent", "cursor")}).label
                     print(tr(f"{kind} worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}",
                              f"Report from {kind} worker {name} (delegated by you, {header[11:16]}):\n{body}"))
                     return
@@ -4803,7 +4798,7 @@ def cmd_wait(args):
                      f"`claudesec delegate <you> --name {name}` with a short note, then wait again")
         if after(d / "ended-unreported"):
             sys.exit(f"{name} stopped without a final report; `claudesec peek {name}` to see where it is")
-        if not cursor_running(w):
+        if not agent_running(w):
             sys.exit(f"{name}: its agent is no longer running (status {w['status']})")
         if time.time() > deadline:
             sys.exit(f"gave up after {args.timeout}s: {name} is still going; wait again, or peek")
@@ -4813,71 +4808,14 @@ def cmd_wait(args):
 def finish_later(name):
     """A delegated worker that reported DONE is archived and closed once its turn is over, from
     outside: this runs in its own stop hook, inside the window that gets killed."""
-    subprocess.Popen([str(SELF), "hook", "cursor-finish", name], env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
+    subprocess.Popen([str(SELF), "hook", "agent-finish", name], env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
 
 
-CURSOR_FALLBACK_MODEL = "gpt-5.6-sol-high"
-AGENT_START = "[claudesec] Cursor agent, model "
-
-
-def cursor_error_text(window):
-    """The error a Cursor agent printed at the end of a failed turn ("Error: Model Blocked"): its
-    stop hook says only "error". The screen may lag the hook by a moment."""
-    if not window:
-        return ""
-    for _ in range(3):
-        lines = [l.strip() for l in pane_text(window, suggestion="drop").splitlines() if l.strip()]
-        hits = [l for l in lines[-40:] if re.search(r"\b(Error|error|ERROR)\b|Blocked|blocked", l)]
-        if hits:
-            return " ".join(hits[-1].split())[:200]
-        time.sleep(1)
-    return ""
-
-
-def hook_cursor_launch(name):
-    """What a spawned Cursor worker's window runs: its agent, in the foreground. Cursor now and
-    then answers a model variant string with "Cannot use this model" and exits, though the same
-    string works a minute later (devbox, 2026-10-22). Refused, the model is tried once more; refused
-    again, CURSOR_FALLBACK_MODEL stands in for it, which the worker's summary and log say. Any
-    other failure is left to hook_cursor_exit."""
-    model = os.environ.get("CLAUDESEC_MODEL") or config()["cursor_worker_model"]
-    first = (worker_dir(name) / "initial.md").read_text()
-    pane = os.environ.get("TMUX_PANE", "")
-    env = {**os.environ, "CLAUDESEC_WORKER": name, "CLAUDESEC_HOME": str(HOME)}
-    env.pop("CLAUDESEC_MODEL", None)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C (`claudesec interrupt`) is the agent's
-
-    def run(m):
-        print(AGENT_START + m, flush=True)
-        return subprocess.run(["agent", "--model", m, "--trust", first], env=env,
-                              preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL)).returncode
-
-    def refused():  # only what the last run printed
-        screen = pane_text(pane, suggestion="drop") if pane else ""
-        return "Cannot use this model" in screen.rsplit(AGENT_START, 1)[-1]
-
-    rc = run(model)
-    if rc and refused():
-        time.sleep(5)
-        rc = run(model)
-        if rc and refused() and model != CURSOR_FALLBACK_MODEL:
-            note = tr(f"模型兜底：{model} 被拒两次，改用 {CURSOR_FALLBACK_MODEL}",
-                      f"model fallback: {model} refused twice, using {CURSOR_FALLBACK_MODEL}")
-            with registry() as reg:
-                w = reg["workers"].get(name)
-                if w is not None:
-                    w.update(model=CURSOR_FALLBACK_MODEL, last_summary=note)
-            append_log(name, "model-fallback", note)
-            rc = run(CURSOR_FALLBACK_MODEL)
-    os.environ["CLAUDESEC_RC"] = str(rc)
-    hook_cursor_exit(name)
-
-
-def hook_cursor_exit(name):
-    """After a spawned Cursor or Codex worker's agent exits for good. A clean exit (the user quit
-    it) is left alone; any other is a failure nobody would otherwise hear of."""
+def hook_agent_exit(name):
+    """After a spawned external worker's agent exits for good. A clean exit (the user quit it) is
+    left alone; any other is a failure nobody would otherwise hear of."""
     rc = os.environ.get("CLAUDESEC_RC", "")
     if rc in ("0", ""):
         return
@@ -4889,7 +4827,7 @@ def hook_cursor_exit(name):
         w = reg["workers"].get(name)
         if w is None:
             return
-        kind = agent_label(w)
+        kind = agent_of(w).label
         w.update(status="FAILED", last_report_at=now(), pending_ask=None,
                  last_summary=tr(f"{kind} agent 退出（rc {rc}）：{why}", f"{kind} agent exited (rc {rc}): {why}")[:200])
         boss = w.get("delegated_by")
@@ -4903,7 +4841,7 @@ def hook_cursor_exit(name):
                        "again with another model."))
 
 
-def hook_cursor_finish(name):
+def hook_agent_finish(name):
     time.sleep(2)
     w = read_registry()[1].get(name)
     if not w or not (worker_dir(name) / "finish").exists():
@@ -4912,74 +4850,95 @@ def hook_cursor_finish(name):
                 if h.endswith("worker→secretary")), "")
     quietly(cmd_archive, name=name, summary=tr(f"为 {w.get('delegated_by')}：", f"for {w.get('delegated_by')}: ")
             + (did.splitlines()[0][:100] if did else ""),
-            tags=f"delegated,{w.get('agent') or 'cursor'}", files=None, subagent=False, task=None, dir=None)
+            tags=f"delegated,{agent_of(w).name}", files=None, subagent=False, task=None, dir=None)
     quietly(cmd_close, name=name)
 
 
-def cursor_worker():
-    """The worker a Cursor hook runs for. The hooks are global; the shell guard in
-    hooks.json already skips sessions without CLAUDESEC_WORKER."""
+# ---------- an external agent's hooks: one set for all, each agent's protocol translating ----------
+# hooks.json of each agent runs `claudesec hook agent-start|agent-prompt|agent-stop <protocol>`,
+# behind a shell guard that skips any session without CLAUDESEC_WORKER (the hooks are global).
+
+def hooked_worker():
+    """The worker an external agent's hook runs for, if any."""
     name = os.environ.get("CLAUDESEC_WORKER", "")
     return name if name in read_registry()[1] else None
 
 
-def hook_cursor_session_start():
-    """A new chat: record its id, and hand Cursor the worker rules as context (it has no
-    --append-system-prompt). A resumed chat fires no sessionStart; it keeps the rules it got."""
+def hook_protocol(protocol):
+    """The adapter that speaks the protocol a hook was installed with."""
+    return next((a for a in AGENTS.values() if a.protocol == protocol), None) or sys.exit(f"no agent speaks {protocol}")
+
+
+def reply(answer):
+    if answer is not None:
+        print(json.dumps(answer, ensure_ascii=False))
+
+
+def hook_agent_start(protocol):
+    """A new session (or, for Codex, a resumed one's first turn): record its id, and hand the agent
+    the worker rules as context (it has no --append-system-prompt). A resumed Cursor chat fires no
+    sessionStart; it keeps the rules it got."""
+    proto = hook_protocol(protocol)
     data = hook_input()
-    name = cursor_worker()
+    name = hooked_worker()
     if not name:
         return
     with registry() as reg:
-        reg["workers"][name]["session"] = data.get("session_id") or data.get("conversation_id")
-    print(json.dumps({"additional_context": (worker_dir(name) / "prompt.md").read_text()}, ensure_ascii=False))
+        reg["workers"][name]["session"] = proto.session_id(data)
+    reply(proto.start_reply((worker_dir(name) / "prompt.md").read_text()))
 
 
-def hook_cursor_prompt():
+def hook_agent_prompt(protocol):
+    hook_protocol(protocol)
     hook_input()
-    name = cursor_worker()
+    name = hooked_worker()
     if name:
         (worker_dir(name) / "busy").write_text(now())
         back_at_work(name, new_turn=True)  # a prompt after a final report: an answer or new work
 
 
-def hook_cursor_stop():
-    """Cursor's Stop: a follow-up message asks for the report, as Claude Code's block does."""
+def hook_agent_stop(protocol):
+    """The agent's turn ends. Without a final report it is asked for one, as Claude Code's Stop
+    block does (Cursor: a follow-up message, up to three times; Codex: a block, once); then the end
+    is marked and, for a worker nobody waits on, the secretary told."""
+    proto = hook_protocol(protocol)
     data = hook_input()
-    name = cursor_worker()
+    name = hooked_worker()
     if not name:
-        return
+        return reply(proto.stop_reply())
     d = worker_dir(name)
     (d / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
     w = read_registry()[1][name]
+    agent = agent_of(w)
+    status, nagged = proto.stop_event(data)
 
     def idle():
         (d / "busy").unlink(missing_ok=True)
 
-    # `claudesec interrupt` stopped it on purpose. One Ctrl+C can end in more than one stop,
-    # so the mark holds for a while; and one that lands while a shell command runs can leave
+    # `claudesec interrupt` stopped it on purpose (Cursor). One Ctrl+C can end in more than one
+    # stop, so the mark holds for a while; and one that lands while a shell command runs can leave
     # the turn going on to complete, which then is an ordinary end.
     interrupted = d / "interrupted"
     if interrupted.exists():
-        if data.get("status") != "completed" and time.time() - interrupted.stat().st_mtime < 30:
+        if status != "completed" and time.time() - interrupted.stat().st_mtime < 30:
             idle()
             (d / "ended-unreported").write_text(now())
-            return
+            return reply(proto.stop_reply())
         interrupted.unlink(missing_ok=True)
-    if data.get("status") == "error" and (d / "reported").exists():
+    if status == "error" and (d / "reported").exists():
         # It had sent its final report when the turn errored (in its closing words, say): the work
         # is delivered, so this is an ordinary end, and a delegated worker's DONE is wrapped up.
         (d / "reported").unlink(missing_ok=True)
         idle()
-        append_log(name, "api-error", "Cursor: turn ended with status error after its final report; taken as the end")
+        append_log(name, "api-error", f"{agent.label}: turn ended with status error after its final report; taken as the end")
         if (d / "finish").exists():
             finish_later(name)
-        return
-    if data.get("status") == "error":
+        return reply(proto.stop_reply())
+    if status == "error":
         idle()
         (d / "ended-error").write_text(now())
-        said = cursor_error_text(w.get("window"))
-        why = f"Cursor ({data.get('model') or '?'}): {said or 'turn ended with status error'}"
+        said = agent.error_text(w)
+        why = f"{agent.label} ({data.get('model') or w.get('model') or '?'}): {said or 'turn ended with status error'}"
         with registry() as reg:
             w = reg["workers"][name]
             if w["status"] not in ("API_ERROR", "WAITING_PERMISSION"):
@@ -4988,114 +4947,46 @@ def hook_cursor_stop():
         append_log(name, "api-error", why)
         blocked = re.search(r"(?i)model.{0,20}(blocked|not available|cannot use)|(blocked|cannot use).{0,20}model", said or "")
         if not w.get("delegated_by") and w.get("mode") != "discuss":  # a delegator's wait reports it
-            raise_alert(tr(f"Cursor worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报：{why}。"
+            raise_alert(tr(f"{agent.label} worker {name} 这一轮以错误结束，停在提示符上，不会自己汇报：{why}。"
                            + (f"是模型用不了：`claudesec model {name} <模型>` 换一个（会重开 agent，对话保留）。"
                               if blocked else f"用 `claudesec send {name}` 让它从中断处继续。"),
-                           f"Cursor worker {name}'s turn ended in an error; it sits at its prompt and won't report "
+                           f"{agent.label} worker {name}'s turn ended in an error; it sits at its prompt and won't report "
                            f"on its own: {why}. "
                            + (f"The model can't be used: switch with `claudesec model {name} <model>` (restarts the "
                               "agent, keeps the conversation)." if blocked else
                               f"Tell it to carry on from where it stopped with `claudesec send {name}`.")))
-        return
+        return reply(proto.stop_reply())
     if w["status"] == "API_ERROR":
         with registry() as reg:
             w = reg["workers"][name]
             w["status"] = settled(w.pop("status_before", None))
             w["pending_ask"] = None
+            w = dict(w)
     marker = d / "reported"
     nobody = not w.get("delegated_by") and not secretary_alive()
-    if data.get("status") != "completed" or w.get("mode") == "discuss" or nobody or marker.exists():
-        if not marker.exists():
-            (d / "ended-unreported").write_text(now())
-        marker.unlink(missing_ok=True)  # aborted by the user, a discussion turn, nobody to tell, or reported
-        idle()
-        if (d / "finish").exists() and data.get("status") == "completed":
-            finish_later(name)
-        return
-    if data.get("loop_count", 0) >= CURSOR_NAGS:
-        idle()
+    if status == "completed" and w.get("mode") != "discuss" and not nobody and not marker.exists() \
+            and nagged < proto.nags:
+        return reply(proto.stop_reply(
+            tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
+               "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
+               + ("" if w.get("delegated_by") else "若用户刚在你的窗口直接打字跟你说过话，汇报里注明。"),
+               f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send the "
+               "secretary a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
+               "the format is under \"Reporting\" in your rules."
+               + ("" if w.get("delegated_by") else " If the user just typed to you in your window, say so in the report."))))
+    # Reported, aborted by the user, a discussion turn, nobody to tell, or asked enough times.
+    if not marker.exists():
         (d / "ended-unreported").write_text(now())
-        if not w.get("delegated_by"):  # a delegator's wait reports it
-            raise_alert(tr(f"Cursor worker {name} 催了 {CURSOR_NAGS} 次仍没汇报就停下了；`claudesec peek {name}` 看看。",
-                           f"Cursor worker {name} stopped without reporting after {CURSOR_NAGS} reminders; have a look "
-                           f"with `claudesec peek {name}`."))
-        return
-    print(json.dumps({"followup_message":
-        tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
-           "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
-           + ("" if w.get("delegated_by") else "若用户刚在你的窗口直接打字跟你说过话，汇报里注明。"),
-           f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send the "
-           "secretary a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
-           "the format is under \"Reporting\" in your rules."
-           + ("" if w.get("delegated_by") else " If the user just typed to you in your window, say so in the report."))},
-        ensure_ascii=False))
-
-
-def hook_codex_session_start():
-    """A Codex session starts (a new one, or a resumed one's first turn): record its id, and hand
-    it the worker rules as context, in full (additionalContextLimit 0 in hooks.json). A resumed
-    one gets them again, so it works by the rules as they are now."""
-    data = hook_input()
-    name = cursor_worker()
-    if not name:
-        return
-    with registry() as reg:
-        reg["workers"][name]["session"] = data.get("session_id")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
-                                             (worker_dir(name) / "prompt.md").read_text()}}, ensure_ascii=False))
-
-
-def hook_codex_prompt():
-    hook_input()
-    name = cursor_worker()
-    if name:
-        (worker_dir(name) / "busy").write_text(now())
-        back_at_work(name, new_turn=True)  # a prompt after a final report: an answer or new work
-
-
-def hook_codex_stop():
-    """Codex's Stop, which takes Claude Code's block: the reason goes back as a prompt and the
-    turn goes on. Once (stop_hook_active), as for Claude Code; then the end is marked and, for a
-    worker nobody waits on, the secretary told. Codex wants JSON from it either way. An
-    interrupted turn runs no Stop (cmd_interrupt marks it)."""
-    data = hook_input()
-    name = cursor_worker()
-    if not name:
-        print("{}")
-        return
-    d = worker_dir(name)
-    (d / "last-stop.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    with registry() as reg:
-        w = reg["workers"][name]
-        if w["status"] == "API_ERROR":
-            w["status"] = settled(w.pop("status_before", None))
-            w["pending_ask"] = None
-        w = dict(w)
-    marker = d / "reported"
-    nobody = not w.get("delegated_by") and not secretary_alive()
-    if w.get("mode") == "discuss" or nobody or marker.exists() or data.get("stop_hook_active"):
-        if not marker.exists():
-            (d / "ended-unreported").write_text(now())
-            if data.get("stop_hook_active") and not w.get("delegated_by") and not nobody \
-                    and w.get("mode") != "discuss":  # a delegator's wait reports it
-                raise_alert(tr(f"Codex worker {name} 催过一次仍没汇报就停下了；`claudesec peek {name}` 看看。",
-                               f"Codex worker {name} stopped without reporting after a reminder; have a look with "
-                               f"`claudesec peek {name}`."))
-        marker.unlink(missing_ok=True)
-        (d / "busy").unlink(missing_ok=True)
-        if (d / "finish").exists():
-            finish_later(name)
-        print("{}")
-        return
-    print(json.dumps({"decision": "block", "reason":
-        tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）给秘书发一条汇报，"
-           "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。"
-           + ("" if w.get("delegated_by") else "若用户刚在你的窗口直接打字跟你说过话，汇报里注明。"),
-           f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send the "
-           "secretary a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
-           "the format is under \"Reporting\" in your rules."
-           + ("" if w.get("delegated_by") else " If the user just typed to you in your window, say so in the report."))},
-        ensure_ascii=False))
+        if status == "completed" and nagged >= proto.nags and not nobody and not w.get("delegated_by") \
+                and w.get("mode") != "discuss":  # a delegator's wait reports it
+            raise_alert(tr(f"{agent.label} worker {name} 催了 {proto.nags} 次仍没汇报就停下了；`claudesec peek {name}` 看看。",
+                           f"{agent.label} worker {name} stopped without reporting after {proto.nags} reminder(s); "
+                           f"have a look with `claudesec peek {name}`."))
+    marker.unlink(missing_ok=True)
+    idle()
+    if (d / "finish").exists() and status == "completed":
+        finish_later(name)
+    reply(proto.stop_reply())
 
 
 def hook_worker_stop(name):
@@ -5452,13 +5343,11 @@ def check_stuck(now_t=None):
         if w["status"] == "SHELVED" or w.get("window") not in live:
             continue
         screen = pane_text(w["window"], suggestion="drop")
-        if not is_external(w) and answer_channels_dialog(w["window"], screen):
-            continue
-        if is_codex(w) and answer_codex_dialog(w["window"], screen):
-            continue
-        if not is_external(w) and (note := answer_credit_dialog(name, w["window"], screen)):
-            raise_alert(note)
-            raised.append(note)
+        answered = agent_of(w).answer_dialog(name, w["window"], screen)
+        if isinstance(answered, str):  # a note for the secretary
+            raise_alert(answered)
+            raised.append(answered)
+        if answered:
             continue
         if w["status"] in ("WAITING_PERMISSION", "API_ERROR"):
             sig = f"{w['status']}|{w.get('last_report_at')}"
@@ -5703,6 +5592,7 @@ def hook_secretary_watch(delay=0):
         time.sleep(1)
 
 
+load_agents()
 HOOKS = {
     "worker-session-start": hook_worker_session_start,
     "worker-permission": hook_worker_permission,
@@ -5717,18 +5607,17 @@ HOOKS = {
     "secretary-session-start": hook_secretary_session_start,
     "secretary-send": hook_secretary_send,
     "secretary-prompt": hook_secretary_prompt,
-    "cursor-session-start": hook_cursor_session_start,
-    "cursor-prompt": hook_cursor_prompt,
-    "cursor-stop": hook_cursor_stop,
-    "cursor-finish": hook_cursor_finish,
     "worker-budget": hook_worker_budget,
-    "cursor-exit": hook_cursor_exit,
-    "agent-exit": hook_cursor_exit,
-    "codex-session-start": hook_codex_session_start,
-    "codex-prompt": hook_codex_prompt,
-    "codex-stop": hook_codex_stop,
-    "cursor-launch": hook_cursor_launch,
+    "agent-start": hook_agent_start,
+    "agent-prompt": hook_agent_prompt,
+    "agent-stop": hook_agent_stop,
+    "agent-exit": hook_agent_exit,
+    "agent-finish": hook_agent_finish,
+    "cursor-exit": hook_agent_exit,      # what windows and stop hooks started before agent-* still run
+    "cursor-finish": hook_agent_finish,
 }
+for _agent in AGENTS.values():
+    HOOKS.update(_agent.hooks())
 
 
 def cmd_hook(args):
@@ -5749,7 +5638,7 @@ def main():
     s = sub.add_parser("run"); s.add_argument("--new", action="store_true"); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("spawn"); s.add_argument("name"); s.add_argument("--dir")
     s.add_argument("--model"); s.add_argument("--discuss", action="store_true")
-    s.add_argument("--agent", choices=["claude", "cursor", "codex"], default="claude")
+    s.add_argument("--agent", choices=list(AGENTS), default="claude")
     s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.add_argument("--budget", type=float, metavar="USD")
     s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
@@ -5802,7 +5691,7 @@ def main():
     s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_model)
     s = sub.add_parser("delegate"); s.add_argument("boss"); s.add_argument("--name", required=True)
     s.add_argument("--dir"); s.add_argument("--model"); s.add_argument("--ack"); s.add_argument("--budget", type=float)
-    s.add_argument("--agent", choices=list(EXTERNAL_AGENTS))
+    s.add_argument("--agent", choices=list(AGENTS))
     s.set_defaults(fn=cmd_delegate)
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--timeout", type=int, default=4 * 3600)
     s.set_defaults(fn=cmd_wait)

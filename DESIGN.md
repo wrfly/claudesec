@@ -465,14 +465,14 @@ worker 干活（可开 subagent，结果不外泄）
 claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
-claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor] [--for WORKER] <<< 任务原文
+claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor|codex] [--for WORKER] <<< 任务原文
                                                 不带 --dir：~/.claudesec/work/NAME（没有就建），运维、通用的活用
-claudesec delegate ME --name N [--dir D] [--ack 理由] <<< 任务书   worker 把小活交给 Cursor worker
+claudesec delegate ME --name N [--dir D] [--agent codex|cursor] [--ack 理由] <<< 任务书   worker 把小活交给 Codex（默认）/ Cursor worker
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
-claudesec report NAME <<< 汇报       Cursor worker 给秘书的汇报
+claudesec report NAME <<< 汇报       Cursor / Codex worker 给秘书的汇报
 claudesec remind WHEN TARGET 内容 [--every 1d]   定时任务，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec review [--print]       开当天的复盘 worker（整理秘书记忆、提提示词 diff）
-claudesec send NAME <<< 原话         秘书给 Cursor worker 说话（粘贴进它的窗口）
+claudesec send NAME <<< 原话         秘书给 Cursor / Codex worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME | close NAME
 claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
                                 Claude Code 的建议或占位，标成「【CC 建议，不是用户输入】」，和用户没发出的草稿区分开
@@ -551,8 +551,13 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
   worker 的 prompt.md 在 spawn / wake 时按开关渲染；秘书的在 `claudesec run` 时渲染成 `~/.claudesec/secretary-prompt.md`
   再传给 claude。关的时候秘书只看到一句「不可用，用户要 Cursor 时告诉用户、改派」，worker 看到「小活自己做或开 subagent」。
 - `claudesec status` 末尾一行「Cursor worker：可用（路径）/ 已关 / 没有 agent 命令」。
+- Codex 一样（config `codex`，要 `ttadk` 和 `codex` 两个命令），标记是 `<!-- if codex -->`；`<!-- if delegate -->`
+  是两者有其一，worker 规则里「把小活交出去」那段和秘书的 Codex / Cursor 段落用它。
 
-### worker 把小活委托给 Cursor（`claudesec delegate` / `wait`）
+### worker 把小活委托给 Codex / Cursor（`claudesec delegate` / `wait`）
+
+下面按 Cursor 写的，Codex 同样适用：2026-10-30 起 delegate 默认开 Codex worker（config `delegate_agent`，用户定的），
+`--agent cursor` 开 Cursor 的。同名追加沿用原来那种（注册表里的，或归档 frontmatter 的 `agent` / tags）。
 
 用户定了「独立、小任务尽量派 cursor 做」。第一版让 worker 发 TYPE: DELEGATE 给秘书、秘书 spawn、Cursor 的汇报
 经秘书转回：一次委托的任务书和结果各过秘书上下文两遍（约 1–2 万 token），每一步还要秘书推理。现在全由脚本做：
@@ -755,6 +760,43 @@ status 列出未到点的提醒。
 send 后它不汇报 → stop 的 followup 催出 DONE；忙时 shelve 被拒，闲时 shelve → wake 带指令 → 同一个会话 id
 接着回复并汇报；窗口被杀后 `lifecycle wake-all` 静默恢复；interrupt 打断 shell 命令后状态不变、不告警；
 没有 CLAUDESEC_WORKER 的普通 Cursor 会话照常跑完，hook 无输出、注册表不变。
+
+### Codex worker（`spawn --agent codex`）
+
+用户 2026-10-30 要的：用 `ttadk codex` 跑 gpt-6.1-sol，跟 Cursor 一样接独立的活。取舍是用户定的：不沙箱、从不询问
+（`codex_args` 默认 `--dangerously-bypass-approvals-and-sandbox`，可在 config 里换），信任目录由 claudesec 自动答，
+delegate 默认用它。
+- 启动：`CLAUDESEC_WORKER=… CLAUDESEC_HOME=… ttadk codex --mode ttadk-only -m <模型> --skip-check -- -c
+  check_for_update_on_startup=false -c notice.hide_full_access_warning=true <codex_args> [resume <id>] "<首条消息>"`。
+  不带 `--mode ttadk-only` 可能要登 ChatGPT；更新提示框会挡住启动，用参数关掉。`resume` 之后不能再跟选项。
+- hook 装在全局 `~/.codex/hooks.json`（或 `$CODEX_HOME`），每条前面是 `[ -z "${CLAUDESEC_WORKER:-}" ] ||`，
+  改之前写 `hooks.json.bak-claudesec-<时间戳>`。三条：SessionStart 记 session id、把 prompt.md 作为 additionalContext
+  交给它（`additionalContextLimit: 0`，否则只给预览；37K 字符实测全量送达）；UserPromptSubmit 记 busy；Stop 跟 Claude Code
+  一样能 block：`{"decision":"block","reason":…}` 让这一轮接着做，催一次（`stop_hook_active`）后不再催，写
+  `ended-unreported`，没人等的告诉秘书。
+- hook 新装或改过后，codex 启动时弹「Hooks need review」：只能用户在那个窗口选「2. Trust all and continue」，信任记在
+  config.toml 的 trusted_hash。claudesec 不答（也不用 `--dangerously-bypass-hook-trust`）：信不信任 hook 是用户的事。
+  spawn / wake 报 STUCK ON A DIALOG 并带一行说明。
+- 自动答的对话框：「Do you trust the contents of this directory?」选 1；从别的目录 resume 时「Choose working directory
+  to resume this session」选 2（窗口所在的目录，是 wake 选的）。
+- SessionStart 只跟着第一条提示触发：resume 不带提示就什么都不触发，所以 wake 看屏幕判断起来没有：新会话有
+  「OpenAI Codex (v…」的框，resume 的没有，只有输入框下面「gpt-6.1-sol default · ~/目录」这一行。
+- interrupt 发 Esc：屏幕上「■ Conversation interrupted」，不触发 Stop，所以 cmd_interrupt 自己清 busy、写 ended-unreported。
+- send 在它忙时，消息插进正在跑的这一轮（Cursor 是排队到这一轮结束）。
+- 不 nice（Cursor 那样的 CPU 限制没给 Codex 加）；看不到花费（不能 --budget）；一轮以 API 错误结束能不能看出来没验证过。
+- 汇报、日志、委托、归档、shelve / wake 都走 Cursor 那一套（`is_external`）。
+
+### 非 Claude 模型的 Claude worker（`spawn --model deepseek-…`）
+
+`ttadk_model()`：模型名不像 Claude 的（claude / opus / sonnet / haiku / fable / default / best / opusplan 开头之外），
+worker 就用 `ttadk claude -m <模型> --skip-check -- <原来的 claude 参数>` 启动。ttadk 把它的端点 env 合进我们的
+`--settings`，hook、规则、汇报都跟普通 worker 一样；不带 `--rc`（remote control 要 claude.ai 登录）。
+deepseek-v4-pro-0813 实测：auto 权限模式下 Bash、写文件都能跑，SessionStart hook 记下了 session。
+
+已验证（真机，codex 0.147.0、ttadk 1.0.36，临时 CLAUDESEC_HOME 和 CODEX_HOME，`codex_args` 换成 workspace-write 沙箱）：
+delegate → hooks review 对话框被识别 → 信任后 PROGRESS、DONE 经 wait 拿到；归档关窗后同名再 delegate → resume 原会话接着做；
+十几秒就交差的活（spawn 还在等对话框时就已归档关窗）不再误报「exited right away」；spawn → 忙时 send 插进这一轮、DONE 带上；
+interrupt → busy 清掉；shelve → wake 恢复同一个会话并汇报。不汇报就停下的那条路只有单测：模型总是先照规则汇报了。
 
 未验证（需要用户真用时观察）：
 - 秘书 `/compact` 后靠注入的状态接上在跑的 worker

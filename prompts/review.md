@@ -21,7 +21,7 @@
    机器/项目专属的、这个用户个人的偏好（比如某类活爱交给谁做、回复用什么语言）留在 memory。纠正一次就写死成「从此所有 X 都…」是过拟合，要么写成判断标准，要么先不提。
 2. 每加一条，同时找能删、能合并的：重复的、已经被代码保证的、过时的。提示词只加不减会撑爆秘书的上下文。
 3. **「铁律」一节一个字都不许改。**
-   `<!-- if cursor --> … <!-- else --> … <!-- end cursor -->` 包着的是只在机器上有 Cursor worker 时才给出的内容，改的时候保留标记。
+   `<!-- if X --> … <!-- else --> … <!-- end X -->`（X 为 cursor / codex / delegate）包着的是只在机器上有 Cursor / Codex worker 时才给出的内容（delegate：两者有其一），改的时候保留标记。
 4. 按仓库的 worktree 规则开新 worktree，分支 `review/{{DATE}}`；改完跑通 python3 -m unittest discover -s tests，commit，**不要 push**。
    `git diff origin/main` 存到 `{{REVIEWS}}/{{DATE}}.diff`。
 5. 汇报 NEED_DECISION：DID 写记忆改了什么（几条合并、删了哪些）；ASK 列每一处提示词改动，一行一条，

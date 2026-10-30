@@ -34,6 +34,7 @@
 | `codex_args` | `["--dangerously-bypass-approvals-and-sandbox"]` | 除模型外 codex（直接跑或经 ttadk）带的参数：默认不沙箱、从不询问（窗口没人看着）。要沙箱又能汇报，可以写 `["-s", "workspace-write", "-a", "never", "--add-dir", "~/.claudesec"]` |
 | `delegate_agent` | `["ttadk", "codex", "cursor"]` | worker 的 `claudesec delegate` 没带 `--agent` 时开哪种：这台机器上可用的第一个（写一个名字也行） |
 | `stale_days` | `7` | 巡检把放了这么多天的待问、待答、待办挑出来提示秘书（每再过这么多天再提一次）；`0` 不按天数查 |
+| `idle_ask_minutes` | `[5, 15, 30]` | 秘书闲置这么多分钟、还有待问 / 待答 / 待办时叫醒它去问用户；每次多等到下一个数，用完就不叫，用户一说话重新算；`[]` 关掉 |
 | `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | 没设额度的 worker 花得太多时告警：超过预算窗口上限的这个比例，或者上次汇报超过 M 分钟后又花了超过 $N |
 | `cursor_max_running` | CPU 核数的一半 | 同时在干活的本地 Cursor worker 最多几个（停在提示符上空闲的不算；不配：本机核数的一半，至少 1；配了数字就按数字；`0` 不限）；超了 `spawn --agent cursor`、`wake`、`delegate` 会拒绝并说明是谁在跑。`0` 不限 |
 | `cursor_nice` | `10` | Cursor agent 用 `nice -n` 这个值运行，CPU 让给别的程序；`0` 正常优先级 |

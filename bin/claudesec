@@ -23,6 +23,7 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec notice add [--from W] TEXT   a to-do (待办事项): something for the user to do, not decide;
                                     notice done N, notice list
   claudesec show N                       the whole of queue item or to-do #N
+  claudesec dnd [on|off]                 the user said "don't disturb me": no idle nudges until off
   claudesec stale                        open queue items and to-dos that look out of date (closed worker,
                                     merged MRs, waited stale_days); the secretary is told of new ones
   claudesec dashboard on|off              panes beside the secretary, top to bottom: to-dos, decisions,
@@ -128,6 +129,8 @@ DEFAULT_CONFIG = {
     "runaway_usd": 20,
     "runaway_quiet_minutes": 60,
     "stale_days": 7,                  # an open queue item or to-do this old is pointed out to the secretary
+    "idle_ask_minutes": [5, 15, 30],  # the secretary idle this long with something for the user: woken to ask;
+                                      # each next wait is the next number, until the user speaks. []: never
     "cursor_max_running": None,       # local Cursor workers at work at once; spawn / wake / delegate past it
                                       # refuse. None: half the CPU cores (at least 1); 0: no limit
     "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
@@ -4152,6 +4155,8 @@ def check_reminders(run_pid):
                 (HOME / "stale-due").unlink(missing_ok=True)
                 with contextlib.suppress(Exception):  # nor a broken queue.md or git checkout
                     check_stale()
+            with contextlib.suppress(Exception):
+                check_idle()
             time.sleep(REMINDER_CHECK_SECS)
 
 
@@ -4165,6 +4170,74 @@ def print_reminders():
             rows.append((r["id"], show_time(r["due"]), show_every(r["every"]) if r.get("every") else "",
                          r["target"], r["text"][:60]))
         print_rows(rows)
+
+
+# ---------- idle: ask the user rather than wait to be chased ----------
+# The user, 2026-10-30: "don't make me chase you any more: when the window has been idle over 5
+# minutes, ask me what needs me." The secretary idle (at its prompt, no message from the user or a
+# worker, no alert since its last turn ended) with items for the user (待问, 待答, 待办) is woken
+# to ask one. Unanswered, the next wait is longer (idle_ask_minutes), until there are none left;
+# the user speaking starts them over, and so do new items. Not while "don't disturb me" (dnd).
+# Idle is Claude Code's own word for it, in its sessions/<pid>.json: status "idle" since
+# statusUpdatedAt. Any turn (a message, an alert, a nudge) moves that on; so does Esc, which
+# runs no Stop hook.
+
+IDLE_NUDGES = "idle-nudges.json"    # {"items": [numbers], "sent": nudges since the user last spoke}
+DND = "dnd"
+
+
+def secretary_idle_minutes():
+    """How long the secretary has sat at its prompt, or None: busy, in a dialog, not running."""
+    with contextlib.suppress(OSError):
+        sid = (HOME / "secretary.session").read_text().strip()
+        s = next((s for s in claude_sessions() if s.get("sessionId") == sid), None)
+        if s and s.get("status") == "idle" and s.get("statusUpdatedAt"):
+            return (time.time() - s["statusUpdatedAt"] / 1000) / 60
+    return None
+
+
+def for_the_user():
+    """Numbers of what waits on the user: 待问 and 待答 items, open to-dos."""
+    items = [n for section, n, _, _, _ in queue_items(queue_text()) if section in ("todo", "doing") and n]
+    return sorted({*items, *(int(n) for n, _, _ in open_notices() if n)})
+
+
+def check_idle():
+    waits = config().get("idle_ask_minutes") or []
+    if not waits or (HOME / DND).exists() or any((HOME / "alerts").glob("*.txt")):
+        return  # alerts not yet delivered will wake it anyway
+    idle = secretary_idle_minutes()
+    if idle is None:
+        return
+    state = {}
+    with contextlib.suppress(OSError, ValueError):
+        state = json.loads((HOME / IDLE_NUDGES).read_text())
+    sent = state.get("sent", 0)
+    items = for_the_user()
+    if set(items) - set(state.get("items", [])):
+        sent = 0  # something new since the last nudge: a new batch
+    if not items or sent >= len(waits) or idle < float(waits[sent]):
+        return
+    (HOME / IDLE_NUDGES).write_text(json.dumps({"items": items, "sent": sent + 1}))
+    last = sent + 1 >= len(waits)
+    raise_alert(tr(f"[闲置] 窗口闲置 {waits[sent]} 分钟，还有 {len(items)} 件要用户处理（{' '.join(f'#{n}' for n in items)}）：挑一件问用户"
+                   "（「待答」有的先提那件，没有就问「待问」最上面的，或提醒一件待办），用文字问，一条消息只问一件。"
+                   + ("用户再不回应就不再叫你了，等用户说话。" if last else ""),
+                   f"[idle] The window has been idle {waits[sent]} minutes, with {len(items)} items for the user "
+                   f"({' '.join(f'#{n}' for n in items)}): ask the user about one (the one waiting for an answer "
+                   "if there is one, else the top one to ask, or remind them of a to-do), in text, one per message."
+                   + (" If the user still doesn't answer, you won't be woken again until they speak." if last else "")))
+
+
+def cmd_dnd(args):
+    """The user said not to disturb them: no idle nudges (the secretary also keeps quiet) until off."""
+    path = HOME / DND
+    if args.state == "on":
+        path.write_text(now())
+    elif args.state == "off":
+        path.unlink(missing_ok=True)
+    print(tr(f"别打扰：{'开（' + path.read_text().strip() + ' 起）' if path.exists() else '关'}",
+             f"Do not disturb: {'on (since ' + path.read_text().strip() + ')' if path.exists() else 'off'}"))
 
 
 # ---------- sweep: queue items and to-dos that may be out of date ----------
@@ -5138,6 +5211,7 @@ def hook_secretary_prompt():
                                           "don't say anything about it; it's for when the user asks."), *progress]))
     if not str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
         (HOME / USER_TURN).write_text(now())  # the user is at the keyboard: a choice box may be shown
+        (HOME / IDLE_NUDGES).unlink(missing_ok=True)  # they answered, or are here: the waits start over
         daily = first_sight_today()
         if daily:
             context.insert(0, daily)
@@ -5786,6 +5860,7 @@ def main():
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
     s = sub.add_parser("show"); s.add_argument("number"); s.set_defaults(fn=cmd_show)
     sub.add_parser("stale").set_defaults(fn=cmd_stale)
+    s = sub.add_parser("dnd"); s.add_argument("state", nargs="?", choices=["on", "off"]); s.set_defaults(fn=cmd_dnd)
     s = sub.add_parser("notice"); s.set_defaults(fn=cmd_notice)
     notice = s.add_subparsers(dest="action", required=True)
     s = notice.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--from", dest="source")

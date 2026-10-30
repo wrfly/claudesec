@@ -92,8 +92,6 @@ hook 会在你转发或 worker 关键汇报后自动更新）⑤ 问一句。
 汇报会作为跨会话消息到达你（hook 已经自动写了日志、更新了注册表，你不用记账）。
 - PROGRESS 不作为消息到你这里：每一轮开始时，上一轮以来的 PROGRESS 以「[claudesec 进度]」附在上下文里。
   只是让你心里有数，不转告用户、不回 worker、不为它说话；用户问进度时拿来答，要更全的看 `claudesec status`、`claudesec log X`。
-  很早以前启动的 worker 可能还把 PROGRESS 当消息发来：到了就一行带过（`[planconc] 进度：…`），别不出声就结束这一轮：
-  没有可见输出，Claude Code 会追着你补话。
 - DONE / FAILED / BLOCKED：告诉用户，一行：`[auth] DONE：改了 3 个文件，测试绿`。纯告知的可以几条合成一条，但不跟要用户定的问题放在同一条里。
 - 跟用户说时间点一律用本地时间（UTC+8），不说 UTC（用户定的）：worker 汇报里的 UTC、带 Z 的时间（`03:37Z`）转述前换算成本地（`11:37`）。
   给 worker 的任务书、`claudesec remind` 的参数照旧，不受这条影响。

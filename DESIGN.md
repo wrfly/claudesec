@@ -718,6 +718,24 @@ status 列出未到点的提醒。
 当天第一条消息附上并不再告警、DONE / close 触发、待办记加入日期和时刻、归档后加入的不算关闭（按天、按秒）。手跑：拿 10-23 的 queue.md 备份和真实注册表、历史，
 挑出 3 条标了已关闭 worker 的；造的条目里 !354 !355 认出已在 alert-atlas 合入，用时约 0.2 秒。
 
+### 秘书的选择框（AskUserQuestion）
+
+用户 2026-10-30 定的（#312）：秘书可以用 Claude Code 的选择框问决策，用户按数字就答了。调查（10-30，2.1.314，101x41 窗格）：
+框开着时秘书收不到 worker 的 SendMessage 和告警（排在 queued_command 里，答完一起到，不丢）；框里打的字被吞，数字直接选中；
+Esc 结束整轮、不触发 PostToolUse。所以：
+- 只在用户开的那一轮用：UserPromptSubmit（`secretary-prompt`）见到用户自己的话就写 `user-turn`，Stop（`secretary-stop`）删掉。
+  PreToolUse（`secretary-ask`）没有它就拒，理由叫秘书 `queue add` 等下次。worker 消息和提醒带 NOT_USER 前缀，不写；
+  asyncRewake 叫醒的那轮不经过用户的 UserPromptSubmit，前一轮的 Stop 已经删了。Esc 打断的那轮没有 Stop，标记留到下一轮结束，
+  这个空子没堵：那时用户刚按过键，在场。
+- 第一次用（没有 `ask-told`）拒一次，叫秘书先用文字说清框怎么用，再调；写下 `ask-told`，之后不拦。
+- 同步 queue.md：header（或问题）里的 `#N`。PreToolUse 把待问 / 搁置 / 记录里的移到待答；PostToolUse（`secretary-answered`）
+  见每个子问题的回答都是选项标签（multiSelect 逗号分开的也算）、没备注，就移到已处理，`--note "用户答：…"`；打了字、加了备注、
+  没答完的留在待答。两种都用 additionalContext 告诉秘书，转「用户决策：」给 worker 仍是秘书的事。
+- 没做：右侧面板标「等你选」（Notification hook 的 permission_prompt 能用）；远程控制 / 网页上框显不显示没验证。
+
+已验证（单测 tests/test_ask.py）：用户开的那轮放行并移到待答、汇报叫醒的那轮和 Stop 之后拒、第一次拒一次、全选项移到已处理、
+打字和备注留在待答、multiSelect。
+
 ### agent 适配层（`agents/*.py`）
 
 用户 2026-10-30 定的（#304/#305）：调本地 agent 要有统一的接入标准，接一个新的要简单；本机专有的（ttadk）也放进仓库，

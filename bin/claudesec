@@ -1553,12 +1553,17 @@ def cmd_run(args):
         "hooks": {
             "SessionStart": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-session-start"}]},
                              {"hooks": [watch]}],
-            "Stop": [{"hooks": [watch]}],
+            "Stop": [{"hooks": [watch]},
+                     {"hooks": [{"type": "command", "command": f"{cmd} hook secretary-stop"}]}],
             # A turn that dies on an API error (billing, overload) has no Stop: without this,
             # no watcher until the user's next message, and the alerts that woke it are lost.
             "StopFailure": [{"hooks": [{**watch, "command": f"{cmd} hook secretary-watch-failed"}]}],
+            "PreToolUse": [{"matcher": "AskUserQuestion",
+                            "hooks": [{"type": "command", "command": f"{cmd} hook secretary-ask"}]}],
             "PostToolUse": [{"matcher": "SendMessage",
-                             "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]}],
+                             "hooks": [{"type": "command", "command": f"{cmd} hook secretary-send"}]},
+                            {"matcher": "AskUserQuestion",
+                             "hooks": [{"type": "command", "command": f"{cmd} hook secretary-answered"}]}],
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-prompt"}]}],
         },
     }, indent=2) + "\n")
@@ -5132,6 +5137,7 @@ def hook_secretary_prompt():
                                           "know how they're doing: don't pass it on to the user, don't answer the workers, "
                                           "don't say anything about it; it's for when the user asks."), *progress]))
     if not str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
+        (HOME / USER_TURN).write_text(now())  # the user is at the keyboard: a choice box may be shown
         daily = first_sight_today()
         if daily:
             context.insert(0, daily)
@@ -5206,6 +5212,116 @@ def mark_answered(name, text):
             return
         line = text.lstrip().splitlines()[0]
         w.update(status="PROGRESS", pending_ask=None, last_summary=tr(f"已答，在处理：{line}", f"answered, working on it: {line}")[:200])
+
+
+# ---------- choice boxes: AskUserQuestion in the secretary's window ----------
+# The user's call (#312, 2026-10-30): the secretary may ask a queue item in a choice box, but only
+# in a turn the user started (they just spoke and are at the keyboard; while a box is open the
+# secretary hears no report or alert), one box per item, its header "#N" or "#N-1". These hooks
+# keep queue.md in step: an item asked goes to 待答, one answered with its options to 已处理.
+
+USER_TURN = "user-turn"     # there while the turn under way was started by the user
+ASK_TOLD = "ask-told"       # the user has been told how a box behaves
+ASK_NUMBER = re.compile(r"#(\d+)")
+
+
+def asked_numbers(questions):
+    """{item number: [its questions]}, by "#N" in each header, else in its question."""
+    found = {}
+    for q in questions:
+        m = ASK_NUMBER.search(str(q.get("header", ""))) or ASK_NUMBER.search(str(q.get("question", "")))
+        if m:
+            found.setdefault(m[1], []).append(q)
+    return found
+
+
+def queue_item_section(num):
+    """The section queue.md has item #num in, or None."""
+    path = HOME / "queue.md"
+    key = None
+    for line in (path.read_text().splitlines() if path.exists() else []):
+        if line.startswith("## "):
+            key = queue_section(line)
+        elif (m := QUEUE_ITEM.match(line)) and m[1] == num:
+            return key
+    return None
+
+
+def queue_move_quietly(num, to, note=None):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.suppress(SystemExit):
+        cmd_queue(argparse.Namespace(action="move", number=num, to=to, note=note))
+
+
+def hook_secretary_stop():
+    (HOME / USER_TURN).unlink(missing_ok=True)
+
+
+def hook_secretary_ask():
+    """PreToolUse on AskUserQuestion: refused in a turn the user didn't start, and the first time
+    until the user has been told how a box behaves; else its items go to 待答."""
+    data = hook_input()
+    why = None
+    if not (HOME / USER_TURN).exists():
+        why = tr("这一轮不是用户刚说话开的（汇报、告警、提醒叫醒的），用户可能不在键盘前，框开着时你也收不到汇报和告警。"
+                 "不开选择框：要定的事 `claudesec queue add`，等用户下次说话再问。",
+                 "This turn wasn't started by the user (a report, alert or reminder woke you): they may not be at "
+                 "the keyboard, and while a box is open you hear no reports or alerts. No choice box: `claudesec "
+                 "queue add` the question and ask when the user next speaks.")
+    elif not (HOME / ASK_TOLD).exists():
+        (HOME / ASK_TOLD).write_text(now())
+        why = tr("第一次用选择框：先用文字告诉用户一声——框开着时打的字会被吞，数字直接选中对应选项；按 Esc 回到普通对话，"
+                 "这件留在待答，之后用文字答也行。说完再调用一次 AskUserQuestion。",
+                 "First choice box: tell the user in text first — while a box is open, typed text is lost and a "
+                 "digit picks that option at once; Esc goes back to the normal chat and the item stays waiting, to "
+                 "be answered in text later. Then call AskUserQuestion again.")
+    if why:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": why}}, ensure_ascii=False))
+        return
+    for num in asked_numbers((data.get("tool_input") or {}).get("questions") or []):
+        if queue_item_section(num) in ("todo", "backlog", "ideas"):
+            queue_move_quietly(num, "doing")
+
+
+def chose_options(q, answer):
+    """The answer is the question's options (one, or several for multiSelect), not typed text."""
+    labels = {str(o.get("label", "")) for o in q.get("options") or []}
+    return bool(answer) and (answer in labels or all(a.strip() in labels for a in answer.split(",")))
+
+
+def hook_secretary_answered():
+    """PostToolUse on AskUserQuestion: an item whose every question got one of its options goes
+    to 已处理 with the answers. Typed text, a note or no answer leaves it in 待答, for the secretary
+    to take as an answer in words. Either way it is told which."""
+    data = hook_input()
+    inp, resp = data.get("tool_input") or {}, data.get("tool_response")
+    resp = resp if isinstance(resp, dict) else {}
+    answers = inp.get("answers") or resp.get("answers") or {}
+    notes = {k: (v or {}).get("notes") for k, v in (inp.get("annotations") or resp.get("annotations") or {}).items()}
+    done, left = [], []
+    for num, qs in asked_numbers(inp.get("questions") or resp.get("questions") or []).items():
+        said = [(q, str(answers.get(q.get("question"), "")).strip()) for q in qs]
+        text = "；".join(f"{q.get('question')} → {a}" + (f"（{notes[q.get('question')]}）" if notes.get(q.get("question")) else "")
+                        for q, a in said if a)
+        if queue_item_section(num) in (None, "done"):
+            continue
+        if all(chose_options(q, a) and not notes.get(q.get("question")) for q, a in said):
+            queue_move_quietly(num, "done", note=tr(f"选择框，用户答：{text}", f"choice box, the user answered: {text}"))
+            done.append(f"#{num}（{text}）")
+        else:
+            left.append(f"#{num}" + (f"（{text}）" if text else ""))
+    lines = []
+    if done:
+        lines.append(tr(f"[claudesec] 按选择框的回答移到了已处理：{'，'.join(done)}。标了 worker 的照常以「用户决策：」转过去。",
+                        f"[claudesec] Moved to Done by the box's answers: {', '.join(done)}. Pass each on to its "
+                        f"worker as usual (\"User decision: …\")."))
+    if left:
+        lines.append(tr(f"[claudesec] 还在待答：{'，'.join(left)}：用户打了字、加了备注或没答完，按文字回答的规矩办。",
+                        f"[claudesec] Still waiting: {', '.join(left)}: typed text, a note or not all answered; "
+                        f"handle it as an answer in words."))
+    if lines:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n".join(lines)}},
+                         ensure_ascii=False))
 
 
 # ---------- watchdog: a worker stuck on a dialog ----------
@@ -5607,6 +5723,9 @@ HOOKS = {
     "secretary-session-start": hook_secretary_session_start,
     "secretary-send": hook_secretary_send,
     "secretary-prompt": hook_secretary_prompt,
+    "secretary-stop": hook_secretary_stop,
+    "secretary-ask": hook_secretary_ask,
+    "secretary-answered": hook_secretary_answered,
     "worker-budget": hook_worker_budget,
     "agent-start": hook_agent_start,
     "agent-prompt": hook_agent_prompt,

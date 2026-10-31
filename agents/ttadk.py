@@ -43,7 +43,6 @@ class TtadkClaude(ClaudeCode):
     label = "Claude Code (ttadk)"
     commands = ("ttadk", "claude")
     model_key = "ttadk_worker_model"
-    remote_control = False  # needs a claude.ai login, which a ttadk session doesn't use
     start_wait = 20
 
     def available(self):

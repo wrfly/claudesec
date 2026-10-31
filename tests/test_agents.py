@@ -120,11 +120,10 @@ class Agents(unittest.TestCase):
         self.assertEqual(ttadk.runtime("gpt-6.1-sol", "claude").runtime_name, "claude")  # the one it started on
         self.assertTrue(ttadk.runtime("gpt-6.1-sol").external)
         self.assertFalse(ttadk.runtime("deepseek-v4-pro-0813").external)
-        cfg = {**self.cs.config(), "remote_control": True}
+        cfg = self.cs.config()
         d = self.root / "d"
         cmd = ttadk.runtime("deepseek-v4-pro-0813").command("w", "deepseek-v4-pro-0813", d, cfg)
         self.assertTrue(cmd.startswith("ttadk claude -m deepseek-v4-pro-0813 --skip-check -- -n w "), cmd)
-        self.assertNotIn("--rc", cmd)  # remote control needs a claude.ai login
         self.assertTrue(self.cs.AGENTS["claude"].command("w", "claude-opus-5-5", d, cfg)
                         .startswith("claude --model claude-opus-5-5 "))
 

@@ -121,7 +121,6 @@ def claude_session_id(pid, args, env):
         candidates.append(Path(config_dir) / "sessions" / f"{pid}.json")
     home = Path.home()
     candidates.append(home / ".claude" / "sessions" / f"{pid}.json")
-    candidates.append(home / ".agentlodge" / "claude" / "sessions" / f"{pid}.json")
     for path in candidates:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

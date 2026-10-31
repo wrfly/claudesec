@@ -180,12 +180,10 @@ tmux pane id，`SendMessage` 可互发。
 5. `--agent` 的正文会**替换**默认系统提示 → 不用 agent 文件，改用 `--append-system-prompt-file`。
 6. worker 等后台 subagent 时会结束本轮；Stop hook 若照常逼汇报，worker 只能发假 BLOCKED
    → Stop hook 输入里 `background_tasks` 非空时放行。
-7. （2026-10-30，claude 2.1.312）`remote_control` 开着时会话带 `--rc` 启动，AgentLodge 的启动脚本把它换成
-   `--dangerously-load-development-channels server:agentlodge`，Claude Code 每次启动都弹「WARNING: Loading development
-   channels」，默认选中「I am using this for local development」，回车进会话；另一项「Exit」和 Esc 都会退出 claude
-   → claudesec 只在框在屏幕底部时按回车（spawn / wake / adopt 的启动检查、看门狗、秘书自己的 `claudesec run`），不按 Esc。
-   网页发来的话以 `<channel source="agentlodge"` 开头进会话（排队的 prompt，isMeta）。没实测 UserPromptSubmit 对它触不触发：
-   触发就当用户的话（不在 NOT_USER 里），进度照常附上、算今天见过用户；不触发，进度留到下一轮，什么也不丢。
+7. 只有某台机器要的东西（别的 `claude` 启动脚本的参数、它带来的对话框、对应的提示词）不进 repo
+   → 插件 `$CLAUDESEC_HOME/plugins/<名字>/plugin.py`：给秘书 / Claude worker 加启动参数（`claude_args`）、
+   在系统提示末尾加话（`prompt`）、回答自己的对话框（`answer_dialog`，spawn / wake / adopt 的启动检查、看门狗、
+   秘书自己启动后一分钟都会问）。没有插件目录时什么都不做；加载失败的插件跳过并打到 stderr。
 
 ### 3.2 组件（已实现）
 
@@ -224,7 +222,7 @@ hook 全部通过 `--settings` 挂在单个会话上，**不碰用户的全局 s
 | 秘书 | SessionStart、Stop，`asyncRewake` | 单实例 watcher（flock）在后台等告警；有告警就以 exit 2 退出 → **叫醒秘书**并送达内容；每轮结束重新挂上；秘书进程退出时 watcher 自行退出 |
 
 **memory 不弹框**：Claude Code 本来就不为会话自己的 auto memory 目录弹确认框，例外是这个路径经符号链接落到受保护的地方。
-这台机器上 `~/.agentlodge/claude/projects` 链到 `~/.claude/projects`：豁免按请求的路径算，保护按解析后的路径算（`~/.claude` 下），
+比如 `$CLAUDE_CONFIG_DIR/projects` 链到 `~/.claude/projects` 时：豁免按请求的路径算，保护按解析后的路径算（`~/.claude` 下），
 于是每次写 memory 都被当成敏感文件。allow 规则救不了：受保护路径不认 allow 规则。所以 settings 里写
 `autoMemoryDirectory` = 解析后的真实目录，同一批文件，路上不经过链接。只在确实有链接时写；算不准的情况不写，照 Claude Code
 默认走：裸仓库、submodule，以及目录名超过 200 字符（Claude Code 会加哈希缩短）。目录按 git 主 checkout 定，worktree 和子目录
@@ -495,7 +493,7 @@ claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job 
 什么算「不归 claudesec 管」：**不看会话名**，看身份和位置。session id 是秘书的（secretary.session）或某个 worker 的，
 不算；pane 在 claudesec 自己的 tmux session 里，或者窗口是某个 worker 的（正在 spawn、wake 的 worker 在注册表里
 已经有窗口、还没有 session id），也不算。名字靠不住：Claude Code 恢复会话时会先给它起个自动名（如
-`agentlodge-da`），过一会儿 `/rename` 才改回 worker 名；外人的会话也可能恰好和某个 worker 同名。
+`myproject-da`），过一会儿 `/rename` 才改回 worker 名；外人的会话也可能恰好和某个 worker 同名。
 回归测试：`python3 -m unittest discover -s tests`。
 
 接管（adopt）：只接管 idle 的会话；`--wait` 等它连续空闲 30 秒。停在提示符、但自己开的后台任务还在跑的会话
@@ -849,7 +847,7 @@ delegate 默认用它。同一天拆成两个 agent：`codex` 直接跑 codex CL
 ttadk 的模型不是 gpt-* / o<N>-* / codex-* 的，跑 Claude Code：
 worker 用 `ttadk claude -m <模型> --skip-check -- <原来的 claude 参数>` 启动。`spawn --agent claude` 加不像 Claude 的模型名
 （`ttadk_model()`：claude / opus / sonnet / haiku / fable / default / best / opusplan 开头之外）拒绝，提示改用 `--agent ttadk`。ttadk 把它的端点 env 合进我们的
-`--settings`，hook、规则、汇报都跟普通 worker 一样；不带 `--rc`（remote control 要 claude.ai 登录）。
+`--settings`，hook、规则、汇报都跟普通 worker 一样（插件看 `who["agent"]` 是 `"ttadk"` 还是 `"claude"`）。
 deepseek-v4-pro-0813 实测：auto 权限模式下 Bash、写文件都能跑，SessionStart hook 记下了 session。
 
 已验证（真机，codex 0.147.0、ttadk 1.0.36，临时 CLAUDESEC_HOME 和 CODEX_HOME，`codex_args` 换成 workspace-write 沙箱）：

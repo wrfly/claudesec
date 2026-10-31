@@ -65,7 +65,7 @@ class ExternalSessions(unittest.TestCase):
     def test_worker_being_woken_under_an_automatic_name(self):
         # wake-all: the registry has the window, no session yet; Claude Code named it on its own.
         self.registry(storage={"status": "STARTING", "session": None, "window": "@21"})
-        self.session("agentlodge-da", "new-sid", "claudesec:@21.%2")
+        self.session("myproject-da", "new-sid", "claudesec:@21.%2")
         self.assertEqual(self.external(), [])
 
     def test_worker_window_outside_claudesec_session(self):

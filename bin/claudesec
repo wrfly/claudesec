@@ -136,9 +136,6 @@ DEFAULT_CONFIG = {
     "cursor_nice": 10,                # their CPU priority (`nice -n`): they yield to the rest of the machine
     "dashboard": True,                # queue and progress panes beside the secretary (`claudesec dashboard off`)
     "language": None,                 # what the panes, status and queue say: "zh", "en"; None = see lang()
-    # AgentLodge's `claude --rc`: the session also on its web page. false; "secretary"; "all" (and the
-    # Claude workers; not Cursor's). Its `claude` launcher turns --rc into a development channel.
-    "remote_control": False,
 }
 TERMINAL = {"DONE", "FAILED", "BLOCKED", "NEED_DECISION"}
 CURSOR_REPORT = "（不是告警）{} worker 的汇报，经告警通道送达，按普通汇报处理"
@@ -1248,7 +1245,7 @@ def without_asked_date(text):
 def secretary_prompt():
     """secretary.md with the Cursor parts kept or dropped for this machine, as a file for claude."""
     path = HOME / "secretary-prompt.md"
-    path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()))
+    path.write_text(render_prompt((PROMPTS / "secretary.md").read_text()) + plugin_prompt(config(), SECRETARY_WHO))
     return path
 
 
@@ -1576,9 +1573,7 @@ def cmd_run(args):
             "--allowedTools", "Bash(claudesec *)"]
     if cfg["secretary_model"]:
         argv += ["--model", cfg["secretary_model"]]
-    rc = remote_control(cfg, secretary=True)
-    if rc:
-        argv.append("--rc")
+    argv += plugin_args(cfg, SECRETARY_WHO)
     session = HOME / "secretary.session"
     if session.exists() and not args.new:
         argv += ["--resume", session.read_text().strip()]
@@ -1599,8 +1594,8 @@ def cmd_run(args):
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGHUP, signal.SIG_DFL)
     child = subprocess.Popen(argv, preexec_fn=default_signals)
-    if rc and os.environ.get("TMUX_PANE"):
-        threading.Thread(target=accept_channels, args=(os.environ["TMUX_PANE"],), daemon=True).start()
+    if os.environ.get("TMUX_PANE") and any(callable(p.get("answer_dialog")) for p in PLUGINS):
+        threading.Thread(target=answer_own_dialogs, args=(os.environ["TMUX_PANE"],), daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: child.terminate())
     child.wait()
     restarting = HOME / "restarting"
@@ -1803,7 +1798,8 @@ def cmd_spawn(args):
                                                      "A task from the secretary (the user's own words):\n\n")
         initial += f"{task}\n"
     memory = getattr(args, "memory", None)
-    d = prepare_worker(name, cfg, initial, project, agent=agent, memory=memory)
+    d = prepare_worker(name, cfg, initial, project, agent=agent, memory=memory,
+                       mode="discuss" if args.discuss else "task")
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     cmd = agent.spawn_command(name, model, d, cfg)
@@ -1832,10 +1828,11 @@ def cmd_spawn(args):
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=None):
+def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=None, mode="task"):
     """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir.
     agent: the adapter it runs on, Claude Code if None; an external one's hooks are global (Agent.install).
-    memory: another auto memory dir than cwd's (the review worker tidies the secretary's)."""
+    memory: another auto memory dir than cwd's (the review worker tidies the secretary's).
+    mode: "task" or "discuss", kept in the dir for what starts its agent (worker_who)."""
     agent = agent or AGENTS["claude"]
     # A reused name starts a fresh log; the old one stays next to it.
     if fresh_log and log_path(name).exists():
@@ -1846,6 +1843,9 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=N
     prompt = render_prompt((PROMPTS / ("worker-external.md" if agent.external else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
               .replace("{{CLAUDESEC}}", hook_cmd()).replace("{{AGENT}}", agent.describe))
+    (d / "mode").write_text(mode)
+    if not agent.external:
+        prompt += plugin_prompt(cfg, worker_who(name, agent.name, d))
     (d / "prompt.md").write_text(prompt)
     (d / "initial.md").write_text(initial)
     (d / "waiting-permission").unlink(missing_ok=True)
@@ -1896,12 +1896,6 @@ def fresh_prompt():
         if "--system-prompt-snapshot" in out:
             return ["--system-prompt-snapshot", "off"]
     return []
-
-
-def remote_control(cfg, secretary=False):
-    """Whether this Claude Code session starts with `--rc` (config remote_control)."""
-    want = cfg.get("remote_control")
-    return want in (True, "all") or (secretary and want == "secretary")
 
 
 def ttadk_model(model):
@@ -2132,14 +2126,12 @@ class ClaudeCode(Agent):
     def launcher(self, model):
         return ["claude", "--model", model]
 
-    remote_control = True  # its own claude.ai login; one through ttadk has none
-
     def command(self, name, model, d, cfg, resume=None, prompt=True):
         return " ".join(shlex.quote(a) for a in [
             *self.launcher(model), "-n", name, "--permission-mode", cfg["worker_permission_mode"],
             "--settings", str(d / "settings.json"),
             "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(),
-            *(["--rc"] if remote_control(cfg) and self.remote_control else []),
+            *plugin_args(cfg, worker_who(name, self.name, d)),
             *(["--resume", resume] if resume else []),
         ]) + (self.first_message(d) if prompt else "")
 
@@ -2147,7 +2139,7 @@ class ClaudeCode(Agent):
         return self.command(name, model, d, cfg)
 
     def answer_dialog(self, name, target, screen):
-        return answer_channels_dialog(target, screen) or (name and answer_credit_dialog(name, target, screen))
+        return answer_plugin_dialog(target, screen) or (name and answer_credit_dialog(name, target, screen))
 
     def dialog_hint(self, screen):  # only up when the model was asked for by name: answer_dialog takes the rest
         return ("Its model runs on usage credits, paid apart from the plan: \"Continue with\" pays for it, "
@@ -2251,6 +2243,78 @@ def load_agents():
     and register with @register_agent. Files starting with _ are skipped."""
     for path in sorted((REPO / "agents").glob("[!_]*.py")):
         exec(compile(path.read_text(), str(path), "exec"), globals())
+
+
+# ---------- plugins: this machine's own additions, kept out of the repo ----------
+# Each $CLAUDESEC_HOME/plugins/<name>/plugin.py, in name order, runs in a namespace of its own,
+# with `cs` for claudesec's names (looked up when used). It may define any of these; each is
+# called for every plugin that has it. No plugins directory: nothing is different.
+#   claude_args(cfg, who)          a list of arguments more for a Claude Code session claudesec starts
+#   prompt(cfg, who)               text added to the end of that session's system prompt
+#   answer_dialog(target, screen)  a dialog of its own on a Claude Code screen (the pane's text, or
+#                                  None: read it yourself): answer it and return True, else False.
+#                                  Asked wherever claudesec watches a worker's screen, and for a
+#                                  minute after the secretary starts
+#   reported(cfg, who, typ)        a worker's report was recorded; typ PROGRESS, DONE, … Runs in
+#                                  the worker's own hook: anything slow goes in a detached process
+# cfg is config(), the plugin's own keys included; who says which session: {"role": "secretary"}
+# or {"role": "worker", "name": …, "agent": "claude" / "ttadk" / …, "discuss": bool}.
+PLUGINS = []
+SECRETARY_WHO = {"role": "secretary"}
+
+
+class PluginView:
+    """claudesec as a plugin sees it: `cs.tmux(...)`, `cs.pane_text(...)`, … at call time."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def load_plugins():
+    for path in sorted((HOME / "plugins").glob("[!_]*/plugin.py")):
+        ns = {"__name__": f"claudesec_plugin_{path.parent.name}", "__file__": str(path), "cs": PluginView()}
+        try:
+            exec(compile(path.read_text(), str(path), "exec"), ns)
+        except Exception as e:  # one broken plugin doesn't take claudesec down with it
+            print(f"claudesec: plugin {path.parent.name} not loaded: {e}", file=sys.stderr)
+            continue
+        PLUGINS.append(ns)
+
+
+def plugin_calls(hook, *args):
+    out = []
+    for ns in PLUGINS:
+        if callable(ns.get(hook)):
+            try:
+                out.append(ns[hook](*args))
+            except Exception as e:
+                print(f"claudesec: plugin {ns['__name__']}.{hook}: {e}", file=sys.stderr)
+    return out
+
+
+def worker_who(name, agent, d):
+    mode = (d / "mode").read_text().strip() if (d / "mode").exists() else "task"
+    return {"role": "worker", "name": name, "agent": agent, "discuss": mode == "discuss"}
+
+
+def registry_who(name, w):
+    return {"role": "worker", "name": name, "agent": w.get("agent") or "claude", "discuss": w.get("mode") == "discuss"}
+
+
+def plugin_args(cfg, who):
+    return [str(a) for got in plugin_calls("claude_args", cfg, dict(who)) for a in (got or [])]
+
+
+def plugin_prompt(cfg, who):
+    return "".join("\n" + got.strip() + "\n" for got in plugin_calls("prompt", cfg, dict(who)) if got and got.strip())
+
+
+def answer_plugin_dialog(target, screen=None):
+    """True when a plugin answered a dialog of its own on target's screen."""
+    return any(plugin_calls("answer_dialog", target, screen))
 
 
 def render_prompt(text):
@@ -2463,7 +2527,7 @@ def external_sessions():
     with contextlib.suppress(OSError):
         ids.add((HOME / "secretary.session").read_text().strip())
     ids -= {None, ""}
-    # Not by name: Claude Code names a resumed session on its own (agentlodge-da) before
+    # Not by name: Claude Code names a resumed session on its own (myproject-da) before
     # /rename puts the worker's name back, and a stranger may share a worker's name. A worker
     # being woken is in the registry with its window but no session id yet.
     windows = {w.get("window") for w in workers.values()} - {None}
@@ -3215,7 +3279,8 @@ def cmd_wake(args):
             reg["workers"][name]["dir"] = cwd
             reg["workers"][name].pop("moved_from", None)
         append_log(name, "task", "; ".join(filter(None, [moved, followed])) or f"now in {cwd}")
-    d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"))
+    d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"),
+                       mode=w.get("mode") or "task")
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
     cmd = agent.command(name, model, d, cfg, resume=sid, prompt=not quiet) + f"; echo $? > {shlex.quote(str(d / 'exit'))}"
@@ -3309,7 +3374,7 @@ def confirm_resume(name, pane, d, sid):
             return f"resumed as a different session {got}", screen
         if (d / "exit").exists() or tmux("display", "-p", "-t", pane, "#{pane_dead}", check=False).strip() != "0":
             return "claude exited", screen
-        if answer_channels_dialog(pane, screen) or answer_credit_dialog(name, pane, screen):
+        if answer_plugin_dialog(pane, screen) or answer_credit_dialog(name, pane, screen):
             continue
         # A dialog blocks before SessionStart; only one that stays up counts.
         dialog = dialog + 1 if re.search(r"trust this folder|Do you trust|Enter to confirm", screen) else 0
@@ -4431,7 +4496,7 @@ def secretary_memory_dir():
 def memory_settings(cwd):
     """Settings so a session started in cwd reads and writes its own auto memory without asking.
     Claude Code asks nothing for that dir, unless its path resolves through a symlink into a
-    protected place: with ~/.agentlodge/claude/projects a link to ~/.claude/projects, the
+    protected place: with $CLAUDE_CONFIG_DIR/projects a link to ~/.claude/projects, the
     exemption goes by the path asked for and the protection by where it lands, and allow rules
     don't count for protected paths. So name the resolved dir as the memory dir: the same files,
     no link on the way. Untouched (no setting) where no link is involved or the dir can't be
@@ -4555,6 +4620,8 @@ def record_report(name, text):
     if discussion_over:
         # Bring the user back to the secretary, who summarizes and offers to dispatch the to-dos.
         tmux("select-window", "-t", f"={config()['tmux_session']}:secretary", check=False)
+    if w is not None:
+        plugin_calls("reported", config(), registry_who(name, w), typ)
 
 
 def cmd_report(args):
@@ -5487,41 +5554,11 @@ def answer_credit_dialog(name, target, screen=None):
               f"(unless --model names {old}).")
 
 
-CHANNELS = re.compile(r"Loading development channels")
-LOCAL_DEV = "I am using this for local development"
-
-
-def answer_channels_dialog(target, screen=None):
-    """With `--rc` (config remote_control), AgentLodge's launcher loads its page as a development
-    channel, and Claude Code warns at every start and waits. Pick "I am using this for local
-    development", the default; the other option, and Esc, quit claude. True when answered."""
-    for _ in range(4):
-        screen = screen if screen is not None else pane_text(target, suggestion="drop")
-        if not screen_dialog(screen):  # a quoted warning in a conversation is not the dialog
-            return False
-        lines = [l for l in screen.splitlines() if l.strip()][-20:]
-        if not any(CHANNELS.search(l) for l in lines):
-            return False
-        at = max((i for i, l in enumerate(lines) if l.lstrip().startswith("❯")), default=None)
-        ok = max((i for i, l in enumerate(lines) if LOCAL_DEV in l), default=None)
-        if at is None or ok is None:
-            return False
-        if at == ok:
-            break
-        tmux("send-keys", "-t", target, "Down" if ok > at else "Up")
-        time.sleep(0.3)
-        screen = None
-    else:
-        return False
-    tmux("send-keys", "-t", target, "Enter")
-    return True
-
-
-def accept_channels(pane, secs=60):
-    """The secretary's own start: nobody else watches its window for the warning."""
+def answer_own_dialogs(pane, secs=60):
+    """The secretary's own start: nobody else watches its window for a plugin's dialog."""
     for _ in range(secs):
         time.sleep(1)
-        if answer_channels_dialog(pane):
+        if answer_plugin_dialog(pane):
             return
 
 
@@ -5798,6 +5835,7 @@ def hook_secretary_watch(delay=0):
 
 
 load_agents()
+load_plugins()
 HOOKS = {
     "worker-session-start": hook_worker_session_start,
     "worker-permission": hook_worker_permission,

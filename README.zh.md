@@ -30,7 +30,7 @@
 | `worker_permission_mode` | `"auto"` | worker 的 `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High） | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
 | `codex_worker_model` | `null`（codex 自己的默认） | `spawn --agent codex` 的默认模型（OpenAI 的 codex CLI，用它自己的登录：ChatGPT、`OPENAI_API_KEY`，或 `~/.codex/config.toml` 里的 `model_provider`）。第一次开 Codex worker（直接跑或经 ttadk）时会往 `~/.codex/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Codex worker 里生效。之后 codex 会在那个 worker 窗口里问一次要不要信任它们：选「2. Trust all and continue」（这一条 claudesec 不替你答；信任目录那一问它会自动答） |
-| `ttadk_worker_model` | `"gpt-6.1-sol"` | `spawn --agent ttadk` 的默认模型：经字节的 ttadk 启动 agent CLI，走 ttadk 的端点（不用别的登录）。模型决定跑哪个：`gpt-*`、`o<N>-*`、`codex-*` 跑 Codex（`ttadk codex --mode ttadk-only`），其他（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……，`ttadk models` 列出全部）跑 Claude Code（`ttadk claude`，除了没有 remote control，跟普通 Claude Code worker 一样）。worker 一直用它开始时那个 |
+| `ttadk_worker_model` | `"gpt-6.1-sol"` | `spawn --agent ttadk` 的默认模型：经字节的 ttadk 启动 agent CLI，走 ttadk 的端点（不用别的登录）。模型决定跑哪个：`gpt-*`、`o<N>-*`、`codex-*` 跑 Codex（`ttadk codex --mode ttadk-only`），其他（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……，`ttadk models` 列出全部）跑 Claude Code（`ttadk claude`，跟普通 Claude Code worker 一样）。worker 一直用它开始时那个 |
 | `codex_args` | `["--dangerously-bypass-approvals-and-sandbox"]` | 除模型外 codex（直接跑或经 ttadk）带的参数：默认不沙箱、从不询问（窗口没人看着）。要沙箱又能汇报，可以写 `["-s", "workspace-write", "-a", "never", "--add-dir", "~/.claudesec"]` |
 | `delegate_agent` | `["ttadk", "codex", "cursor"]` | worker 的 `claudesec delegate` 没带 `--agent` 时开哪种：这台机器上可用的第一个（写一个名字也行） |
 | `stale_days` | `7` | 巡检把放了这么多天的待问、待答、待办挑出来提示秘书（每再过这么多天再提一次）；`0` 不按天数查 |
@@ -43,9 +43,8 @@
 | `cursor` | `"auto"` | Cursor worker（`spawn --agent cursor`、worker 的 `claudesec delegate`）能不能用。`"auto"`：机器上有 `agent` 命令就能用；`false` 关掉；`true` 要用（没装 `agent` 仍不可用）。不可用时这两个命令拒绝并说明原因，秘书和 worker 的规则里也不出现交给 Cursor 的内容。`claudesec status` 末尾显示当前状态。改完 `claudesec --restart`，worker 下次启动或唤醒时生效 |
 | `codex` / `ttadk` | `"auto"` | 直接跑的 Codex、经 ttadk 的 worker 能不能用，跟上面的 `cursor` 一样。`codex` 的 `"auto"`：装了 `codex` 且登录了；`ttadk` 的 `"auto"`：装了 `ttadk`（它的 Codex worker 还要 `codex`）。`agents/*.py` 里每个 agent 都有这样一个同名开关；加新 agent 见 `agents/README.md` |
 | `dashboard` | `true` | 秘书窗口右侧的四块面板，从上到下：待办事项（`claudesec notice` 登记的、要用户去做的事）、决策队列（待问、待答，搁置的折成最后一行）、任务进展（worker 的状态、距今、token 用量和今天的花费，搁置的；最后一行是秘书和全部今天的花费）、定时任务（`claudesec remind` 登记、还没到点的），3 秒刷新。`dashboard_side: "left"` 把这一列放到秘书左边。每条默认折叠成一行，点一条展开看全文，点标题栏全部展开 / 收起；各自用鼠标滚轮上下滚（焦点在面板上时也可以用 ↑↓ / PgUp PgDn / g G）。窗口宽 ≥110 列显示，更窄不显示；终端尺寸变了自动重排。`claudesec dashboard on|off` 切换 |
-| `remote_control` | `false` | 用 AgentLodge 的 `claude --rc` 起会话，在它的网页上看对话、发消息、审批。`"secretary"`：只有秘书；`"all"`：秘书和 Claude worker（Cursor、Codex worker 和跑 ttadk 模型的 Claude worker 不带）。要 `PATH` 里的 `claude` 是 AgentLodge 的启动脚本。每次启动 Claude Code 会弹「WARNING: Loading development channels」，claudesec 自动选「I am using this for local development」。只在启动时生效：秘书 `claudesec --restart`（对话保留）；在跑的 worker 要 shelve 再 wake，新开的直接带上。网页上的历史由频道服务（`remote-control channel`，单独的进程）读 transcript 发过去：秘书的 transcript 可能上百 MB（2026-10-30 是 112MB），网页会一直「载入中」甚至卡死；claude 自己的 resume 不经过它。transcript 很大时先别给秘书开 |
 | `language` | 不设 | `"zh"` 或 `"en"`，见[语言](#语言) |
-| `claude_config_dir` | 自动 | Claude Code 的配置目录。如果 `CLAUDE_CONFIG_DIR` 只在 claude 的启动脚本里设，从 tmux 起的 claudesec 进程看不到它；hook 第一次运行时会自动记到这里。想一开始就对，手动写上（比如 `"/home/me/.agentlodge/claude"`）|
+| `claude_config_dir` | 自动 | Claude Code 的配置目录。如果 `CLAUDE_CONFIG_DIR` 只在 claude 的启动脚本里设，从 tmux 起的 claudesec 进程看不到它；hook 第一次运行时会自动记到这里。想一开始就对，手动写上（比如 `"/home/me/.claude-alt"`）|
 
 ### 语言
 
@@ -118,6 +117,9 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 
 repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`。
 `~/.claudesec/` 是这台机器的状态（注册表、历史、教训、决策队列），秘书的 Claude Code memory 是这台机器上的偏好，都不在 repo 里；
+只有这台机器要的东西（别的启动脚本的参数、它带来的对话框）做成插件 `~/.claudesec/plugins/<名字>/plugin.py`，也不在 repo 里：
+插件可以给 claudesec 起的 Claude Code 会话加参数、往系统提示末尾加话、在它们屏幕上回答自己的对话框，接口见 `bin/claudesec` 里
+`load_plugins` 上面的注释；没有插件目录就什么都不变。
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。
 
 ## 改 claudesec 本身

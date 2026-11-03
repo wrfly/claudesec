@@ -2127,6 +2127,7 @@ class ClaudeCode(Agent):
         return ["claude", "--model", model]
 
     def command(self, name, model, d, cfg, resume=None, prompt=True):
+        context_window(d / "settings.json", model)
         return " ".join(shlex.quote(a) for a in [
             *self.launcher(model), "-n", name, "--permission-mode", cfg["worker_permission_mode"],
             "--settings", str(d / "settings.json"),
@@ -5490,6 +5491,27 @@ def screen_dialog(screen):
     if not any(DIALOG_FOOTER.search(l) for l in lines[-4:]):
         return None
     return "\n".join(lines[-12:])
+
+
+# What Claude Code's model aliases stand for, where ANTHROPIC_DEFAULT_<ALIAS>_MODEL doesn't say.
+MODEL_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5",
+                 "fable": "claude-fable-5-1"}
+LONG_CONTEXT = 1_000_000
+
+
+def context_window(settings, model):
+    """A model ending in [1m] gets a 1M context in the worker's settings.json. Through a gateway
+    (ANTHROPIC_BASE_URL) Claude Code drops the [1m] and sizes the context by the settings'
+    modelSettings.<id>.autoCompactWindow, which the user's settings may set to 200k for their own
+    sessions (2026-11-03: `--model 'opus[1m]'` still showed 200k in /context). A model without it
+    leaves the user's settings in force."""
+    base, long = re.subn(r"\[1m\]$", "", model or "", flags=re.I)
+    if not long or not settings.exists():
+        return
+    ids = {base, os.environ.get(f"ANTHROPIC_DEFAULT_{base.upper()}_MODEL") or MODEL_ALIASES.get(base.lower(), base)}
+    conf = json.loads(settings.read_text())
+    conf["modelSettings"] = {**conf.get("modelSettings", {}), **{i: {"autoCompactWindow": LONG_CONTEXT} for i in sorted(ids)}}
+    settings.write_text(json.dumps(conf, indent=2) + "\n")
 
 
 def model_id(shown):

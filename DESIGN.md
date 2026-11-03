@@ -749,6 +749,18 @@ Esc 结束整轮、不触发 PostToolUse。所以：
 已验证（单测 tests/test_ask.py）：用户开的那轮放行并移到待答、汇报叫醒的那轮和 Stop 之后拒、第一次拒一次、全选项移到已处理、
 打字和备注留在待答、multiSelect。
 
+### 1M 上下文（模型名带 `[1m]`）
+
+模型名以 `[1m]` 结尾（`claude-opus-5-5[1m]`、`opus[1m]`）的 Claude Code worker，claudesec 在它的 settings.json 里写
+`modelSettings.<模型 id>.autoCompactWindow: 1000000`。经网关（ANTHROPIC_BASE_URL）跑时 Claude Code 丢掉 `[1m]`，上下文大小
+只看这项设置；用户自己的 settings 可能把它设成 200k（2026-11-03：`claudesec model denoise 'opus[1m]'` 后 /context 仍是 200k，
+原因是用户生效的 settings 里 `claude-opus-5-5` 钉了 `autoCompactWindow: 200000`）。`--settings` 按键合并，worker 的这项盖过用户的，
+用户自己的会话不变。别名按 `ANTHROPIC_DEFAULT_<别名>_MODEL`，没设就按内置表（opus → claude-opus-5-5 等）。不带 `[1m]` 的不写，
+沿用用户设置。spawn、wake、`claudesec model` 都走同一个命令，所以换模型、唤醒后也生效；秘书自己不走这里。
+
+已验证：单测 tests/test_context_window.py；隔离环境起 `claude-opus-5-5[1m]` worker，/context 显示 `33.9k/1m tokens`；
+网关上一次约 97 万 token 输入的请求正常返回（$7.76）。
+
 ### agent 适配层（`agents/*.py`）
 
 用户 2026-10-30 定的（#304/#305）：调本地 agent 要有统一的接入标准，接一个新的要简单；本机专有的（ttadk）也放进仓库，

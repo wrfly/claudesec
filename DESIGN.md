@@ -749,6 +749,18 @@ Esc 结束整轮、不触发 PostToolUse。所以：
 已验证（单测 tests/test_ask.py）：用户开的那轮放行并移到待答、汇报叫醒的那轮和 Stop 之后拒、第一次拒一次、全选项移到已处理、
 打字和备注留在待答、multiSelect。
 
+### 运行中的 worker 切讨论模式（`claudesec discuss NAME on|off`）
+
+讨论模式原来只能在 spawn 时用 `--discuss` 开。2026-11-04 review30 是普通 spawn 的 worker，任务却是在窗口里逐条问用户 30 个问题：
+每轮停下等用户答，Stop hook 要它汇报、不认 PROGRESS，它只好每轮发 BLOCKED「等用户答第 N 条」，每条都叫醒秘书。
+`claudesec discuss NAME on` 把注册表和 worker 目录里的 mode 改成 discuss：Stop hook（Claude Code 的和外部 agent 的）放行，
+状态栏显示「讨论中」，DONE 时把用户切回秘书，wake 后仍是讨论模式；on 同时把用户切到它的窗口。`off` 改回 task。
+worker 自己跑（worker 规则里写了：要在窗口里跟用户一问一答时先切），也可以秘书跑；秘书跑的话命令输出会提示用
+SendMessage / `claudesec send` 告诉它，因为 worker 没有每轮注入的 hook，它自己不知道 mode 变了。
+没用「PROGRESS 里写明在等用户就放行」：那要 Stop hook 去解析最近一条 PROGRESS 的文字，等用户这件事一轮轮持续，模式开关更直接。
+
+已验证：单测 tests/test_discuss_switch.py（切前拦、切后放行、off 后又拦；DONE 切回秘书；自己切不提示告诉自己）。
+
 ### 1M 上下文（模型名带 `[1m]`）
 
 模型名以 `[1m]` 结尾（`claude-opus-5-5[1m]`、`opus[1m]`）的 Claude Code worker，claudesec 在它的 settings.json 里写

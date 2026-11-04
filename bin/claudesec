@@ -24,6 +24,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     notice done N, notice list
   claudesec show N                       the whole of queue item or to-do #N
   claudesec dnd [on|off]                 the user said "don't disturb me": no idle nudges until off
+  claudesec discuss NAME [on|off]        a running worker into discussion mode (its turns may end waiting
+                                    for the user in its window, no report each turn) or back
   claudesec stale                        open queue items and to-dos that look out of date (closed worker,
                                     merged MRs, waited stale_days); the secretary is told of new ones
   claudesec dashboard on|off              panes beside the secretary, top to bottom: to-dos, decisions,
@@ -4315,6 +4317,36 @@ def cmd_dnd(args):
              f"Do not disturb: {'on (since ' + path.read_text().strip() + ')' if path.exists() else 'off'}"))
 
 
+
+def cmd_discuss(args):
+    """A running worker into discussion mode (on) or back to task mode (off): the mode spawn --discuss
+    starts in. Its turns may end waiting for the user in its window with no report (the Stop hooks
+    skip a discussion), and its DONE takes the user back to the secretary. For a worker that asks the
+    user things one by one in its window, which otherwise sent a BLOCKED each turn to get past the
+    hook, waking the secretary every time (review30, 2026-11-04). The worker runs it on itself, or
+    the secretary on a worker and then tells it. on switches the user to its window."""
+    w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
+    if args.state:
+        mode = "discuss" if args.state == "on" else "task"
+        with registry() as reg:
+            reg["workers"][args.name]["mode"] = mode
+        (worker_dir(args.name) / "mode").write_text(mode)  # for its plugins' claude_args, at its next wake
+        append_log(args.name, "mode", mode)
+        if mode == "discuss" and w.get("window") in alive_windows():
+            tmux("select-window", "-t", w["window"], check=False)
+    mode = read_registry()[1][args.name].get("mode") or "task"
+    print(tr(f"{args.name}：{'讨论模式' if mode == 'discuss' else '任务模式'}",
+             f"{args.name}: {'discussion' if mode == 'discuss' else 'task'} mode"))
+    if args.state and os.environ.get("CLAUDESEC_WORKER") != args.name:
+        how = (f"`claudesec send {args.name}`" if is_external(w) else f"SendMessage(to: {args.name!r})")
+        print(tr(f"它自己还不知道：用 {how} 告诉它" + ("「你已切到讨论模式：按规则里的「讨论模式」跟用户在窗口里直接对话，"
+                                                    "每轮不用汇报，结束时发 DONE」。" if mode == "discuss" else
+                                                    "「讨论模式已结束，回到任务模式：每轮结束前照常汇报」。"),
+                 f"It doesn't know yet: tell it with {how}: " + ("\"You are in discussion mode now: talk to the user "
+                 "in your window as under 'Discussion mode' in your rules; no report each turn; send DONE at the end.\""
+                 if mode == "discuss" else "\"Discussion mode is over, back to task mode: report before each turn ends.\"")))
+
+
 # ---------- sweep: queue items and to-dos that may be out of date ----------
 # The user, 2026-10-27: "look at the to-dos and the decision queue yourself and clear out what has
 # expired; don't make me chase it every time". claudesec points out what it can tell mechanically
@@ -5936,6 +5968,8 @@ def main():
     s = sub.add_parser("show"); s.add_argument("number"); s.set_defaults(fn=cmd_show)
     sub.add_parser("stale").set_defaults(fn=cmd_stale)
     s = sub.add_parser("dnd"); s.add_argument("state", nargs="?", choices=["on", "off"]); s.set_defaults(fn=cmd_dnd)
+    s = sub.add_parser("discuss"); s.add_argument("name"); s.add_argument("state", nargs="?", choices=["on", "off"])
+    s.set_defaults(fn=cmd_discuss)
     s = sub.add_parser("notice"); s.set_defaults(fn=cmd_notice)
     notice = s.add_subparsers(dest="action", required=True)
     s = notice.add_parser("add"); s.add_argument("words", nargs="+"); s.add_argument("--from", dest="source")

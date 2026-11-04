@@ -115,6 +115,7 @@ The catch: Shift+Enter now always sends that sequence, so a shell outside tmux m
     claudesec queue list --older 7   # open items that have waited a week or more
     claudesec queue doctor     # check queue.md (line-number prefixes, doubled sections, numbers twice); --fix repairs
     claudesec model W M        # switch worker W to model M (restarts it, conversation kept); the way for Cursor and Codex workers
+    claudesec discuss W on|off # worker W into discussion mode (talks with the user in its window, no report each turn) or back
 
 Every item in the queue pane has a number: reply to the secretary "12 A" or "15 no need" to answer that item.
 

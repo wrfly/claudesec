@@ -16,6 +16,12 @@ from test_external_sessions import load
 
 class ContextWindow(unittest.TestCase):
     def setUp(self):
+        # ANTHROPIC_DEFAULT_<ALIAS>_MODEL overrides the alias table: the machine running the tests
+        # may set them, so each test starts without and sets the ones it means to.
+        env = mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_DEFAULT_")},
+                              clear=True)
+        env.start()
+        self.addCleanup(env.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.cs = load(self.home)

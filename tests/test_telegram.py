@@ -2,8 +2,9 @@
 fake Bot API on 127.0.0.1 (never api.telegram.org): text, photos with a caption, files, long text in
 pieces or as message.txt, a 429 waited out (a long one not), a photo Telegram refuses sent as a file;
 no config, a config others can read, a missing file, a credential (the config, ~/.ssh, a private key,
-the token in a file), a mode-600 file outside allow_private: refused before anything is sent; the rest
-of ~/.claudesec, and allow_private's private files, sent. The token shows up in no output.
+the token in a file), a mode-600 file outside allow_private and workers' output: refused before anything
+is sent; the rest of ~/.claudesec, workers' mode-600 output, and allow_private's private files, sent.
+The token shows up in no output.
 
     python3 -m unittest discover -s tests
 """
@@ -271,6 +272,33 @@ class Telegram(unittest.TestCase):
         code, out, _ = self.run_cs("plugin", "telegram", "send", str(qr), str(shot))
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendPhoto", "sendPhoto"])
+
+    def test_workers_output_sent_though_600(self):
+        """Workers write with umask 077: in $CLAUDESEC_HOME/work and scratch mode 600 isn't a sign of a secret.
+        Elsewhere in $CLAUDESEC_HOME it still is, and credentials are refused there too."""
+        self.configure(allow_private=["~/.claudesec/secrets/vpn-qr"])
+        shot = self.put("work/prorate/screenshots/a.png", PNG, 0o600, top=self.home)
+        report = self.put("scratch/pr1/report.md", b"# done\n", 0o600, top=self.home)
+        code, _, err = self.run_cs("plugin", "telegram", "send", str(shot), str(report))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.methods(), ["sendPhoto", "sendDocument"])
+        self.server.calls.clear()
+        self.refused(self.put("secrets/admin.txt", b"hunter2", 0o600, top=self.home), "only its owner may read it")
+        self.refused(self.put("backups/vpn/ss.txt", b"ss://x", 0o600, top=self.home), "only its owner may read it")
+        self.refused(self.put("queue.md", b"x", 0o600, top=self.home), "only its owner may read it")
+        self.refused(self.put("work/w/admin.token", b"abc", 0o600, top=self.home), "a file named admin.token")
+        self.refused(self.put("work/w/relay.server.env", b"PASSWORD=x", 0o600, top=self.home), "a file named relay.server.env")
+        self.refused(self.put("work/w/wg.conf", b"[Interface]\nPrivateKey = " + b"A" * 43 + b"=\n", 0o600, top=self.home),
+                     "private key")
+        self.refused(self.put("work/w/k.txt", b"-----BEGIN PRIVATE KEY-----", 0o600, top=self.home), "private key")
+        secret = self.put("secrets/vpn.txt", b"hunter2", 0o600, top=self.home)
+        os.link(secret, self.home / "work" / "w" / "vpn.txt")  # a secret's other name in work/
+        self.refused(self.home / "work" / "w" / "vpn.txt", "2 hard links")
+        (self.home / "work" / "w" / "s.txt").symlink_to(secret)  # where the file really is counts
+        self.refused(self.home / "work" / "w" / "s.txt", "only its owner may read it")
+        (self.home / "work" / "w" / "conf.json").symlink_to(self.home / "telegram.json")
+        self.refused(self.home / "work" / "w" / "conf.json", "Telegram config")
+        self.refused(self.put("work-not/x.png", PNG, 0o600, top=self.home), "only its owner may read it")
 
     def test_secret_text_not_sent(self):
         self.configure()

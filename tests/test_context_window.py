@@ -46,6 +46,10 @@ class ContextWindow(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-9"}):
             _, conf = self.settings("sonnet[1m]")
         self.assertIn("claude-sonnet-9", conf["modelSettings"])
+        with mock.patch.dict(os.environ, {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5[1m]"}):
+            _, conf = self.settings("opus[1m]")
+        self.assertEqual(conf["modelSettings"]["claude-opus-5-5"], {"autoCompactWindow": 1_000_000})
+        self.assertNotIn("claude-opus-5-5[1m]", conf["modelSettings"])
 
     def test_without_1m_nothing_is_set(self):
         _, conf = self.settings("claude-opus-5-5")

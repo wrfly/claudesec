@@ -6128,7 +6128,9 @@ def context_window(settings, model):
     base, long = re.subn(r"\[1m\]$", "", model or "", flags=re.I)
     if not long or not settings.exists():
         return
-    ids = {base, os.environ.get(f"ANTHROPIC_DEFAULT_{base.upper()}_MODEL") or MODEL_ALIASES.get(base.lower(), base)}
+    # The AgentLodge wrapper sets ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m] (2026-11-06): the id is without it
+    alias = os.environ.get(f"ANTHROPIC_DEFAULT_{base.upper()}_MODEL") or MODEL_ALIASES.get(base.lower(), base)
+    ids = {base, re.sub(r"\[1m\]$", "", alias, flags=re.I)}
     conf = json.loads(settings.read_text())
     conf["modelSettings"] = {**conf.get("modelSettings", {}), **{i: {"autoCompactWindow": LONG_CONTEXT} for i in sorted(ids)}}
     settings.write_text(json.dumps(conf, indent=2) + "\n")

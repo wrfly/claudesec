@@ -272,6 +272,60 @@ class Telegram(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendPhoto", "sendPhoto"])
 
+    def test_secret_text_not_sent(self):
+        self.configure()
+        key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+        for argv, stdin in ((["-t", "-"], key), (["-t", "-"], key + "x\n" * 20000), (["-t", f"token {TOKEN}"], ""),
+                            (["-t", "-", self.file("a.png", PNG)], "the caption " + key)):
+            code, _, err = self.run_cs("telegram", "send", *argv, stdin=stdin)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("the text doesn't go out this way", err)
+        self.assertEqual(self.server.calls, [])
+
+    def test_what_is_checked_is_what_is_sent(self):
+        self.configure()
+        good = self.file("good.png", PNG)
+        key = self.put(".ssh/id_ed25519", b"-----BEGIN OPENSSH PRIVATE KEY-----", 0o600)
+        link = self.files / "shot.png"
+        link.symlink_to(good)
+        checked = self.ns["refused"]
+
+        def swap_after(*a):  # the link turns to the key between the check and the send
+            why = checked(*a)
+            link.unlink()
+            link.symlink_to(key)
+            return why
+        self.ns["refused"] = swap_after
+        code, _, _ = self.run_cs("telegram", "send", str(link))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.calls[0][3]["photo"], ("shot.png", PNG))
+
+    def test_allow_private_must_be_a_list_of_absolute_dirs(self):
+        for bad, said in (("~/qr", "must be a list"), ([1], "must be a list"), (["qr"], "isn't an absolute path")):
+            self.configure(allow_private=bad)
+            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            self.assertEqual(code, 1)
+            self.assertIn(said, err)
+        self.assertEqual(self.server.calls, [])
+
+    def test_private_hard_link_not_sent(self):
+        self.configure(allow_private=["~/qr"])
+        secret = self.put("notes/admin.txt", b"hunter2", 0o600)
+        (self.user_home / "qr").mkdir()
+        os.link(secret, self.user_home / "qr" / "x.png")
+        self.refused(self.user_home / "qr" / "x.png", "2 hard links")
+        shared = self.put("qr/shared.png", PNG)  # readable by others: a hard link is no matter
+        os.link(shared, self.user_home / "qr" / "shared2.png")
+        code, _, _ = self.run_cs("telegram", "send", str(self.user_home / "qr" / "shared2.png"))
+        self.assertEqual(code, 0)
+
+    def test_fifo_not_waited_on(self):
+        self.configure()
+        os.mkfifo(self.files / "pipe")
+        code, _, err = self.run_cs("telegram", "send", str(self.files / "pipe"))
+        self.assertEqual(code, 1)
+        self.assertIn("not a file", err)
+
     def test_allow_private_cannot_be_everything(self):
         self.configure(allow_private=["~", "/"])
         code, _, err = self.run_cs("telegram", "send", str(self.put("notes/a.txt", b"x", 0o600)))

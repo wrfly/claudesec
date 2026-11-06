@@ -17,6 +17,7 @@ import json
 import mimetypes
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -97,11 +98,18 @@ def under(path, top):
 def private_dirs(conf):
     """allow_private from the config, as resolved directories. One that is the home directory or
     above it is dropped: that would let every private file through."""
+    want = conf.get("allow_private")
+    if want is None:
+        return []
+    if not isinstance(want, list) or not all(isinstance(d, str) for d in want):
+        raise Failed(tr(f"{conf_path()} 的 allow_private 要写成目录的列表，比如 [\"~/qr\"]",
+                        f"allow_private in {conf_path()} must be a list of directories, like [\"~/qr\"]"))
     out = []
-    for d in conf.get("allow_private") or []:
-        d = Path(str(d)).expanduser()
+    for d in want:
+        d = Path(d).expanduser()
         if not d.is_absolute():
-            continue
+            raise Failed(tr(f"{conf_path()} 的 allow_private 里 {shown(d)} 不是绝对路径（可以用 ~/ 开头）",
+                            f"allow_private in {conf_path()}: {shown(d)} isn't an absolute path (~/ is fine)"))
         d = d.resolve()
         if any(under(h, d) for h in homes()):
             print(tr(f"claudesec telegram: allow_private 里的 {shown(d)} 是家目录或更上层，不算",
@@ -111,12 +119,50 @@ def private_dirs(conf):
     return out
 
 
-def refused(path, conf):
-    """Why path must not go out through here, or None. The secretary runs this without a permission
-    prompt, on paths a worker may have reported, so: never a credential; a file only its owner may
-    read only from a directory the user put in allow_private."""
-    real = path.resolve()
-    if conf_path().exists() and real.samefile(conf_path()):
+def secret_in(data, conf):
+    """Why these bytes (a file's, or the text) must not go out, or None."""
+    if PRIVATE_KEY.search(data):
+        return tr("里面有私钥", "it has a private key in it")
+    if conf["token"].encode() in data:
+        return tr("里面有这个 bot 的 token", "it has this bot's token in it")
+    return None
+
+
+def open_once(path):
+    """(the file it really is, its fstat, its bytes), all from one open: what is checked is what is
+    sent, whatever happens to the path in between. Failed if it isn't a regular file or is too big."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))  # a FIFO doesn't hang the open
+    except OSError as e:
+        raise Failed(tr(f"{shown(path)}：打不开（{e.strerror}）", f"{shown(path)}: can't open it ({e.strerror})")) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Failed(tr(f"{shown(path)}：不是文件", f"{shown(path)}: not a file"))
+        if st.st_size > FILE_MAX:
+            raise Failed(tr(f"{shown(path)}：{st.st_size >> 20}MB，超过 Bot API 的 50MB 上限",
+                            f"{shown(path)}: {st.st_size >> 20}MB, over the Bot API's 50MB limit"))
+        try:  # where the open file is, not where the path points now
+            real = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            real = path.resolve()
+        with os.fdopen(os.dup(fd), "rb") as f:
+            data = f.read(FILE_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > FILE_MAX:
+        raise Failed(tr(f"{shown(path)}：超过 Bot API 的 50MB 上限", f"{shown(path)}: over the Bot API's 50MB limit"))
+    if not data:
+        raise Failed(tr(f"{shown(path)}：空文件，Telegram 不收", f"{shown(path)}: empty, Telegram won't take it"))
+    return real, st, data
+
+
+def refused(path, real, st, data, conf):
+    """Why the file open_once read must not go out through here, or None. The secretary runs this
+    without a permission prompt, on paths a worker may have reported, so: never a credential; a file
+    only its owner may read only from a directory the user put in allow_private, and not a hard link."""
+    with_conf = conf_path()
+    if with_conf.exists() and os.path.samestat(st, with_conf.stat()):
         return tr("这是 Telegram 的配置文件（里面有 token）", "it's the Telegram config (the token is in it)")
     for p in {path.absolute(), real}:
         if CREDENTIAL_NAMES.search(p.name):
@@ -125,16 +171,18 @@ def refused(path, conf):
             hit = next((c for c in CREDENTIAL_PATHS if under(p, h / c)), None)
             if hit:
                 return tr(f"在 ~/{hit} 里，那是放凭据的地方", f"it's in ~/{hit}, where credentials live")
-    data = real.read_bytes()
-    if PRIVATE_KEY.search(data):
-        return tr("里面有私钥", "it has a private key in it")
-    if conf["token"].encode() in data:
-        return tr("里面有这个 bot 的 token", "it has this bot's token in it")
-    mode = real.stat().st_mode & 0o777
-    if not mode & 0o077 and not any(under(real, d) for d in conf["allow_private"]):
-        return tr(f"只有属主能读（权限 {mode:o}），像是私密文件；要能发，用户自己把它所在的目录加进 {conf_path()} 的 allow_private",
-                  f"only its owner may read it (mode {mode:o}): it looks private. To have files like it sent, the user"
-                  f" adds its directory to allow_private in {conf_path()} themselves")
+    why = secret_in(data, conf)
+    if why:
+        return why
+    mode = st.st_mode & 0o777
+    if not mode & 0o077:
+        if not any(under(real, d) for d in conf["allow_private"]):
+            return tr(f"只有属主能读（权限 {mode:o}），像是私密文件；要能发，用户自己把它所在的目录加进 {conf_path()} 的 allow_private",
+                      f"only its owner may read it (mode {mode:o}): it looks private. To have files like it sent, the user"
+                      f" adds its directory to allow_private in {conf_path()} themselves")
+        if st.st_nlink > 1:  # the same file may sit somewhere else under another name
+            return tr(f"只有属主能读，又有 {st.st_nlink} 个硬链接：可能是别处私密文件的另一个名字",
+                      f"only its owner may read it and it has {st.st_nlink} hard links: it may be a private file from elsewhere")
     return None
 
 
@@ -285,18 +333,18 @@ def chunks(text, limit=TEXT_MAX):
     return [c.strip("\n") for c in out if c.strip()]
 
 
-def send_file(conf, path, caption, as_document):
+def send_file(conf, path, data, caption, as_document):
     fields = {"chat_id": conf["chat_id"]}
     if caption:
         fields["caption"] = caption
-    if not as_document and path.suffix.lower() in PHOTO_TYPES and path.stat().st_size <= PHOTO_MAX:
+    if not as_document and path.suffix.lower() in PHOTO_TYPES and len(data) <= PHOTO_MAX:
         try:
-            call(conf, "sendPhoto", fields, {"photo": (path.name, path.read_bytes())})
+            call(conf, "sendPhoto", fields, {"photo": (path.name, data)})
             return "photo"
         except Failed as e:  # a picture Telegram won't take as a photo (its size, its shape) goes as a file
             if e.code != 400 or not PHOTO_REFUSED.search(e.description):
                 raise
-    call(conf, "sendDocument", fields, {"document": (path.name, path.read_bytes())})
+    call(conf, "sendDocument", fields, {"document": (path.name, data)})
     return "file"
 
 
@@ -307,19 +355,19 @@ def cmd_send(args):
     files = [Path(f).expanduser() for f in args.files]
     if not text and not files:
         raise Failed(tr("没东西可发：给 -t 文字（-t - 从 stdin 读）或文件", "nothing to send: give -t TEXT (-t - reads stdin) or files"))
-    for f in files:  # every one checked before anything is sent
-        if not f.is_file():
-            raise Failed(tr(f"{shown(f)}：不是文件", f"{shown(f)}: not a file"))
-        size = f.stat().st_size
-        if not size:
-            raise Failed(tr(f"{shown(f)}：空文件，Telegram 不收", f"{shown(f)}: empty, Telegram won't take it"))
-        if size > FILE_MAX:
-            raise Failed(tr(f"{shown(f)}：{size >> 20}MB，超过 Bot API 的 50MB 上限", f"{shown(f)}: {size >> 20}MB, over the Bot API's 50MB limit"))
-        why = refused(f, conf)
+    dont = tr("别复制、别改权限、别改配置绕过。什么都没发",
+              "don't copy it, change its mode or edit the config to get around this. Nothing was sent")
+    why = secret_in(text.encode("utf-8", "replace"), conf)
+    if why:
+        raise Failed(tr(f"文字不经这里发：{why}。要发就请用户自己从 Telegram 发；{dont}",
+                        f"the text doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram themselves; {dont}"))
+    data = {}
+    for f in files:  # every one checked before anything is sent, and sent as it was read then
+        real, st, data[f] = open_once(f)
+        why = refused(f, real, st, data[f], conf)
         if why:
-            raise Failed(tr(f"{shown(f)} 不经这里发：{why}。要发就请用户自己从 Telegram 发；别复制、别改权限、别改配置绕过。什么都没发",
-                            f"{shown(f)} doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram"
-                            f" themselves; don't copy it, change its mode or edit the config to get around this. Nothing was sent"))
+            raise Failed(tr(f"{shown(f)} 不经这里发：{why}。要发就请用户自己从 Telegram 发；{dont}",
+                            f"{shown(f)} doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram themselves; {dont}"))
     caption = text if len(files) == 1 and text and u16(text) <= CAPTION_MAX else None
     if text and not caption:
         parts = chunks(text)
@@ -332,7 +380,7 @@ def cmd_send(args):
                 of = f" {i}/{len(parts)}" if len(parts) > 1 else ""
                 print(tr(f"已发：文字{of}（{len(part)} 字）", f"sent: text{of} ({len(part)} chars)"), flush=True)
     for f in files:
-        kind = send_file(conf, f, caption, args.document)
+        kind = send_file(conf, f, data[f], caption, args.document)
         with_caption = tr("，带文字", ", with the text") if caption else ""
         print(tr(f"已发：{'图片' if kind == 'photo' else '文件'} {shown(f.name)}{with_caption}",
                  f"sent: {kind} {shown(f.name)}{with_caption}"), flush=True)

@@ -65,9 +65,11 @@ on paths a worker may have reported, so:
   `~/.config/gh`, `~/.config/gcloud`, `~/.config/rclone`, browser profiles, `~/.netrc`, `~/.git-credentials`,
   `~/.npmrc`, `~/.pypirc`, … `CREDENTIAL_PATHS` in `plugin.py` has them all), files named like one
   (`id_rsa`, `id_ed25519`, `.env`, `.credentials.json`, `*.key`, `*.p12`, …), and any file with a private
-  key or the bot's token in it. Checked on the path given and on the file it links to.
+  key or the bot's token in it; text with one in it either. Checked on the path given and on the file
+  it links to. Each file is opened once, and the bytes checked are the bytes sent.
 - **sent only from `allow_private`**: a file only its owner may read (mode 600 and the like). Put the
   directories of private files that are meant for you (VPN QR codes, say) in `allow_private` yourself.
+  A private file with more than one hard link is refused even there (it may be a file from elsewhere).
   The secretary can't change that list without your say: `telegram.json` is outside what it may do
   unasked, and its prompt tells it not to.
 - everything else, `~/.claudesec` included (reports, workers' output), goes.

@@ -42,6 +42,7 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
 | `bot_token` | from @BotFather. Never printed: not in output, errors or tracebacks |
 | `chat_id` | where everything goes: a group's id (`-100…`), a user's (a number), or a public channel's `@name` |
 | `proxy` | optional, e.g. `"http://127.0.0.1:7890"`, where api.telegram.org isn't reachable directly. Without it `https_proxy` from the environment applies. http(s) proxies only: for a socks one use its http port |
+| `allow_private` | optional, directories, e.g. `["~/.claudesec/secrets/vpn-qr"]`: files only their owner may read (mode 600) are sent from these, from nowhere else. Credentials are refused even here; the home directory or above it is ignored |
 | `api_base` | optional, default `https://api.telegram.org` (a local Bot API server, or the tests' fake one) |
 
 ## Commands
@@ -56,11 +57,22 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
     claudesec telegram chats                                  # chats the bot has seen, to find chat_id
 
 Every file is checked first, and one bad path means nothing is sent: it must be there, not empty, at
-most 50MB (the Bot API's limit), and not look private. Refused: `telegram.json` itself (under any name),
-a file only its owner may read (mode 600 and the like), anything under a dot directory of the home
-directory (`~/.ssh`, `~/.claudesec`, …). There's no flag to override that: the secretary runs this
-without a permission prompt, on paths a worker may have reported, so a file like that you send from
-Telegram yourself.
+most 50MB (the Bot API's limit), and not a secret. The secretary runs this without a permission prompt,
+on paths a worker may have reported, so:
+
+- **never sent**: `telegram.json` itself (under any name or link), anything in a credential place of the
+  home directory (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.password-store`,
+  `~/.config/gh`, `~/.config/gcloud`, `~/.config/rclone`, browser profiles, `~/.netrc`, `~/.git-credentials`,
+  `~/.npmrc`, `~/.pypirc`, … `CREDENTIAL_PATHS` in `plugin.py` has them all), files named like one
+  (`id_rsa`, `id_ed25519`, `.env`, `.credentials.json`, `*.key`, `*.p12`, …), and any file with a private
+  key or the bot's token in it. Checked on the path given and on the file it links to.
+- **sent only from `allow_private`**: a file only its owner may read (mode 600 and the like). Put the
+  directories of private files that are meant for you (VPN QR codes, say) in `allow_private` yourself.
+  The secretary can't change that list without your say: `telegram.json` is outside what it may do
+  unasked, and its prompt tells it not to.
+- everything else, `~/.claudesec` included (reports, workers' output), goes.
+
+There's no flag to override any of it. A file that's refused, you send from Telegram yourself.
 
 Text over 4096 characters goes in up to three messages, cut between lines; longer than that, as one
 `message.txt`. Text with two or more files goes first as a message of its own. A picture Telegram

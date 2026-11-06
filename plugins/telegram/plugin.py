@@ -7,9 +7,10 @@
 Only sends: it doesn't read the chat for messages. Config is $CLAUDESEC_HOME/telegram.json, mode 600:
     {"bot_token": "123456:ABC...", "chat_id": -1001234567890}
 optional "proxy" ("http://127.0.0.1:7890"; else the https_proxy environment applies) and "api_base".
-The token is never printed: not in output, errors or tracebacks. Files that look private are
-refused (the config itself, ones only their owner may read, anything under a dot directory of the home
-directory): the secretary runs this without a permission prompt, on paths a worker may have reported.
+The token is never printed: not in output, errors or tracebacks. Credentials are refused
+(the config itself, ~/.ssh and the like, private keys, a file with the token in it), and so is a file
+only its owner may read unless it's in a directory of "allow_private" in the config: the secretary runs
+this without a permission prompt, on paths a worker may have reported.
 Enable: ln -s <repo>/plugins/telegram ~/.claudesec/plugins/telegram
 """
 import json
@@ -66,25 +67,74 @@ def shown(path):
     return str(path).encode("utf-8", "replace").decode("utf-8")
 
 
-def refused(path):
-    """Why path must not go out through here, or None."""
+# Where credentials live, under the home directory: never sent, whatever allow_private says.
+CREDENTIAL_PATHS = (
+    ".ssh", ".gnupg", ".password-store", ".pki", ".aws", ".azure", ".kube", ".docker", ".terraform.d",
+    ".config/gcloud", ".config/gh", ".config/hub", ".config/rclone", ".config/op", ".config/sops",
+    ".local/share/keyrings", ".mozilla", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
+    ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc", ".vault-token", ".cargo/credentials",
+    ".cargo/credentials.toml", ".codex/auth.json",
+)
+# File names that hold a secret wherever they are.
+CREDENTIAL_NAMES = re.compile(
+    r"^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?|\.credentials\.json|\.git-credentials|\.netrc|\.pgpass|\.env(\..+)?)$"
+    r"|\.(key|p12|pfx|kdbx|jks|keystore)$", re.I)
+PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
+
+
+def homes():
+    return {Path.home(), Path.home().resolve()}
+
+
+def under(path, top):
+    try:
+        path.relative_to(top)
+        return True
+    except ValueError:
+        return False
+
+
+def private_dirs(conf):
+    """allow_private from the config, as resolved directories. One that is the home directory or
+    above it is dropped: that would let every private file through."""
+    out = []
+    for d in conf.get("allow_private") or []:
+        d = Path(str(d)).expanduser()
+        if not d.is_absolute():
+            continue
+        d = d.resolve()
+        if any(under(h, d) for h in homes()):
+            print(tr(f"claudesec telegram: allow_private 里的 {shown(d)} 是家目录或更上层，不算",
+                     f"claudesec telegram: allow_private's {shown(d)} is the home directory or above it: ignored"), file=sys.stderr)
+            continue
+        out.append(d)
+    return out
+
+
+def refused(path, conf):
+    """Why path must not go out through here, or None. The secretary runs this without a permission
+    prompt, on paths a worker may have reported, so: never a credential; a file only its owner may
+    read only from a directory the user put in allow_private."""
     real = path.resolve()
-    with_conf = conf_path()
-    if with_conf.exists() and real.samefile(with_conf):
+    if conf_path().exists() and real.samefile(conf_path()):
         return tr("这是 Telegram 的配置文件（里面有 token）", "it's the Telegram config (the token is in it)")
-    for p in (path.absolute(), real):
-        rels = []
-        for home in {Path.home(), Path.home().resolve()}:
-            try:
-                rels.append(p.relative_to(home))
-            except ValueError:
-                pass
-        if any(part.startswith(".") for rel in rels for part in rel.parts):
-            return tr("在家目录的点目录里（~/.ssh、~/.claudesec 这类放私密东西的地方）",
-                      "it's under a dot directory of the home directory (~/.ssh, ~/.claudesec: where private things live)")
-    if not real.stat().st_mode & 0o077:
-        return tr(f"只有属主能读（权限 {real.stat().st_mode & 0o777:o}），像是私密文件",
-                  f"only its owner may read it (mode {real.stat().st_mode & 0o777:o}): it looks private")
+    for p in {path.absolute(), real}:
+        if CREDENTIAL_NAMES.search(p.name):
+            return tr(f"{p.name} 这种文件名放的是凭据", f"a file named {p.name} holds a credential")
+        for h in homes():
+            hit = next((c for c in CREDENTIAL_PATHS if under(p, h / c)), None)
+            if hit:
+                return tr(f"在 ~/{hit} 里，那是放凭据的地方", f"it's in ~/{hit}, where credentials live")
+    data = real.read_bytes()
+    if PRIVATE_KEY.search(data):
+        return tr("里面有私钥", "it has a private key in it")
+    if conf["token"].encode() in data:
+        return tr("里面有这个 bot 的 token", "it has this bot's token in it")
+    mode = real.stat().st_mode & 0o777
+    if not mode & 0o077 and not any(under(real, d) for d in conf["allow_private"]):
+        return tr(f"只有属主能读（权限 {mode:o}），像是私密文件；要能发，用户自己把它所在的目录加进 {conf_path()} 的 allow_private",
+                  f"only its owner may read it (mode {mode:o}): it looks private. To have files like it sent, the user"
+                  f" adds its directory to allow_private in {conf_path()} themselves")
     return None
 
 
@@ -130,8 +180,10 @@ def load_conf(need_chat=True):
     if need_chat and not CHAT_RE.match(chat):
         raise Failed(tr(f"{path} 缺 chat_id（群的 id 形如 -100…）：claudesec telegram chats 列出 bot 见过的群",
                         f"{path} has no chat_id (a group's is like -100…): claudesec telegram chats lists the ones the bot has seen"))
-    return {"token": token, "chat_id": chat, "proxy": conf.get("proxy"),
-            "api_base": str(conf.get("api_base") or API_BASE).rstrip("/")}
+    out = {"token": token, "chat_id": chat, "proxy": conf.get("proxy"),
+           "api_base": str(conf.get("api_base") or API_BASE).rstrip("/"), "allow_private": conf.get("allow_private")}
+    out["allow_private"] = private_dirs(out)
+    return out
 
 
 def opener(conf):
@@ -258,16 +310,16 @@ def cmd_send(args):
     for f in files:  # every one checked before anything is sent
         if not f.is_file():
             raise Failed(tr(f"{shown(f)}：不是文件", f"{shown(f)}: not a file"))
-        why = refused(f)
-        if why:
-            raise Failed(tr(f"{shown(f)} 不经这里发：{why}。要发就请用户自己从 Telegram 发；别复制、别改权限绕过。什么都没发",
-                            f"{shown(f)} doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram"
-                            f" themselves; don't copy it or change its mode to get around this. Nothing was sent"))
         size = f.stat().st_size
         if not size:
             raise Failed(tr(f"{shown(f)}：空文件，Telegram 不收", f"{shown(f)}: empty, Telegram won't take it"))
         if size > FILE_MAX:
             raise Failed(tr(f"{shown(f)}：{size >> 20}MB，超过 Bot API 的 50MB 上限", f"{shown(f)}: {size >> 20}MB, over the Bot API's 50MB limit"))
+        why = refused(f, conf)
+        if why:
+            raise Failed(tr(f"{shown(f)} 不经这里发：{why}。要发就请用户自己从 Telegram 发；别复制、别改权限、别改配置绕过。什么都没发",
+                            f"{shown(f)} doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram"
+                            f" themselves; don't copy it, change its mode or edit the config to get around this. Nothing was sent"))
     caption = text if len(files) == 1 and text and u16(text) <= CAPTION_MAX else None
     if text and not caption:
         parts = chunks(text)
@@ -361,7 +413,8 @@ def prompt(cfg, who):
 - 文字：`-t '一句话'`；长的、带引号的从 stdin 读：`claudesec telegram send -t - [文件…] <<'EOF'` … `EOF`。
   文字配一个文件时当它的说明一起发
 - 文件在 worker 那里：让 worker 在汇报里给绝对路径，你来发
-- 私密的发不了：配置文件、只有属主能读的、家目录点目录（~/.ssh、~/.claudesec…）里的都会被拒。被拒就告诉用户自己从 Telegram 发，
-  别复制到别处、别 chmod 绕过；这条对 worker 汇报里给的路径同样适用
+- 凭据发不了：telegram.json、~/.ssh 这类凭据目录、私钥、含 token 的文件都拒；只有属主能读的（600）只在用户列进
+  allow_private 的目录里才发。被拒就告诉用户、请用户自己从 Telegram 发；别复制到别处、别 chmod、别改 telegram.json 绕过，
+  worker 汇报里给的路径同样如此
 发完给一行收据「发到 Telegram 了：a.png」。报「还没配置」就把它打印的步骤列成用户的待办，别自己去找 token、也别读 telegram.json。
 """

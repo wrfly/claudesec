@@ -1,8 +1,9 @@
 """plugins/telegram, linked into a temporary $CLAUDESEC_HOME the way a user enables it, sending to a
 fake Bot API on 127.0.0.1 (never api.telegram.org): text, photos with a caption, files, long text in
 pieces or as message.txt, a 429 waited out (a long one not), a photo Telegram refuses sent as a file;
-no config, a config others can read, a missing file, a file that looks private (the config, mode 600, a
-dot directory of the home directory): refused before anything is sent. The token shows up in no output.
+no config, a config others can read, a missing file, a credential (the config, ~/.ssh, a private key,
+the token in a file), a mode-600 file outside allow_private: refused before anything is sent; the rest
+of ~/.claudesec, and allow_private's private files, sent. The token shows up in no output.
 
     python3 -m unittest discover -s tests
 """
@@ -222,31 +223,61 @@ class Telegram(unittest.TestCase):
         slept.assert_called_once_with(40)  # 40 + 30 is over the minute
         self.assertIn("30s", err)
 
-    def test_config_not_sent(self):
-        self.configure()
-        (self.files / "innocent.txt").symlink_to(self.home / "telegram.json")
-        for path in (self.home / "telegram.json", self.files / "innocent.txt"):
-            code, _, err = self.run_cs("telegram", "send", "-t", "here", str(path))
-            self.assertEqual(code, 1)
-            self.assertIn("Telegram config", err)
+    def put(self, rel, data=b"hello", mode=0o644, top=None):
+        path = (top or self.user_home) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+        return path
+
+    def refused(self, path, why):
+        code, _, err = self.run_cs("telegram", "send", self.file("fine.png", PNG), str(path))
+        self.assertEqual(code, 1, path)
+        self.assertIn(why, err)
+        self.assertIn("the user sends it from Telegram", err)
         self.assertEqual(self.server.calls, [])
 
-    def test_private_files_not_sent(self):
+    def test_credentials_never_sent(self):
+        self.configure(allow_private=[str(self.user_home / "qr"), str(self.user_home / ".ssh")])
+        self.refused(self.put(".ssh/id_rsa.pub", b"ssh-rsa AAAA"), "~/.ssh")
+        self.refused(self.put(".config/gh/hosts.yml"), "~/.config/gh")
+        self.refused(self.put(".docker/config.json"), "~/.docker")
+        self.refused(self.put("work/.env"), "a file named .env")
+        self.refused(self.put("qr/id_ed25519", b"x", 0o600), "a file named id_ed25519")
+        self.refused(self.put("qr/innocent.txt", b"junk\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl", 0o600), "private key")
+        self.refused(self.put("qr/copy.json", json.dumps({"t": TOKEN}).encode(), 0o600), "this bot's token")
+        link = self.user_home / "qr" / "link.png"
+        link.symlink_to(self.put(".aws/credentials"))
+        self.refused(link, "~/.aws")
+
+    def test_config_refused_under_any_name(self):
         self.configure()
-        secret = self.file("id_ed25519", b"-----BEGIN OPENSSH PRIVATE KEY-----")
-        Path(secret).chmod(0o600)
-        (self.user_home / ".ssh").mkdir()
-        key = self.user_home / ".ssh" / "id_rsa.pub"
-        key.write_bytes(b"ssh-rsa AAAA")
-        key.chmod(0o644)
-        (self.files / "link").symlink_to(key)
-        for path, why in ((secret, "only its owner may read it"), (str(key), "dot directory"),
-                          (str(self.files / "link"), "dot directory")):
-            code, _, err = self.run_cs("telegram", "send", self.file("fine.png", PNG), path)
-            self.assertEqual(code, 1)
-            self.assertIn(why, err)
-            self.assertIn("the user sends it from Telegram", err)
-        self.assertEqual(self.server.calls, [])
+        (self.files / "innocent.txt").symlink_to(self.home / "telegram.json")
+        os.link(self.home / "telegram.json", self.files / "hard.txt")
+        for path in (self.home / "telegram.json", self.files / "innocent.txt", self.files / "hard.txt"):
+            self.refused(path, "Telegram config")
+
+    def test_private_files_only_from_allow_private(self):
+        self.configure(allow_private=["~/.claudesec/secrets/vpn-qr"])
+        secret = self.put(".claudesec/secrets/admin.txt", b"hunter2", 0o600)
+        self.refused(secret, "only its owner may read it")
+        self.refused(self.put("Downloads/x.pdf", b"%PDF", 0o600), "allow_private")
+        sneaky = self.user_home / ".claudesec/secrets/vpn-qr/also.txt"
+        sneaky.parent.mkdir(parents=True)
+        sneaky.symlink_to(secret)  # in the allowed directory, but the file it is isn't
+        self.refused(sneaky, "only its owner may read it")
+        qr = self.put(".claudesec/secrets/vpn-qr/phone.png", PNG, 0o600)
+        shot = self.put(".claudesec/reports/w/shot.png", PNG)  # ~/.claudesec isn't off limits
+        code, out, _ = self.run_cs("telegram", "send", str(qr), str(shot))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.methods(), ["sendPhoto", "sendPhoto"])
+
+    def test_allow_private_cannot_be_everything(self):
+        self.configure(allow_private=["~", "/"])
+        code, _, err = self.run_cs("telegram", "send", str(self.put("notes/a.txt", b"x", 0o600)))
+        self.assertEqual(code, 1)
+        self.assertIn("is the home directory or above it: ignored", err)
+        self.assertIn("only its owner may read it", err)
 
     def test_name_not_in_utf8(self):
         self.configure()

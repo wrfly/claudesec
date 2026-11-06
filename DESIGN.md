@@ -183,14 +183,16 @@ tmux pane id，`SendMessage` 可互发。
 7. 只有某台机器要的东西（别的 `claude` 启动脚本的参数、它带来的对话框、对应的提示词）不进 repo
    → 插件 `$CLAUDESEC_HOME/plugins/<名字>/plugin.py`：给秘书 / Claude worker 加启动参数（`claude_args`）、
    在系统提示末尾加话（`prompt`）、回答自己的对话框（`answer_dialog`，spawn / wake / adopt 的启动检查、看门狗、
-   秘书自己启动后一分钟都会问）、加自己的子命令（`commands`）。没有插件目录时什么都不做；加载失败的插件跳过并打到 stderr。
+   秘书自己启动后一分钟都会问）、加自己的命令（`commands`，挂在 `claudesec plugin <插件目录名>` 下）。没有插件目录时什么都不做；加载失败的插件跳过并打到 stderr。
    谁都可能要、但不是人人要的（Telegram 发送）放 repo 的 `plugins/<名字>/`，用户 `ln -s` 进插件目录才生效。
-   给秘书的新动作做成 `claudesec` 子命令而不是 MCP 工具：秘书带 `--allowedTools Bash(claudesec *)`，不弹权限框，
+   给秘书的新动作做成 `claudesec plugin <名字> …` 命令而不是 MCP 工具：秘书带 `--allowedTools Bash(claudesec *)`，不弹权限框，
    也不用多一个常驻的 MCP 进程、不碰 Claude Code 的配置目录。
-   代价：插件的子命令也就进了秘书免确认的范围，所以要它自己拒掉不该不问就做的事
+   代价：插件的命令也就进了秘书免确认的范围，所以要它自己拒掉不该不问就做的事
    （Telegram 从不发凭据：配置文件本身、~/.ssh 这类凭据目录、私钥、含 token 的文件；
    只有属主能读的文件只从用户自己写进配置 allow_private 的目录发；被拒就让用户自己发）。
-   跟内置命令或先加载的插件重名的子命令跳过并打到 stderr，不覆盖。
+   插件命令一律在 `claudesec plugin` 下、按插件目录名分开（用户 2026-11-07：「把plugin变成命令,telegram作为plugin的子命令」），
+   名字由目录决定，跟内置命令、跟别的插件都撞不上，不用查重名；顶层命令只归 claudesec 自己。
+   `claudesec plugin` 不带参数列出插件：加载了的（挂载点、命令、链接到哪）、没加载上的（原因）、repo 里有但没链接的（怎么启用）。
 
 ### 3.2 组件（已实现）
 

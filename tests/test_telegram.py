@@ -127,20 +127,20 @@ class Telegram(unittest.TestCase):
 
     def test_text(self):
         self.configure()
-        code, out, _ = self.run_cs("telegram", "send", "-t", "hello there")
+        code, out, _ = self.run_cs("plugin", "telegram", "send", "-t", "hello there")
         self.assertEqual(code, 0)
         self.assertEqual(self.server.calls, [(TOKEN, "sendMessage", {"chat_id": "-1001234567890", "text": "hello there"}, {})])
         self.assertIn("sent: text", out)
 
     def test_text_from_stdin(self):
         self.configure()
-        self.run_cs("telegram", "send", "-t", "-", stdin="it's \"quoted\"\nsecond line\n")
+        self.run_cs("plugin", "telegram", "send", "-t", "-", stdin="it's \"quoted\"\nsecond line\n")
         self.assertEqual(self.server.calls[0][2]["text"], "it's \"quoted\"\nsecond line")
 
     def test_long_text_in_pieces(self):
         self.configure()
         text = "\n".join(f"line {i} " + "x" * 90 for i in range(100))  # ~10000 characters
-        self.run_cs("telegram", "send", "-t", text)
+        self.run_cs("plugin", "telegram", "send", "-t", text)
         sent = [c[2]["text"] for c in self.server.calls]
         self.assertEqual(self.methods(), ["sendMessage"] * 3)
         self.assertTrue(all(len(s) <= 4096 for s in sent))
@@ -157,7 +157,7 @@ class Telegram(unittest.TestCase):
     def test_photo_with_caption(self):
         self.configure()
         shot = self.file("shot.png", PNG)
-        code, out, _ = self.run_cs("telegram", "send", "-t", "the screenshot", shot)
+        code, out, _ = self.run_cs("plugin", "telegram", "send", "-t", "the screenshot", shot)
         self.assertEqual(code, 0)
         [(_, method, fields, files)] = self.server.calls
         self.assertEqual(method, "sendPhoto")
@@ -167,21 +167,21 @@ class Telegram(unittest.TestCase):
 
     def test_document(self):
         self.configure()
-        self.run_cs("telegram", "send", self.file("report.pdf", b"%PDF-1.4"), self.file("qr.png", PNG), "--document")
+        self.run_cs("plugin", "telegram", "send", self.file("report.pdf", b"%PDF-1.4"), self.file("qr.png", PNG), "--document")
         self.assertEqual(self.methods(), ["sendDocument", "sendDocument"])
         self.assertEqual(self.server.calls[0][3], {"document": ("report.pdf", b"%PDF-1.4")})
         self.assertEqual(self.server.calls[1][3], {"document": ("qr.png", PNG)})
 
     def test_text_and_two_files(self):
         self.configure()
-        self.run_cs("telegram", "send", "-t", "both", self.file("a.png", PNG), self.file("b.txt"))
+        self.run_cs("plugin", "telegram", "send", "-t", "both", self.file("a.png", PNG), self.file("b.txt"))
         self.assertEqual(self.methods(), ["sendMessage", "sendPhoto", "sendDocument"])
         self.assertNotIn("caption", self.server.calls[1][2])
 
     def test_refused_photo_goes_as_file(self):
         self.configure()
         self.server.answers["sendPhoto"] = [(400, {"ok": False, "error_code": 400, "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"})]
-        code, out, _ = self.run_cs("telegram", "send", self.file("tall.png", PNG))
+        code, out, _ = self.run_cs("plugin", "telegram", "send", self.file("tall.png", PNG))
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendPhoto", "sendDocument"])
         self.assertIn("sent: file tall.png", out)
@@ -189,7 +189,7 @@ class Telegram(unittest.TestCase):
     def test_text_too_long_goes_as_a_file(self):
         self.configure()
         text = "\n".join(f"line {i} " + "x" * 90 for i in range(200))  # ~20000 characters: 5 messages
-        code, out, _ = self.run_cs("telegram", "send", "-t", text)
+        code, out, _ = self.run_cs("plugin", "telegram", "send", "-t", text)
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendDocument"])
         self.assertEqual(self.server.calls[0][3], {"document": ("message.txt", text.encode())})
@@ -199,7 +199,7 @@ class Telegram(unittest.TestCase):
         self.configure()
         self.server.answers["sendMessage"] = [(200, {"ok": True, "result": {}}),
                                               (400, {"ok": False, "error_code": 400, "description": "Bad Request: nope"})]
-        code, out, err = self.run_cs("telegram", "send", "-t", "\n".join("y" * 90 for _ in range(60)))
+        code, out, err = self.run_cs("plugin", "telegram", "send", "-t", "\n".join("y" * 90 for _ in range(60)))
         self.assertEqual(code, 1)
         self.assertIn("sent: text 1/2", out)
         self.assertIn("nope", err)
@@ -207,7 +207,7 @@ class Telegram(unittest.TestCase):
     def test_other_photo_errors_not_retried_as_file(self):
         self.configure()
         self.server.answers["sendPhoto"] = [(400, {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"})]
-        code, _, err = self.run_cs("telegram", "send", self.file("a.png", PNG))
+        code, _, err = self.run_cs("plugin", "telegram", "send", self.file("a.png", PNG))
         self.assertEqual(code, 1)
         self.assertEqual(self.methods(), ["sendPhoto"])
         self.assertIn("sendPhoto: Bad Request: chat not found", err)
@@ -218,7 +218,7 @@ class Telegram(unittest.TestCase):
             (429, {"ok": False, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 40}}),
             (429, {"ok": False, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 30}})]
         with mock.patch("time.sleep") as slept:
-            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         slept.assert_called_once_with(40)  # 40 + 30 is over the minute
         self.assertIn("30s", err)
@@ -231,7 +231,7 @@ class Telegram(unittest.TestCase):
         return path
 
     def refused(self, path, why):
-        code, _, err = self.run_cs("telegram", "send", self.file("fine.png", PNG), str(path))
+        code, _, err = self.run_cs("plugin", "telegram", "send", self.file("fine.png", PNG), str(path))
         self.assertEqual(code, 1, path)
         self.assertIn(why, err)
         self.assertIn("the user sends it from Telegram", err)
@@ -268,7 +268,7 @@ class Telegram(unittest.TestCase):
         self.refused(sneaky, "only its owner may read it")
         qr = self.put(".claudesec/secrets/vpn-qr/phone.png", PNG, 0o600)
         shot = self.put(".claudesec/reports/w/shot.png", PNG)  # ~/.claudesec isn't off limits
-        code, out, _ = self.run_cs("telegram", "send", str(qr), str(shot))
+        code, out, _ = self.run_cs("plugin", "telegram", "send", str(qr), str(shot))
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendPhoto", "sendPhoto"])
 
@@ -277,7 +277,7 @@ class Telegram(unittest.TestCase):
         key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
         for argv, stdin in ((["-t", "-"], key), (["-t", "-"], key + "x\n" * 20000), (["-t", f"token {TOKEN}"], ""),
                             (["-t", "-", self.file("a.png", PNG)], "the caption " + key)):
-            code, _, err = self.run_cs("telegram", "send", *argv, stdin=stdin)
+            code, _, err = self.run_cs("plugin", "telegram", "send", *argv, stdin=stdin)
             self.assertEqual(code, 1, argv)
             self.assertIn("the text doesn't go out this way", err)
         self.assertEqual(self.server.calls, [])
@@ -296,14 +296,14 @@ class Telegram(unittest.TestCase):
             link.symlink_to(key)
             return why
         self.ns["refused"] = swap_after
-        code, _, _ = self.run_cs("telegram", "send", str(link))
+        code, _, _ = self.run_cs("plugin", "telegram", "send", str(link))
         self.assertEqual(code, 0)
         self.assertEqual(self.server.calls[0][3]["photo"], ("shot.png", PNG))
 
     def test_allow_private_must_be_a_list_of_absolute_dirs(self):
         for bad, said in (("~/qr", "must be a list"), ([1], "must be a list"), (["qr"], "isn't an absolute path")):
             self.configure(allow_private=bad)
-            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
             self.assertEqual(code, 1)
             self.assertIn(said, err)
         self.assertEqual(self.server.calls, [])
@@ -316,19 +316,19 @@ class Telegram(unittest.TestCase):
         self.refused(self.user_home / "qr" / "x.png", "2 hard links")
         shared = self.put("qr/shared.png", PNG)  # readable by others: a hard link is no matter
         os.link(shared, self.user_home / "qr" / "shared2.png")
-        code, _, _ = self.run_cs("telegram", "send", str(self.user_home / "qr" / "shared2.png"))
+        code, _, _ = self.run_cs("plugin", "telegram", "send", str(self.user_home / "qr" / "shared2.png"))
         self.assertEqual(code, 0)
 
     def test_fifo_not_waited_on(self):
         self.configure()
         os.mkfifo(self.files / "pipe")
-        code, _, err = self.run_cs("telegram", "send", str(self.files / "pipe"))
+        code, _, err = self.run_cs("plugin", "telegram", "send", str(self.files / "pipe"))
         self.assertEqual(code, 1)
         self.assertIn("not a file", err)
 
     def test_allow_private_cannot_be_everything(self):
         self.configure(allow_private=["~", "/"])
-        code, _, err = self.run_cs("telegram", "send", str(self.put("notes/a.txt", b"x", 0o600)))
+        code, _, err = self.run_cs("plugin", "telegram", "send", str(self.put("notes/a.txt", b"x", 0o600)))
         self.assertEqual(code, 1)
         self.assertIn("is the home directory or above it: ignored", err)
         self.assertIn("only its owner may read it", err)
@@ -336,7 +336,7 @@ class Telegram(unittest.TestCase):
     def test_name_not_in_utf8(self):
         self.configure()
         name = os.fsdecode(b"\xffnotes.txt")
-        code, out, _ = self.run_cs("telegram", "send", self.file(name))
+        code, out, _ = self.run_cs("plugin", "telegram", "send", self.file(name))
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendDocument"])
         self.assertEqual(self.server.calls[0][3]["document"][1], b"hello")
@@ -344,13 +344,13 @@ class Telegram(unittest.TestCase):
 
     def test_socks_proxy_said_plainly(self):
         self.configure(proxy="socks5://me:hunter2@127.0.0.1:1080")
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("socks5:// proxy: only http(s) proxies", err)
         self.assertNotIn("hunter2", err)
         self.configure()
         with mock.patch.dict(os.environ, {"https_proxy": "socks5h://127.0.0.1:1080", "no_proxy": ""}):
-            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertIn("https_proxy is a socks5h:// proxy", err)
         self.assertEqual(self.server.calls, [])
 
@@ -358,7 +358,7 @@ class Telegram(unittest.TestCase):
         self.configure(chat_id=None)
         self.server.answers["getUpdates"] = [(409, {"ok": False, "error_code": 409,
             "description": "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"})]
-        code, _, err = self.run_cs("telegram", "chats")
+        code, _, err = self.run_cs("plugin", "telegram", "chats")
         self.assertEqual(code, 1)
         self.assertNotIn("deleteWebhook", err)
         self.assertIn("Don't delete the webhook", err)
@@ -369,7 +369,7 @@ class Telegram(unittest.TestCase):
             (429, {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 3", "parameters": {"retry_after": 3}}),
             (200, {"ok": True, "result": {}})]
         with mock.patch("time.sleep") as slept:
-            code, _, _ = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, _ = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 0)
         slept.assert_called_once_with(3)
         self.assertEqual(self.methods(), ["sendMessage", "sendMessage"])
@@ -377,7 +377,7 @@ class Telegram(unittest.TestCase):
     def test_api_error(self):
         self.configure()
         self.server.answers["sendMessage"] = [(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})]
-        code, out, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, out, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("sendMessage: Unauthorized", err)
 
@@ -385,18 +385,18 @@ class Telegram(unittest.TestCase):
         self.configure()
         self.server.answers["sendMessage"] = [(400, {"ok": False, "error_code": 400, "description": "Bad Request: group chat was upgraded to a supergroup chat",
                                                      "parameters": {"migrate_to_chat_id": -1009876}})]
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("-1009876", err)
 
     def test_unreachable(self):
         self.configure(api_base="http://127.0.0.1:1")
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("sendMessage:", err)
 
     def test_not_configured(self):
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("@BotFather", err)
         self.assertIn(str(self.home / "telegram.json"), err)
@@ -404,27 +404,27 @@ class Telegram(unittest.TestCase):
 
     def test_readable_by_others(self):
         self.configure(mode=0o644)
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("chmod 600", err)
         self.assertEqual(self.server.calls, [])
 
     def test_bad_token(self):
         self.configure(bot_token="not a token")
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("bot_token", err)
 
     def test_missing_file_sends_nothing(self):
         self.configure()
-        code, _, err = self.run_cs("telegram", "send", "-t", "hi", self.file("a.png", PNG), str(self.files / "gone.pdf"))
+        code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi", self.file("a.png", PNG), str(self.files / "gone.pdf"))
         self.assertEqual(code, 1)
         self.assertIn("gone.pdf", err)
         self.assertEqual(self.server.calls, [])
 
     def test_nothing_to_send(self):
         self.configure()
-        code, _, err = self.run_cs("telegram", "send")
+        code, _, err = self.run_cs("plugin", "telegram", "send")
         self.assertEqual(code, 1)
         self.assertEqual(self.server.calls, [])
 
@@ -432,7 +432,7 @@ class Telegram(unittest.TestCase):
         self.configure()
         self.server.answers["getMe"] = [(200, {"ok": True, "result": {"username": "my_bot"}})]
         self.server.answers["getChat"] = [(200, {"ok": True, "result": {"id": -1001234567890, "type": "supergroup", "title": "Inbox"}})]
-        code, out, _ = self.run_cs("telegram", "check")
+        code, out, _ = self.run_cs("plugin", "telegram", "check")
         self.assertEqual(code, 0)
         self.assertIn("@my_bot", out)
         self.assertIn("Inbox", out)
@@ -442,7 +442,7 @@ class Telegram(unittest.TestCase):
         self.server.answers["getUpdates"] = [(200, {"ok": True, "result": [
             {"update_id": 1, "my_chat_member": {"chat": {"id": -1001, "type": "supergroup", "title": "Inbox"}}},
             {"update_id": 2, "message": {"chat": {"id": 42, "type": "private", "first_name": "Me"}, "text": "/start"}}]})]
-        code, out, _ = self.run_cs("telegram", "chats")
+        code, out, _ = self.run_cs("plugin", "telegram", "chats")
         self.assertEqual(code, 0)
         self.assertIn("-1001\tsupergroup\tInbox", out)
         self.assertIn("42\tprivate\tMe", out)
@@ -451,19 +451,19 @@ class Telegram(unittest.TestCase):
     def test_proxy(self):
         self.configure(proxy="http://127.0.0.1:1")
         with mock.patch.dict(os.environ, {"no_proxy": "", "NO_PROXY": ""}):
-            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)  # went to the (dead) proxy, not to the server
         self.assertEqual(self.server.calls, [])
 
     def test_prompt_for_the_secretary_only(self):
-        self.assertIn("claudesec telegram send", self.cs.plugin_prompt({}, self.cs.SECRETARY_WHO))
+        self.assertIn("claudesec plugin telegram send", self.cs.plugin_prompt({}, self.cs.SECRETARY_WHO))
         worker = {"role": "worker", "name": "w", "agent": "claude", "discuss": False}
         self.assertEqual(self.cs.plugin_prompt({}, worker), "")
 
     def test_unexpected_error_scrubbed(self):
         self.configure()
         with mock.patch("urllib.request.OpenerDirector.open", side_effect=RuntimeError(f"boom /bot{TOKEN}/sendMessage")):
-            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+            code, _, err = self.run_cs("plugin", "telegram", "send", "-t", "hi")
         self.assertEqual(code, 1)
         self.assertIn("boom /bot<token>/sendMessage", err)
 

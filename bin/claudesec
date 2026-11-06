@@ -2260,14 +2260,16 @@ def load_agents():
 #                                  minute after the secretary starts
 #   reported(cfg, who, typ)        a worker's report was recorded; typ PROGRESS, DONE, … Runs in
 #                                  the worker's own hook: anything slow goes in a detached process
-#   commands(sub)                  subcommands of its own: sub is main()'s argparse subparsers;
+#   commands(sub)                  commands of its own, `claudesec plugin <its directory's name> …`:
+#                                  sub is that parser's argparse subparsers (required);
 #                                  sub.add_parser(…).set_defaults(fn=…), fn(args) runs the command.
-#                                  A name claudesec or a plugin before it has is skipped (stderr).
 #                                  The secretary runs `claudesec …` without a permission prompt, so
 #                                  such a command refuses itself what shouldn't happen unasked
 # cfg is config(), the plugin's own keys included; who says which session: {"role": "secretary"}
 # or {"role": "worker", "name": …, "agent": "claude" / "ttadk" / …, "discuss": bool}.
 PLUGINS = []
+PLUGINS_FAILED = {}   # name: why it didn't load
+PLUGIN_HOOKS = ("claude_args", "prompt", "answer_dialog", "reported", "commands")
 SECRETARY_WHO = {"role": "secretary"}
 
 
@@ -2283,11 +2285,13 @@ class PluginView:
 
 def load_plugins():
     for path in sorted((HOME / "plugins").glob("[!_]*/plugin.py")):
-        ns = {"__name__": f"claudesec_plugin_{path.parent.name}", "__file__": str(path), "cs": PluginView()}
+        ns = {"__name__": f"claudesec_plugin_{path.parent.name}", "__file__": str(path), "cs": PluginView(),
+              "__plugin__": path.parent.name, "__commands__": []}
         try:
             exec(compile(path.read_text(), str(path), "exec"), ns)
         except Exception as e:  # one broken plugin doesn't take claudesec down with it
             print(f"claudesec: plugin {path.parent.name} not loaded: {e}", file=sys.stderr)
+            PLUGINS_FAILED[path.parent.name] = f"{type(e).__name__}: {e}"
             continue
         PLUGINS.append(ns)
 
@@ -2312,22 +2316,50 @@ def registry_who(name, w):
     return {"role": "worker", "name": name, "agent": w.get("agent") or "claude", "discuss": w.get("mode") == "discuss"}
 
 
-class PluginCommands:
-    """main()'s subparsers as a plugin's commands() gets them: add_parser with a name already
-    taken leaves the one there and hands back a parser nobody runs."""
+def add_plugin_commands(sub):
+    """`claudesec plugin NAME …` for each plugin with commands(); NAME is its directory's, so two
+    plugins can't take the same one, nor one of claudesec's own."""
+    for ns in PLUGINS:
+        if not callable(ns.get("commands")):
+            continue
+        name = ns["__plugin__"]
+        doc = (ns.get("__doc__") or "").strip().splitlines()
+        s = sub.add_parser(name, help=doc[0] if doc else None)
+        mine = s.add_subparsers(dest="action", required=True)
+        try:
+            ns["commands"](mine)
+        except Exception as e:
+            print(f"claudesec: plugin {name}.commands: {e}", file=sys.stderr)
+        ns["__commands__"] = list(mine.choices)
 
-    def __init__(self, sub):
-        self.sub = sub
 
-    def add_parser(self, name, **kw):
-        taken = [n for n in [name, *kw.get("aliases", ())] if n in self.sub.choices]
-        if taken:
-            print(f"claudesec: a plugin's subcommand {taken[0]!r} is taken: skipped", file=sys.stderr)
-            return argparse.ArgumentParser(prog=f"claudesec {name}")
-        return self.sub.add_parser(name, **kw)
-
-    def __getattr__(self, name):
-        return getattr(self.sub, name)
+def cmd_plugin(args):
+    """The plugins: loaded (with their hooks and commands), not loaded, and the repo's not linked in."""
+    where = HOME / "plugins"
+    print(tr(f"插件（{where}）：", f"Plugins ({where}):"))
+    for ns in PLUGINS:
+        d = Path(ns["__file__"]).parent
+        linked = f" → {d.resolve()}" if d.is_symlink() else ""
+        hooks = [h for h in PLUGIN_HOOKS if callable(ns.get(h))]
+        print(f"  {ns['__plugin__']}{linked}")
+        print(tr(f"    挂载点：{' '.join(hooks) or '无'}", f"    hooks: {' '.join(hooks) or 'none'}"))
+        if ns["__commands__"]:
+            print(tr("    命令：", "    commands: ") + f"claudesec plugin {ns['__plugin__']} {'|'.join(ns['__commands__'])}")
+    for name, why in PLUGINS_FAILED.items():
+        print(tr(f"  {name}：没加载上（{why}）", f"  {name}: not loaded ({why})"))
+    if not PLUGINS and not PLUGINS_FAILED:
+        print(tr("  （没有）", "  (none)"))
+    have = {ns["__plugin__"] for ns in PLUGINS} | set(PLUGINS_FAILED)
+    spare = [d for d in sorted((REPO / "plugins").glob("[!_]*/plugin.py")) if d.parent.name not in have]
+    if spare:
+        print(tr("repo 里有、没启用的（链接进来就启用，再 claudesec --restart）：",
+                 "In the repo, not enabled (link one in to enable it, then claudesec --restart):"))
+        for d in spare:
+            first = re.match(r'\s*(?:"""|\'\'\')(.*)', d.read_text())  # its docstring's first line
+            doc = first.group(1).strip() if first else ""
+            print(f"  {d.parent.name}{'  ' + doc if doc else ''}")
+            print(f"    mkdir -p {where} && ln -s {d.parent} {where / d.parent.name}")
+    print(tr("各插件的说明在它目录里的 README.md。", "Each plugin's README.md is in its directory."))
 
 
 def plugin_args(cfg, who):
@@ -6030,7 +6062,9 @@ def main():
     s.add_argument("correction"); s.set_defaults(fn=cmd_lesson)
     s = sub.add_parser("hook"); s.add_argument("event", choices=HOOKS); s.add_argument("name", nargs="?")
     s.set_defaults(fn=cmd_hook)
-    plugin_calls("commands", PluginCommands(sub))
+    s = sub.add_parser("plugin", help="list the plugins; `plugin NAME …` runs a plugin's commands")
+    s.set_defaults(fn=cmd_plugin)
+    add_plugin_commands(s.add_subparsers(dest="plugin"))
 
     argv = sys.argv[1:]
     if not argv or argv[0].startswith("-") and argv[0] not in ("-h", "--help"):

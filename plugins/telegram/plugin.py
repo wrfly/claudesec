@@ -1,8 +1,8 @@
 """Telegram: send the user text and files through a bot, to one chat (a group, usually).
 
-    claudesec telegram send [-t TEXT | -t -] [--document] [FILE ...]
-    claudesec telegram check     the bot and the chat it sends to
-    claudesec telegram chats     the chats the bot has seen lately, to find the chat_id
+    claudesec plugin telegram send [-t TEXT | -t -] [--document] [FILE ...]
+    claudesec plugin telegram check     the bot and the chat it sends to
+    claudesec plugin telegram chats     the chats the bot has seen lately, to find the chat_id
 
 Only sends: it doesn't read the chat for messages. Config is $CLAUDESEC_HOME/telegram.json, mode 600:
     {"bot_token": "123456:ABC...", "chat_id": -1001234567890}
@@ -112,8 +112,8 @@ def private_dirs(conf):
                             f"allow_private in {conf_path()}: {shown(d)} isn't an absolute path (~/ is fine)"))
         d = d.resolve()
         if any(under(h, d) for h in homes()):
-            print(tr(f"claudesec telegram: allow_private 里的 {shown(d)} 是家目录或更上层，不算",
-                     f"claudesec telegram: allow_private's {shown(d)} is the home directory or above it: ignored"), file=sys.stderr)
+            print(tr(f"claudesec plugin telegram: allow_private 里的 {shown(d)} 是家目录或更上层，不算",
+                     f"claudesec plugin telegram: allow_private's {shown(d)} is the home directory or above it: ignored"), file=sys.stderr)
             continue
         out.append(d)
     return out
@@ -194,8 +194,8 @@ def setup_text(path):
    umask 077; cat > {path} <<'EOF'
    {{"bot_token": "123456:ABC…", "chat_id": -100…}}
    EOF
-   不知道 chat_id：先只写 bot_token，跑 claudesec telegram chats 看 bot 见过的群和它们的 id，再补上
-4. claudesec telegram check 验证""",
+   不知道 chat_id：先只写 bot_token，跑 claudesec plugin telegram chats 看 bot 见过的群和它们的 id，再补上
+4. claudesec plugin telegram check 验证""",
               f"""Telegram isn't set up ({path} doesn't exist). For the user to do (don't paste the token into a chat):
 1. In Telegram, ask @BotFather for /newbot and keep the token it gives (like 123456:ABC…)
 2. Add the bot to the group that should get things, and send /start@the_bot_username there
@@ -203,8 +203,8 @@ def setup_text(path):
    umask 077; cat > {path} <<'EOF'
    {{"bot_token": "123456:ABC…", "chat_id": -100…}}
    EOF
-   No chat_id yet: write just bot_token, run claudesec telegram chats for the chats the bot has seen, then add it
-4. claudesec telegram check to try it""")
+   No chat_id yet: write just bot_token, run claudesec plugin telegram chats for the chats the bot has seen, then add it
+4. claudesec plugin telegram check to try it""")
 
 
 def load_conf(need_chat=True):
@@ -226,8 +226,8 @@ def load_conf(need_chat=True):
     _token[:] = [token]
     chat = str(conf.get("chat_id") or "").strip()
     if need_chat and not CHAT_RE.match(chat):
-        raise Failed(tr(f"{path} 缺 chat_id（群的 id 形如 -100…）：claudesec telegram chats 列出 bot 见过的群",
-                        f"{path} has no chat_id (a group's is like -100…): claudesec telegram chats lists the ones the bot has seen"))
+        raise Failed(tr(f"{path} 缺 chat_id（群的 id 形如 -100…）：claudesec plugin telegram chats 列出 bot 见过的群",
+                        f"{path} has no chat_id (a group's is like -100…): claudesec plugin telegram chats lists the ones the bot has seen"))
     out = {"token": token, "chat_id": chat, "proxy": conf.get("proxy"),
            "api_base": str(conf.get("api_base") or API_BASE).rstrip("/"), "allow_private": conf.get("allow_private")}
     out["allow_private"] = private_dirs(out)
@@ -430,24 +430,23 @@ def run(fn):
         try:
             fn(args)
         except Failed as e:
-            print(f"claudesec telegram: {shown(e)}", file=sys.stderr)
+            print(f"claudesec plugin telegram: {shown(e)}", file=sys.stderr)
             sys.exit(1)
         except Exception as e:  # no traceback: one could carry the URL, and the URL has the token
-            print(f"claudesec telegram: {type(e).__name__}: {scrub(e)}", file=sys.stderr)
+            print(f"claudesec plugin telegram: {type(e).__name__}: {scrub(e)}", file=sys.stderr)
             sys.exit(1)
     return go
 
 
 def commands(sub):
-    s = sub.add_parser("telegram", help="send the user text and files through a Telegram bot")
-    t = s.add_subparsers(dest="action", required=True)
-    x = t.add_parser("send")
+    """claudesec plugin telegram send / check / chats"""
+    x = sub.add_parser("send", help="text and files to the chat")
     x.add_argument("files", nargs="*")
     x.add_argument("-t", "--text", help="the text; - reads it from stdin")
     x.add_argument("--document", action="store_true", help="pictures as files too (not recompressed)")
     x.set_defaults(fn=run(cmd_send))
-    t.add_parser("check").set_defaults(fn=run(cmd_check))
-    t.add_parser("chats").set_defaults(fn=run(cmd_chats))
+    sub.add_parser("check", help="the bot and the chat it sends to").set_defaults(fn=run(cmd_check))
+    sub.add_parser("chats", help="the chats the bot has seen lately").set_defaults(fn=run(cmd_chats))
 
 
 def prompt(cfg, who):
@@ -455,10 +454,10 @@ def prompt(cfg, who):
         return ""
     return """## 发到 Telegram
 
-用户让你把东西「发给我」（一段文字、文件、截图、二维码）时，用 `claudesec telegram send` 发到配好的 Telegram 群里：
-- 文件：`claudesec telegram send /绝对路径/a.png /绝对路径/b.pdf`。png / jpg / webp 按图片发（会压缩），别的按文件发；
+用户让你把东西「发给我」（一段文字、文件、截图、二维码）时，用 `claudesec plugin telegram send` 发到配好的 Telegram 群里：
+- 文件：`claudesec plugin telegram send /绝对路径/a.png /绝对路径/b.pdf`。png / jpg / webp 按图片发（会压缩），别的按文件发；
   要原图（截图要看清字、二维码要扫）加 `--document`
-- 文字：`-t '一句话'`；长的、带引号的从 stdin 读：`claudesec telegram send -t - [文件…] <<'EOF'` … `EOF`。
+- 文字：`-t '一句话'`；长的、带引号的从 stdin 读：`claudesec plugin telegram send -t - [文件…] <<'EOF'` … `EOF`。
   文字配一个文件时当它的说明一起发
 - 文件在 worker 那里：让 worker 在汇报里给绝对路径，你来发
 - 凭据发不了：telegram.json、~/.ssh 这类凭据目录、私钥、含 token 的文件都拒；只有属主能读的（600）只在用户列进

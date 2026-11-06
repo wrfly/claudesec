@@ -8,7 +8,7 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
 
 | Hook | What |
 |---|---|
-| `commands` | `claudesec telegram send / check / chats` (below). The secretary may run `claudesec …` without a permission prompt, so sending never stops on one |
+| `commands` | `claudesec plugin telegram send / check / chats` (below; `claudesec plugin` lists the plugins). The secretary may run `claudesec …` without a permission prompt, so sending never stops on one |
 | `prompt` | a few lines in the secretary's system prompt: when the user asks to be sent something, how to use `send`. Workers' prompts are unchanged |
 
 ## Setting it up
@@ -20,6 +20,7 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
 
        repo=$(dirname "$(dirname "$(readlink -f ~/.local/bin/claudesec)")")   # this checkout
        mkdir -p ~/.claudesec/plugins && ln -s "$repo/plugins/telegram" ~/.claudesec/plugins/telegram
+       claudesec plugin             # telegram → …/plugins/telegram, its hooks and commands
 
 4. Write the config yourself, readable only by you (claudesec refuses one others can read). Don't paste
    the token into a chat with the secretary: it would sit in the conversation's transcript.
@@ -27,12 +28,12 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
        umask 077; cat > ~/.claudesec/telegram.json <<'EOF'
        {"bot_token": "123456:ABC…"}
        EOF
-       claudesec telegram chats     # the chats the bot has seen in the last day: id, type, title
+       claudesec plugin telegram chats     # the chats the bot has seen in the last day: id, type, title
 
    Then add the group's id (`-100…`) as `"chat_id"`: `{"bot_token": "…", "chat_id": -100…}`.
 5. Try it, and restart the secretary so its prompt has the new lines:
 
-       claudesec telegram check     # bot @… → supergroup "…" (-100…): ready
+       claudesec plugin telegram check     # bot @… → supergroup "…" (-100…): ready
        claudesec --restart
 
 `~/.claudesec/telegram.json`:
@@ -47,14 +48,14 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
 
 ## Commands
 
-    claudesec telegram send /abs/shot.png /abs/report.pdf     # png / jpg / webp as photos, the rest as files
-    claudesec telegram send --document /abs/qr.png            # pictures as files: no recompression
-    claudesec telegram send -t 'one line' [FILE]              # text; with one file it goes as that file's caption
-    claudesec telegram send -t - [FILE…] <<'EOF'              # long text, or text with quotes, from stdin
+    claudesec plugin telegram send /abs/shot.png /abs/report.pdf     # png / jpg / webp as photos, the rest as files
+    claudesec plugin telegram send --document /abs/qr.png            # pictures as files: no recompression
+    claudesec plugin telegram send -t 'one line' [FILE]              # text; with one file it goes as that file's caption
+    claudesec plugin telegram send -t - [FILE…] <<'EOF'              # long text, or text with quotes, from stdin
     …
     EOF
-    claudesec telegram check                                  # the bot and the chat it sends to
-    claudesec telegram chats                                  # chats the bot has seen, to find chat_id
+    claudesec plugin telegram check                                  # the bot and the chat it sends to
+    claudesec plugin telegram chats                                  # chats the bot has seen, to find chat_id
 
 Every file is checked first, and one bad path means nothing is sent: it must be there, not empty, at
 most 50MB (the Bot API's limit), and not a secret. The secretary runs this without a permission prompt,

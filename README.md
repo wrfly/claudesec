@@ -116,6 +116,7 @@ The catch: Shift+Enter now always sends that sequence, so a shell outside tmux m
     claudesec queue doctor     # check queue.md (line-number prefixes, doubled sections, numbers twice); --fix repairs
     claudesec model W M        # switch worker W to model M (restarts it, conversation kept); the way for Cursor and Codex workers
     claudesec discuss W on|off # worker W into discussion mode (talks with the user in its window, no report each turn) or back
+    claudesec plugin           # the plugins: loaded (hooks, commands), failed, and the repo's not yet linked in
 
 Every item in the queue pane has a number: reply to the secretary "12 A" or "15 no need" to answer that item.
 
@@ -150,8 +151,11 @@ These are not in the repo:
 - The secretary's Claude Code memory: preferences on this machine.
 - Plugins, `~/.claudesec/plugins/<name>/plugin.py`: what only this machine needs (another launcher's
   flags, a dialog it brings up). Each may add arguments to the Claude Code sessions claudesec starts,
-  text to their system prompts, and answer a dialog of its own on their screens; the comment above
-  `load_plugins` in `bin/claudesec` has the interface. Without a plugins directory nothing changes.
+  text to their system prompts, commands of its own (`claudesec plugin <name> …`), and answer a dialog of its own on
+  their screens; the comment above `load_plugins` in `bin/claudesec` has the interface. Without a
+  plugins directory nothing changes. Optional plugins that anyone may want come in the repo's
+  `plugins/`, each off until linked into `~/.claudesec/plugins/`; `claudesec plugin` lists what's loaded and what isn't:
+  [`plugins/telegram`](plugins/telegram/README.md) sends you what you ask the secretary to send, through a Telegram bot.
 
 To bring the history along, copy `~/.claudesec/history/`. The session ids in its task files can be
 `--resume`d only on the original machine.

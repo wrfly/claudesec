@@ -1,10 +1,13 @@
 """Plugins in $CLAUDESEC_HOME/plugins/<name>/plugin.py: none, and nothing is different; one adds
 arguments and prompt text to the Claude Code sessions claudesec starts (knowing which session),
-answers a dialog of its own, and hears of reports; a broken one is skipped.
+answers a dialog of its own, hears of reports, and adds commands under `claudesec plugin NAME`;
+`claudesec plugin` lists them; a broken one is skipped.
 
     python3 -m unittest discover -s tests
 """
 import argparse
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -33,6 +36,11 @@ def answer_dialog(target, screen):
 
 def reported(cfg, who, typ):
     seen.append((who, typ))
+
+def commands(sub):
+    s = sub.add_parser("hello")
+    s.add_argument("who")
+    s.set_defaults(fn=lambda args: seen.append(("hello", args.who)))
 '''
 
 
@@ -117,6 +125,57 @@ class Plugins(unittest.TestCase):
         cs.record_report("t", "TYPE: DONE\nDID: talked")
         self.assertEqual(cs.PLUGINS[0]["seen"],
                          [({"role": "worker", "name": "t", "agent": "claude", "discuss": True}, "DONE")])
+
+    def test_its_commands_run_under_plugin(self):
+        cs = self.load({"p": PLUGIN})
+        with mock.patch("sys.argv", ["claudesec", "plugin", "p", "hello", "you"]):
+            cs.main()
+        self.assertEqual(cs.PLUGINS[0]["seen"], [("hello", "you")])
+        with mock.patch("sys.argv", ["claudesec", "hello", "you"]), mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):  # not at the top level
+                cs.main()
+
+    def test_same_command_names_in_two_plugins(self):
+        theirs = "def commands(sub):\n    sub.add_parser('hello').set_defaults(fn=lambda a: seen.append('q'))\nseen = []\n"
+        cs = self.load({"p": PLUGIN, "q": theirs, "hook": theirs})  # a plugin may even be called like a command
+        for argv in (["plugin", "p", "hello", "you"], ["plugin", "q", "hello"], ["plugin", "hook", "hello"]):
+            with mock.patch("sys.argv", ["claudesec", *argv]):
+                cs.main()
+        self.assertEqual([ns["seen"] for ns in cs.PLUGINS], [["q"], [("hello", "you")], ["q"]])
+        with mock.patch("sys.argv", ["claudesec", "hook", "nope"]), mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):  # claudesec's own hook is untouched: "nope" isn't one of its events
+                cs.main()
+
+    def run_plugin_list(self, cs):
+        out = io.StringIO()
+        with mock.patch("sys.argv", ["claudesec", "plugin"]), contextlib.redirect_stdout(out):
+            cs.main()
+        return out.getvalue()
+
+    def test_plugin_lists_them(self):
+        (self.home / "config.json").write_text(json.dumps({"language": "en"}))
+        with mock.patch("sys.stderr"):
+            cs = self.load({"p": PLUGIN, "x-broken": "raise RuntimeError('no')\n"})
+        cs.lang.cache_clear()
+        cs.REPO = self.home / "repo"
+        (cs.REPO / "plugins" / "spare").mkdir(parents=True)
+        (cs.REPO / "plugins" / "spare" / "plugin.py").write_text('"""Spare: does a thing."""\n')
+        (cs.REPO / "plugins" / "p").mkdir()
+        (cs.REPO / "plugins" / "p" / "plugin.py").write_text("")
+        said = self.run_plugin_list(cs)
+        self.assertIn("  p\n    hooks: claude_args prompt answer_dialog reported commands\n", said)
+        self.assertIn("commands: claudesec plugin p hello", said)
+        self.assertIn("x-broken: not loaded (RuntimeError: no)", said)
+        self.assertIn("  spare  Spare: does a thing.", said)
+        self.assertIn(f"ln -s {cs.REPO / 'plugins' / 'spare'} {self.home / 'plugins' / 'spare'}", said)
+        self.assertNotIn("ln -s " + str(cs.REPO / "plugins" / "p"), said)  # p is loaded already
+
+    def test_plugin_lists_none(self):
+        (self.home / "config.json").write_text(json.dumps({"language": "en"}))
+        cs = self.load()
+        cs.lang.cache_clear()
+        cs.REPO = self.home / "repo"
+        self.assertIn("(none)", self.run_plugin_list(cs))
 
     def test_a_broken_plugin_is_skipped(self):
         with mock.patch("sys.stderr"):

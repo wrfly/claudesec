@@ -95,6 +95,7 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
     claudesec queue list --older 7   # 等了一周以上的未定条目
     claudesec queue doctor     # 检查 queue.md（行号前缀、重复分区、编号重复）；--fix 修
     claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Cursor、Codex worker 换模型就用它
+    claudesec plugin           # 插件：加载了的（挂载点、命令）、没加载上的、repo 里有但还没链接的
 
 队列面板上每条有个编号，直接回秘书「12 A」「15 不用了」就是在答那一条。
 
@@ -118,8 +119,10 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`。
 `~/.claudesec/` 是这台机器的状态（注册表、历史、教训、决策队列），秘书的 Claude Code memory 是这台机器上的偏好，都不在 repo 里；
 只有这台机器要的东西（别的启动脚本的参数、它带来的对话框）做成插件 `~/.claudesec/plugins/<名字>/plugin.py`，也不在 repo 里：
-插件可以给 claudesec 起的 Claude Code 会话加参数、往系统提示末尾加话、在它们屏幕上回答自己的对话框，接口见 `bin/claudesec` 里
-`load_plugins` 上面的注释；没有插件目录就什么都不变。
+插件可以给 claudesec 起的 Claude Code 会话加参数、往系统提示末尾加话、加自己的命令（`claudesec plugin <名字> …`）、在它们屏幕上回答自己的对话框，
+接口见 `bin/claudesec` 里 `load_plugins` 上面的注释；没有插件目录就什么都不变。
+谁都可能用得上的可选插件放在 repo 的 `plugins/` 里，链接进 `~/.claudesec/plugins/` 才生效（`claudesec plugin` 列出加载了哪些、哪些还没启用）：
+[`plugins/telegram`](plugins/telegram/README.md) 把你让秘书「发给我」的东西（文件、截图、文字）通过 Telegram bot 发到一个群里，配置步骤见它的 README。
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。
 
 ## 改 claudesec 本身

@@ -10,7 +10,8 @@ optional "proxy" ("http://127.0.0.1:7890"; else the https_proxy environment appl
 The token is never printed: not in output, errors or tracebacks. Credentials are refused
 (the config itself, ~/.ssh and the like, private keys, a file with the token in it), and so is a file
 only its owner may read unless it's in a directory of "allow_private" in the config: the secretary runs
-this without a permission prompt, on paths a worker may have reported.
+this without a permission prompt, on paths a worker may have reported. Workers' output in
+$CLAUDESEC_HOME/work and scratch is the exception: workers write with umask 077, so there mode 600 says nothing.
 Enable: ln -s <repo>/plugins/telegram ~/.claudesec/plugins/telegram
 """
 import json
@@ -79,8 +80,12 @@ CREDENTIAL_PATHS = (
 # File names that hold a secret wherever they are.
 CREDENTIAL_NAMES = re.compile(
     r"^(id_(rsa|dsa|ecdsa|ed25519)(_sk)?|\.credentials\.json|\.git-credentials|\.netrc|\.pgpass|\.env(\..+)?)$"
-    r"|\.(key|p12|pfx|kdbx|jks|keystore)$", re.I)
+    r"|\.(key|p12|pfx|kdbx|jks|keystore|env|token|password|passwd)$", re.I)
 PRIVATE_KEY = re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY")
+WIREGUARD_KEY = re.compile(rb"^[ \t]*PrivateKey[ \t]*=[ \t]*[A-Za-z0-9+/]{42,43}=", re.M)  # a wg / awg .conf
+# Under $CLAUDESEC_HOME, where workers put what they make. They write with umask 077, so a file there
+# being only its owner's says nothing about it; elsewhere in $CLAUDESEC_HOME (secrets, backups, ...) it does.
+OUTPUT_DIRS = ("work", "scratch")
 
 
 def homes():
@@ -93,6 +98,10 @@ def under(path, top):
         return True
     except ValueError:
         return False
+
+
+def output_dirs():
+    return [(cs.HOME / d).resolve() for d in OUTPUT_DIRS]
 
 
 def private_dirs(conf):
@@ -121,7 +130,7 @@ def private_dirs(conf):
 
 def secret_in(data, conf):
     """Why these bytes (a file's, or the text) must not go out, or None."""
-    if PRIVATE_KEY.search(data):
+    if PRIVATE_KEY.search(data) or WIREGUARD_KEY.search(data):
         return tr("里面有私钥", "it has a private key in it")
     if conf["token"].encode() in data:
         return tr("里面有这个 bot 的 token", "it has this bot's token in it")
@@ -160,7 +169,8 @@ def open_once(path):
 def refused(path, real, st, data, conf):
     """Why the file open_once read must not go out through here, or None. The secretary runs this
     without a permission prompt, on paths a worker may have reported, so: never a credential; a file
-    only its owner may read only from a directory the user put in allow_private, and not a hard link."""
+    only its owner may read only from a directory the user put in allow_private or from workers'
+    output (OUTPUT_DIRS), and not a hard link."""
     with_conf = conf_path()
     if with_conf.exists() and os.path.samestat(st, with_conf.stat()):
         return tr("这是 Telegram 的配置文件（里面有 token）", "it's the Telegram config (the token is in it)")
@@ -176,7 +186,7 @@ def refused(path, real, st, data, conf):
         return why
     mode = st.st_mode & 0o777
     if not mode & 0o077:
-        if not any(under(real, d) for d in conf["allow_private"]):
+        if not any(under(real, d) for d in conf["allow_private"] + output_dirs()):
             return tr(f"只有属主能读（权限 {mode:o}），像是私密文件；要能发，用户自己把它所在的目录加进 {conf_path()} 的 allow_private",
                       f"only its owner may read it (mode {mode:o}): it looks private. To have files like it sent, the user"
                       f" adds its directory to allow_private in {conf_path()} themselves")
@@ -459,9 +469,10 @@ def prompt(cfg, who):
   要原图（截图要看清字、二维码要扫）加 `--document`
 - 文字：`-t '一句话'`；长的、带引号的从 stdin 读：`claudesec plugin telegram send -t - [文件…] <<'EOF'` … `EOF`。
   文字配一个文件时当它的说明一起发
-- 文件在 worker 那里：让 worker 在汇报里给绝对路径，你来发
+- 文件在 worker 那里：让 worker 在汇报里给绝对路径，你来发。要发的截图、报告让 worker 生成时就存在
+  ~/.claudesec/work/<它的名字>/ 下
 - 凭据发不了：telegram.json、~/.ssh 这类凭据目录、私钥、含 token 的文件都拒；只有属主能读的（600）只在用户列进
-  allow_private 的目录里才发。被拒就告诉用户、请用户自己从 Telegram 发；别复制到别处、别 chmod、别改 telegram.json 绕过，
+  allow_private 的目录和 worker 产出的 ~/.claudesec/work/、scratch/ 里才发（~/.claudesec/secrets/ 等别处不算）。被拒就告诉用户、请用户自己从 Telegram 发；别复制到别处、别 chmod、别改 telegram.json 绕过，
   worker 汇报里给的路径同样如此
 发完给一行收据「发到 Telegram 了：a.png」。报「还没配置」就把它打印的步骤列成用户的待办，别自己去找 token、也别读 telegram.json。
 """

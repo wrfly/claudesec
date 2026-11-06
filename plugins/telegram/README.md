@@ -65,15 +65,18 @@ on paths a worker may have reported, so:
   home directory (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.password-store`,
   `~/.config/gh`, `~/.config/gcloud`, `~/.config/rclone`, browser profiles, `~/.netrc`, `~/.git-credentials`,
   `~/.npmrc`, `~/.pypirc`, … `CREDENTIAL_PATHS` in `plugin.py` has them all), files named like one
-  (`id_rsa`, `id_ed25519`, `.env`, `.credentials.json`, `*.key`, `*.p12`, …), and any file with a private
-  key or the bot's token in it; text with one in it either. Checked on the path given and on the file
-  it links to. Each file is opened once, and the bytes checked are the bytes sent.
-- **sent only from `allow_private`**: a file only its owner may read (mode 600 and the like). Put the
-  directories of private files that are meant for you (VPN QR codes, say) in `allow_private` yourself.
+  (`id_rsa`, `id_ed25519`, `.env`, `*.env`, `.credentials.json`, `*.key`, `*.token`, `*.password`, `*.p12`,
+  …), and any file with a private key (PEM, or WireGuard's `PrivateKey =`) or the bot's token in it; text
+  with one in it either. Checked on the path given and on the file it links to. Each file is opened once, and the bytes checked are the bytes sent.
+- **sent only from `allow_private`, or from workers' output**: a file only its owner may read (mode 600
+  and the like). Put the directories of private files that are meant for you (VPN QR codes, say) in
+  `allow_private` yourself. Workers write with umask 077, so in `~/.claudesec/work/` and
+  `~/.claudesec/scratch/`, where their screenshots and reports go, mode 600 says nothing and doesn't count;
+  anywhere else in `~/.claudesec` (`secrets/`, `backups/`, …) it does, as outside it.
   A private file with more than one hard link is refused even there (it may be a file from elsewhere).
   The secretary can't change that list without your say: `telegram.json` is outside what it may do
   unasked, and its prompt tells it not to.
-- everything else, `~/.claudesec` included (reports, workers' output), goes.
+- everything else goes.
 
 There's no flag to override any of it. A file that's refused, you send from Telegram yourself.
 

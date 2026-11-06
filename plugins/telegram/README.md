@@ -41,7 +41,7 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
 |---|---|
 | `bot_token` | from @BotFather. Never printed: not in output, errors or tracebacks |
 | `chat_id` | where everything goes: a group's id (`-100…`), a user's (a number), or a public channel's `@name` |
-| `proxy` | optional, e.g. `"http://127.0.0.1:7890"`, where api.telegram.org isn't reachable directly. Without it `https_proxy` from the environment applies |
+| `proxy` | optional, e.g. `"http://127.0.0.1:7890"`, where api.telegram.org isn't reachable directly. Without it `https_proxy` from the environment applies. http(s) proxies only: for a socks one use its http port |
 | `api_base` | optional, default `https://api.telegram.org` (a local Bot API server, or the tests' fake one) |
 
 ## Commands
@@ -55,11 +55,19 @@ It's a plugin (see the comment above `load_plugins` in `bin/claudesec`), off unt
     claudesec telegram check                                  # the bot and the chat it sends to
     claudesec telegram chats                                  # chats the bot has seen, to find chat_id
 
-Every file is checked first (there, not empty, at most 50MB, the Bot API's limit): one bad path and
-nothing is sent. Text over 4096 characters goes in several messages, cut between lines; text with
-two or more files goes first as a message of its own. A picture Telegram won't take as a photo (over
-10MB, an odd shape) goes as a file. Telegram asking to slow down (429) is waited out, up to three times.
-The exit status is 1 on any failure, with Telegram's reason on stderr.
+Every file is checked first, and one bad path means nothing is sent: it must be there, not empty, at
+most 50MB (the Bot API's limit), and not look private. Refused: `telegram.json` itself (under any name),
+a file only its owner may read (mode 600 and the like), anything under a dot directory of the home
+directory (`~/.ssh`, `~/.claudesec`, …). There's no flag to override that: the secretary runs this
+without a permission prompt, on paths a worker may have reported, so a file like that you send from
+Telegram yourself.
+
+Text over 4096 characters goes in up to three messages, cut between lines; longer than that, as one
+`message.txt`. Text with two or more files goes first as a message of its own. A picture Telegram
+won't take as a photo (`PHOTO_…` / `IMAGE_…` / dimensions errors) goes as a file. Telegram asking to slow
+down (429) is waited out up to 60 seconds in all, then it gives up and says how long Telegram wants.
+Each message is reported on stdout as it goes; the exit status is 1 on any failure, with Telegram's
+reason on stderr.
 
 ## Tests
 

@@ -1,7 +1,8 @@
 """plugins/telegram, linked into a temporary $CLAUDESEC_HOME the way a user enables it, sending to a
 fake Bot API on 127.0.0.1 (never api.telegram.org): text, photos with a caption, files, long text in
-pieces, a 429 waited out, a photo Telegram refuses sent as a file; no config, a config others can
-read, a missing file: refused before anything is sent. The token shows up in no output.
+pieces or as message.txt, a 429 waited out (a long one not), a photo Telegram refuses sent as a file;
+no config, a config others can read, a missing file, a file that looks private (the config, mode 600, a
+dot directory of the home directory): refused before anything is sent. The token shows up in no output.
 
     python3 -m unittest discover -s tests
 """
@@ -81,7 +82,9 @@ class Telegram(unittest.TestCase):
         self.cs = load(self.home)
         self.server = FakeBotAPI()
         threading.Thread(target=self.server.serve_forever, args=(0.02,), daemon=True).start()
-        self.env = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        self.user_home = Path(self.tmp.name) / "user"   # $HOME, for the dot-directory rule
+        self.user_home.mkdir()
+        self.env = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*", "HOME": str(self.user_home)})
         self.env.start()
         self.files = self.home / "out"
         self.files.mkdir()
@@ -115,6 +118,7 @@ class Telegram(unittest.TestCase):
     def file(self, name, data=b"hello"):
         path = self.files / name
         path.write_bytes(data)
+        path.chmod(0o644)
         return str(path)
 
     def methods(self):
@@ -180,6 +184,99 @@ class Telegram(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.methods(), ["sendPhoto", "sendDocument"])
         self.assertIn("sent: file tall.png", out)
+
+    def test_text_too_long_goes_as_a_file(self):
+        self.configure()
+        text = "\n".join(f"line {i} " + "x" * 90 for i in range(200))  # ~20000 characters: 5 messages
+        code, out, _ = self.run_cs("telegram", "send", "-t", text)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.methods(), ["sendDocument"])
+        self.assertEqual(self.server.calls[0][3], {"document": ("message.txt", text.encode())})
+        self.assertIn("message.txt", out)
+
+    def test_each_message_reported_as_it_goes(self):
+        self.configure()
+        self.server.answers["sendMessage"] = [(200, {"ok": True, "result": {}}),
+                                              (400, {"ok": False, "error_code": 400, "description": "Bad Request: nope"})]
+        code, out, err = self.run_cs("telegram", "send", "-t", "\n".join("y" * 90 for _ in range(60)))
+        self.assertEqual(code, 1)
+        self.assertIn("sent: text 1/2", out)
+        self.assertIn("nope", err)
+
+    def test_other_photo_errors_not_retried_as_file(self):
+        self.configure()
+        self.server.answers["sendPhoto"] = [(400, {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"})]
+        code, _, err = self.run_cs("telegram", "send", self.file("a.png", PNG))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.methods(), ["sendPhoto"])
+        self.assertIn("sendPhoto: Bad Request: chat not found", err)
+
+    def test_long_429_not_waited(self):
+        self.configure()
+        self.server.answers["sendMessage"] = [
+            (429, {"ok": False, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 40}}),
+            (429, {"ok": False, "error_code": 429, "description": "Too Many Requests", "parameters": {"retry_after": 30}})]
+        with mock.patch("time.sleep") as slept:
+            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        self.assertEqual(code, 1)
+        slept.assert_called_once_with(40)  # 40 + 30 is over the minute
+        self.assertIn("30s", err)
+
+    def test_config_not_sent(self):
+        self.configure()
+        (self.files / "innocent.txt").symlink_to(self.home / "telegram.json")
+        for path in (self.home / "telegram.json", self.files / "innocent.txt"):
+            code, _, err = self.run_cs("telegram", "send", "-t", "here", str(path))
+            self.assertEqual(code, 1)
+            self.assertIn("Telegram config", err)
+        self.assertEqual(self.server.calls, [])
+
+    def test_private_files_not_sent(self):
+        self.configure()
+        secret = self.file("id_ed25519", b"-----BEGIN OPENSSH PRIVATE KEY-----")
+        Path(secret).chmod(0o600)
+        (self.user_home / ".ssh").mkdir()
+        key = self.user_home / ".ssh" / "id_rsa.pub"
+        key.write_bytes(b"ssh-rsa AAAA")
+        key.chmod(0o644)
+        (self.files / "link").symlink_to(key)
+        for path, why in ((secret, "only its owner may read it"), (str(key), "dot directory"),
+                          (str(self.files / "link"), "dot directory")):
+            code, _, err = self.run_cs("telegram", "send", self.file("fine.png", PNG), path)
+            self.assertEqual(code, 1)
+            self.assertIn(why, err)
+            self.assertIn("the user sends it from Telegram", err)
+        self.assertEqual(self.server.calls, [])
+
+    def test_name_not_in_utf8(self):
+        self.configure()
+        name = os.fsdecode(b"\xffnotes.txt")
+        code, out, _ = self.run_cs("telegram", "send", self.file(name))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.methods(), ["sendDocument"])
+        self.assertEqual(self.server.calls[0][3]["document"][1], b"hello")
+        self.assertIn("notes.txt", out)
+
+    def test_socks_proxy_said_plainly(self):
+        self.configure(proxy="socks5://me:hunter2@127.0.0.1:1080")
+        code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        self.assertEqual(code, 1)
+        self.assertIn("socks5:// proxy: only http(s) proxies", err)
+        self.assertNotIn("hunter2", err)
+        self.configure()
+        with mock.patch.dict(os.environ, {"https_proxy": "socks5h://127.0.0.1:1080", "no_proxy": ""}):
+            code, _, err = self.run_cs("telegram", "send", "-t", "hi")
+        self.assertIn("https_proxy is a socks5h:// proxy", err)
+        self.assertEqual(self.server.calls, [])
+
+    def test_chats_when_updates_go_elsewhere(self):
+        self.configure(chat_id=None)
+        self.server.answers["getUpdates"] = [(409, {"ok": False, "error_code": 409,
+            "description": "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"})]
+        code, _, err = self.run_cs("telegram", "chats")
+        self.assertEqual(code, 1)
+        self.assertNotIn("deleteWebhook", err)
+        self.assertIn("Don't delete the webhook", err)
 
     def test_429_waited_out(self):
         self.configure()

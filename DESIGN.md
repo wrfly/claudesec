@@ -187,6 +187,9 @@ tmux pane id，`SendMessage` 可互发。
    谁都可能要、但不是人人要的（Telegram 发送）放 repo 的 `plugins/<名字>/`，用户 `ln -s` 进插件目录才生效。
    给秘书的新动作做成 `claudesec` 子命令而不是 MCP 工具：秘书带 `--allowedTools Bash(claudesec *)`，不弹权限框，
    也不用多一个常驻的 MCP 进程、不碰 Claude Code 的配置目录。
+   代价：插件的子命令也就进了秘书免确认的范围，所以要它自己拒掉不该不问就做的事
+   （Telegram 不发配置文件、只有属主能读的文件、家目录点目录里的东西，被拒就让用户自己发）。
+   跟内置命令或先加载的插件重名的子命令跳过并打到 stderr，不覆盖。
 
 ### 3.2 组件（已实现）
 

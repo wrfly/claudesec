@@ -129,6 +129,20 @@ class Plugins(unittest.TestCase):
             cs.main()
         self.assertEqual(cs.PLUGINS[0]["seen"], [("hello", "you")])
 
+    def test_a_taken_subcommand_is_skipped(self):
+        theirs = "def commands(sub):\n    sub.add_parser('hook')\n    sub.add_parser('hello')\n"
+        with mock.patch("sys.stderr") as err:
+            cs = self.load({"p": PLUGIN, "q-theirs": theirs})
+            with mock.patch("sys.argv", ["claudesec", "hello", "you"]):
+                cs.main()
+        self.assertEqual(cs.PLUGINS[0]["seen"], [("hello", "you")])  # the first plugin's, not q's
+        said = "".join(c.args[0] for c in err.write.call_args_list)
+        self.assertIn("'hook' is taken", said)
+        self.assertIn("'hello' is taken", said)
+        with mock.patch("sys.argv", ["claudesec", "hook", "nope"]), mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):  # still claudesec's own hook: "nope" isn't one of its events
+                cs.main()
+
     def test_a_broken_plugin_is_skipped(self):
         with mock.patch("sys.stderr"):
             cs = self.load({"a-broken": "raise RuntimeError('no')\n", "b-good": PLUGIN,

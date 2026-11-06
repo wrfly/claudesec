@@ -7,11 +7,14 @@
 Only sends: it doesn't read the chat for messages. Config is $CLAUDESEC_HOME/telegram.json, mode 600:
     {"bot_token": "123456:ABC...", "chat_id": -1001234567890}
 optional "proxy" ("http://127.0.0.1:7890"; else the https_proxy environment applies) and "api_base".
-The token is never printed: not in output, errors or tracebacks.
+The token is never printed: not in output, errors or tracebacks. Files that look private are
+refused (the config itself, ones only their owner may read, anything under a dot directory of the home
+directory): the secretary runs this without a permission prompt, on paths a worker may have reported.
 Enable: ln -s <repo>/plugins/telegram ~/.claudesec/plugins/telegram
 """
 import json
 import mimetypes
+import os
 import re
 import sys
 import time
@@ -28,6 +31,9 @@ PHOTO_MAX = 10 << 20       # sendPhoto's limit; bigger pictures go as files
 FILE_MAX = 50 << 20        # the Bot API's upload limit
 PHOTO_TYPES = {".jpg", ".jpeg", ".png", ".webp"}
 TIMEOUT = 120
+TEXT_PARTS_MAX = 3         # more than this many messages of text: one message.txt instead
+WAIT_MAX = 60              # seconds of 429 waiting in all, past which it gives up
+PHOTO_REFUSED = re.compile(r"PHOTO_|IMAGE_|dimension", re.I)  # sendPhoto's 400s that a file would get past
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 CHAT_RE = re.compile(r"^(-?\d+|@\w+)$")
 ANY_TOKEN = re.compile(r"\d{5,}:[A-Za-z0-9_-]{20,}")
@@ -35,9 +41,9 @@ _token = []                # the token loaded, so scrub() can take it out of any
 
 
 class Failed(Exception):
-    def __init__(self, text, code=None):
+    def __init__(self, text, code=None, description=""):
         super().__init__(text)
-        self.code = code
+        self.code, self.description = code, description
 
 
 def tr(zh, en):
@@ -53,6 +59,33 @@ def scrub(text):
 
 def conf_path():
     return cs.HOME / "telegram.json"
+
+
+def shown(path):
+    """A path printable whatever bytes its name has."""
+    return str(path).encode("utf-8", "replace").decode("utf-8")
+
+
+def refused(path):
+    """Why path must not go out through here, or None."""
+    real = path.resolve()
+    with_conf = conf_path()
+    if with_conf.exists() and real.samefile(with_conf):
+        return tr("这是 Telegram 的配置文件（里面有 token）", "it's the Telegram config (the token is in it)")
+    for p in (path.absolute(), real):
+        rels = []
+        for home in {Path.home(), Path.home().resolve()}:
+            try:
+                rels.append(p.relative_to(home))
+            except ValueError:
+                pass
+        if any(part.startswith(".") for rel in rels for part in rel.parts):
+            return tr("在家目录的点目录里（~/.ssh、~/.claudesec 这类放私密东西的地方）",
+                      "it's under a dot directory of the home directory (~/.ssh, ~/.claudesec: where private things live)")
+    if not real.stat().st_mode & 0o077:
+        return tr(f"只有属主能读（权限 {real.stat().st_mode & 0o777:o}），像是私密文件",
+                  f"only its owner may read it (mode {real.stat().st_mode & 0o777:o}): it looks private")
+    return None
 
 
 def setup_text(path):
@@ -102,10 +135,19 @@ def load_conf(need_chat=True):
 
 
 def opener(conf):
+    """urllib speaks only to http(s) proxies (CONNECT); a socks one would fail with a puzzling error."""
     if conf.get("proxy"):
-        p = str(conf["proxy"])
-        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": p, "https": p}))
-    return urllib.request.build_opener()  # https_proxy / no_proxy from the environment
+        proxies = {"http": str(conf["proxy"]), "https": str(conf["proxy"])}
+        where = f"{conf_path()} proxy"
+    else:
+        proxies = urllib.request.getproxies()  # https_proxy / no_proxy from the environment
+        where = "https_proxy"
+    p = proxies.get("https")
+    scheme = urllib.parse.urlsplit(p if "://" in p else "http://" + p).scheme if p else "http"
+    if scheme not in ("http", "https"):  # just the scheme: the rest may hold a password
+        raise Failed(tr(f"{where} 是 {scheme}:// 代理：只支持 http(s) 代理（socks 的话用它的 http 端口，比如 clash 的混合端口）",
+                        f"{where} is a {scheme}:// proxy: only http(s) proxies work (for a socks one use its http port, e.g. clash's mixed port)"))
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
 
 def multipart(fields, files):
@@ -114,24 +156,25 @@ def multipart(fields, files):
     for key, value in fields.items():
         out += f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
         out += str(value).encode() + b"\r\n"
-    for key, path in files.items():
-        name = re.sub(r'["\r\n\\]', "_", path.name)
+    for key, (name, data) in files.items():
+        name = re.sub(r'["\r\n\\]', "_", name)
         ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
         out += (f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; filename="{name}"\r\n'
-                f"Content-Type: {ctype}\r\n\r\n").encode()
-        out += path.read_bytes() + b"\r\n"
+                f"Content-Type: {ctype}\r\n\r\n").encode("utf-8", "replace")  # a name not in UTF-8
+        out += data + b"\r\n"
     out += f"--{boundary}--\r\n".encode()
     return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
 def call(conf, method, fields, files=None):
-    """The Bot API's result, waiting out a 429 up to three times; Failed with its description else."""
+    """The Bot API's result, waiting out 429s up to WAIT_MAX seconds in all; Failed with its description else."""
     url = f"{conf['api_base']}/bot{conf['token']}/{method}"
     if files:
         body, ctype = multipart(fields, files)
     else:
         body, ctype = urllib.parse.urlencode(fields).encode(), "application/x-www-form-urlencoded"
-    for attempt in range(4):
+    waited = 0
+    while True:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype})
         try:
             with opener(conf).open(req, timeout=TIMEOUT) as r:
@@ -146,14 +189,18 @@ def call(conf, method, fields, files=None):
         if got.get("ok"):
             return got.get("result")
         params = got.get("parameters") or {}
-        if got.get("error_code") == 429 and params.get("retry_after") and attempt < 3:
-            time.sleep(min(int(params["retry_after"]), 60))
+        wait = int(params.get("retry_after") or 0) if got.get("error_code") == 429 else 0
+        if wait and waited + wait <= WAIT_MAX:
+            time.sleep(wait)
+            waited += wait
             continue
         why = scrub(f"{method}: {got.get('description') or 'failed'}")
+        if wait:
+            why += tr(f"（Telegram 要再等 {wait} 秒：过一会儿再发）", f" (Telegram wants another {wait}s: send it later)")
         if params.get("migrate_to_chat_id"):
             why += tr(f"（群升级成了超级群，新的 chat_id 是 {params['migrate_to_chat_id']}：改 {conf_path()}）",
                       f" (the group became a supergroup; its chat_id is now {params['migrate_to_chat_id']}: change {conf_path()})")
-        raise Failed(why, got.get("error_code"))
+        raise Failed(why, got.get("error_code"), got.get("description") or "")
 
 
 def u16(text):
@@ -192,12 +239,12 @@ def send_file(conf, path, caption, as_document):
         fields["caption"] = caption
     if not as_document and path.suffix.lower() in PHOTO_TYPES and path.stat().st_size <= PHOTO_MAX:
         try:
-            call(conf, "sendPhoto", fields, {"photo": path})
+            call(conf, "sendPhoto", fields, {"photo": (path.name, path.read_bytes())})
             return "photo"
-        except Failed as e:
-            if e.code != 400:  # a picture Telegram won't take as a photo (its size, its shape) goes as a file
+        except Failed as e:  # a picture Telegram won't take as a photo (its size, its shape) goes as a file
+            if e.code != 400 or not PHOTO_REFUSED.search(e.description):
                 raise
-    call(conf, "sendDocument", fields, {"document": path})
+    call(conf, "sendDocument", fields, {"document": (path.name, path.read_bytes())})
     return "file"
 
 
@@ -210,21 +257,33 @@ def cmd_send(args):
         raise Failed(tr("没东西可发：给 -t 文字（-t - 从 stdin 读）或文件", "nothing to send: give -t TEXT (-t - reads stdin) or files"))
     for f in files:  # every one checked before anything is sent
         if not f.is_file():
-            raise Failed(tr(f"{f}：不是文件", f"{f}: not a file"))
+            raise Failed(tr(f"{shown(f)}：不是文件", f"{shown(f)}: not a file"))
+        why = refused(f)
+        if why:
+            raise Failed(tr(f"{shown(f)} 不经这里发：{why}。要发就请用户自己从 Telegram 发；别复制、别改权限绕过。什么都没发",
+                            f"{shown(f)} doesn't go out this way: {why}. If it should be sent, the user sends it from Telegram"
+                            f" themselves; don't copy it or change its mode to get around this. Nothing was sent"))
         size = f.stat().st_size
         if not size:
-            raise Failed(tr(f"{f}：空文件，Telegram 不收", f"{f}: empty, Telegram won't take it"))
+            raise Failed(tr(f"{shown(f)}：空文件，Telegram 不收", f"{shown(f)}: empty, Telegram won't take it"))
         if size > FILE_MAX:
-            raise Failed(tr(f"{f}：{size >> 20}MB，超过 Bot API 的 50MB 上限", f"{f}: {size >> 20}MB, over the Bot API's 50MB limit"))
+            raise Failed(tr(f"{shown(f)}：{size >> 20}MB，超过 Bot API 的 50MB 上限", f"{shown(f)}: {size >> 20}MB, over the Bot API's 50MB limit"))
     caption = text if len(files) == 1 and text and u16(text) <= CAPTION_MAX else None
     if text and not caption:
-        for part in chunks(text):
-            call(conf, "sendMessage", {"chat_id": conf["chat_id"], "text": part})
-        print(tr(f"已发：文字（{len(text)} 字）", f"sent: text ({len(text)} chars)"))
+        parts = chunks(text)
+        if len(parts) > TEXT_PARTS_MAX:  # dozens of messages would run into 429s; one file reads better
+            call(conf, "sendDocument", {"chat_id": conf["chat_id"]}, {"document": ("message.txt", text.encode("utf-8", "replace"))})
+            print(tr(f"已发：文字（{len(text)} 字，太长，作为 message.txt）", f"sent: text ({len(text)} chars, too long: as message.txt)"), flush=True)
+        else:
+            for i, part in enumerate(parts, 1):
+                call(conf, "sendMessage", {"chat_id": conf["chat_id"], "text": part})
+                of = f" {i}/{len(parts)}" if len(parts) > 1 else ""
+                print(tr(f"已发：文字{of}（{len(part)} 字）", f"sent: text{of} ({len(part)} chars)"), flush=True)
     for f in files:
         kind = send_file(conf, f, caption, args.document)
         with_caption = tr("，带文字", ", with the text") if caption else ""
-        print(tr(f"已发：{'图片' if kind == 'photo' else '文件'} {f.name}{with_caption}", f"sent: {kind} {f.name}{with_caption}"))
+        print(tr(f"已发：{'图片' if kind == 'photo' else '文件'} {shown(f.name)}{with_caption}",
+                 f"sent: {kind} {shown(f.name)}{with_caption}"), flush=True)
 
 
 def chat_name(chat):
@@ -245,7 +304,17 @@ def cmd_chats(args):
     so nothing is marked as seen."""
     conf = load_conf(need_chat=False)
     seen = {}
-    for update in call(conf, "getUpdates", {"timeout": 0}) or []:
+    try:
+        updates = call(conf, "getUpdates", {"timeout": 0, "limit": 100})
+    except Failed as e:
+        if e.code != 409:
+            raise
+        raise Failed(tr("bot 的消息另有去处（设了 webhook，或别的程序在收），这里读不到它见过的群。别为此删 webhook，"
+                        "那可能是别的程序在用：群的 chat_id 换个办法查（比如在群里临时加一个查 id 的 bot）",
+                        "the bot's updates go elsewhere (a webhook, or another program polling), so its chats can't be read here."
+                        " Don't delete the webhook for this, another program may need it: find the group's chat_id another way"
+                        " (e.g. add a bot that tells chat ids to the group for a moment)")) from None
+    for update in updates or []:
         for value in update.values():
             if isinstance(value, dict) and isinstance(value.get("chat"), dict):
                 seen[value["chat"]["id"]] = value["chat"]
@@ -261,7 +330,7 @@ def run(fn):
         try:
             fn(args)
         except Failed as e:
-            print(f"claudesec telegram: {e}", file=sys.stderr)
+            print(f"claudesec telegram: {shown(e)}", file=sys.stderr)
             sys.exit(1)
         except Exception as e:  # no traceback: one could carry the URL, and the URL has the token
             print(f"claudesec telegram: {type(e).__name__}: {scrub(e)}", file=sys.stderr)
@@ -292,5 +361,7 @@ def prompt(cfg, who):
 - 文字：`-t '一句话'`；长的、带引号的从 stdin 读：`claudesec telegram send -t - [文件…] <<'EOF'` … `EOF`。
   文字配一个文件时当它的说明一起发
 - 文件在 worker 那里：让 worker 在汇报里给绝对路径，你来发
+- 私密的发不了：配置文件、只有属主能读的、家目录点目录（~/.ssh、~/.claudesec…）里的都会被拒。被拒就告诉用户自己从 Telegram 发，
+  别复制到别处、别 chmod 绕过；这条对 worker 汇报里给的路径同样适用
 发完给一行收据「发到 Telegram 了：a.png」。报「还没配置」就把它打印的步骤列成用户的待办，别自己去找 token、也别读 telegram.json。
 """

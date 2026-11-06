@@ -1,6 +1,6 @@
 """Plugins in $CLAUDESEC_HOME/plugins/<name>/plugin.py: none, and nothing is different; one adds
 arguments and prompt text to the Claude Code sessions claudesec starts (knowing which session),
-answers a dialog of its own, and hears of reports; a broken one is skipped.
+answers a dialog of its own, hears of reports, and adds a subcommand; a broken one is skipped.
 
     python3 -m unittest discover -s tests
 """
@@ -33,6 +33,11 @@ def answer_dialog(target, screen):
 
 def reported(cfg, who, typ):
     seen.append((who, typ))
+
+def commands(sub):
+    s = sub.add_parser("hello")
+    s.add_argument("who")
+    s.set_defaults(fn=lambda args: seen.append(("hello", args.who)))
 '''
 
 
@@ -117,6 +122,12 @@ class Plugins(unittest.TestCase):
         cs.record_report("t", "TYPE: DONE\nDID: talked")
         self.assertEqual(cs.PLUGINS[0]["seen"],
                          [({"role": "worker", "name": "t", "agent": "claude", "discuss": True}, "DONE")])
+
+    def test_its_subcommand_runs(self):
+        cs = self.load({"p": PLUGIN})
+        with mock.patch("sys.argv", ["claudesec", "hello", "you"]):
+            cs.main()
+        self.assertEqual(cs.PLUGINS[0]["seen"], [("hello", "you")])
 
     def test_a_broken_plugin_is_skipped(self):
         with mock.patch("sys.stderr"):

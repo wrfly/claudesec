@@ -150,8 +150,11 @@ These are not in the repo:
 - The secretary's Claude Code memory: preferences on this machine.
 - Plugins, `~/.claudesec/plugins/<name>/plugin.py`: what only this machine needs (another launcher's
   flags, a dialog it brings up). Each may add arguments to the Claude Code sessions claudesec starts,
-  text to their system prompts, and answer a dialog of its own on their screens; the comment above
-  `load_plugins` in `bin/claudesec` has the interface. Without a plugins directory nothing changes.
+  text to their system prompts, `claudesec` subcommands of its own, and answer a dialog of its own on
+  their screens; the comment above `load_plugins` in `bin/claudesec` has the interface. Without a
+  plugins directory nothing changes. Optional plugins that anyone may want come in the repo's
+  `plugins/`, each off until linked into `~/.claudesec/plugins/`:
+  [`plugins/telegram`](plugins/telegram/README.md) sends you what you ask the secretary to send, through a Telegram bot.
 
 To bring the history along, copy `~/.claudesec/history/`. The session ids in its task files can be
 `--resume`d only on the original machine.

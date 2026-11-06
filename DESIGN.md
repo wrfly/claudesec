@@ -183,7 +183,10 @@ tmux pane id，`SendMessage` 可互发。
 7. 只有某台机器要的东西（别的 `claude` 启动脚本的参数、它带来的对话框、对应的提示词）不进 repo
    → 插件 `$CLAUDESEC_HOME/plugins/<名字>/plugin.py`：给秘书 / Claude worker 加启动参数（`claude_args`）、
    在系统提示末尾加话（`prompt`）、回答自己的对话框（`answer_dialog`，spawn / wake / adopt 的启动检查、看门狗、
-   秘书自己启动后一分钟都会问）。没有插件目录时什么都不做；加载失败的插件跳过并打到 stderr。
+   秘书自己启动后一分钟都会问）、加自己的子命令（`commands`）。没有插件目录时什么都不做；加载失败的插件跳过并打到 stderr。
+   谁都可能要、但不是人人要的（Telegram 发送）放 repo 的 `plugins/<名字>/`，用户 `ln -s` 进插件目录才生效。
+   给秘书的新动作做成 `claudesec` 子命令而不是 MCP 工具：秘书带 `--allowedTools Bash(claudesec *)`，不弹权限框，
+   也不用多一个常驻的 MCP 进程、不碰 Claude Code 的配置目录。
 
 ### 3.2 组件（已实现）
 

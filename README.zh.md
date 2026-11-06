@@ -118,8 +118,10 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法，含复盘后定下的约定）、`prompts/worker.md`。
 `~/.claudesec/` 是这台机器的状态（注册表、历史、教训、决策队列），秘书的 Claude Code memory 是这台机器上的偏好，都不在 repo 里；
 只有这台机器要的东西（别的启动脚本的参数、它带来的对话框）做成插件 `~/.claudesec/plugins/<名字>/plugin.py`，也不在 repo 里：
-插件可以给 claudesec 起的 Claude Code 会话加参数、往系统提示末尾加话、在它们屏幕上回答自己的对话框，接口见 `bin/claudesec` 里
-`load_plugins` 上面的注释；没有插件目录就什么都不变。
+插件可以给 claudesec 起的 Claude Code 会话加参数、往系统提示末尾加话、加自己的 `claudesec` 子命令、在它们屏幕上回答自己的对话框，
+接口见 `bin/claudesec` 里 `load_plugins` 上面的注释；没有插件目录就什么都不变。
+谁都可能用得上的可选插件放在 repo 的 `plugins/` 里，链接进 `~/.claudesec/plugins/` 才生效：
+[`plugins/telegram`](plugins/telegram/README.md) 把你让秘书「发给我」的东西（文件、截图、文字）通过 Telegram bot 发到一个群里，配置步骤见它的 README。
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。
 
 ## 改 claudesec 本身

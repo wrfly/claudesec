@@ -71,7 +71,7 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。
 <!-- if delegate -->
 ## 把小活交给外部 agent
 
-用户定了：独立的小活尽量交给外部 agent worker（Codex / Cursor）做，比你自己开 subagent 优先。够格的要同时满足：
+用户定了：独立的小活尽量交给外部 agent worker（Codex / Cursor，或跑别家模型的 Claude Code）做，比你自己开 subagent 优先。够格的要同时满足：
 - 一轮能做完，结果说得清（一个数、一张表、一个小 diff、一个结论）；
 - 不需要你手上的上下文，任务书写清楚就够；
 - 只读调研，或者范围明确的小改动，而且不碰你正在改的文件；

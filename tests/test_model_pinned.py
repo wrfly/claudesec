@@ -96,6 +96,26 @@ class ModelPinned(unittest.TestCase):
         self.assertIn("--model claude-opus-5-5", self.cmds[0])
         self.assertNotIn("model_pinned", self.reg()["workers"]["plain"])
 
+    def test_agent_named_in_delegate_agent_runs_delegate_model(self):
+        # The secretary opens an external agent worker with --agent; with delegate_agent "claude"
+        # that is a Claude Code worker on delegate_model, not a plain one on worker_model.
+        (self.home / "config.json").write_text(json.dumps({
+            "delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"}))
+        self.screen = ""
+        self.spawn("ext", "--dir", self.tmp.name, "--agent", "claude")
+        self.spawn("plain", "--dir", self.tmp.name)
+        self.spawn("named", "--dir", self.tmp.name, "--agent", "claude", "--model", "gemini-4-argon")
+        models = {n: w["model"] for n, w in self.reg()["workers"].items()}
+        self.assertEqual(models, {"ext": "gpt-5.6-sol", "plain": "claude-opus-5-5", "named": "gemini-4-argon"})
+        self.assertIn("--model gpt-5.6-sol", self.cmds[0])
+        self.assertNotIn("model_pinned", self.reg()["workers"]["ext"])
+
+    def test_agent_not_in_delegate_agent_keeps_worker_model(self):
+        (self.home / "config.json").write_text(json.dumps({"delegate_model": "gpt-5.6-sol"}))
+        self.screen = ""
+        self.spawn("c", "--dir", self.tmp.name, "--agent", "claude")
+        self.assertEqual(self.reg()["workers"]["c"]["model"], "claude-opus-5-5")
+
     def test_model_dialogs_title_is_not_a_switch_option(self):
         self.assertIsNone(self.cs.SWITCH.search("   Switch to Fable 5.1?"))
         self.assertEqual(self.cs.SWITCH.search(" ❯ Switch to Opus 5.5 and continue")[1], "Opus 5.5")

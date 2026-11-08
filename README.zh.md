@@ -26,7 +26,7 @@
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `secretary_model` | `null` | 秘书用的模型；`null` 跟 Claude Code 的默认走。**建议写死**（如 `"claude-opus-5-5"`）：默认模型变成要额外额度的那种时，秘书启动会卡在确认框上 |
-| `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定。不是 Claude 的模型（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……）用 `--agent ttadk` |
+| `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定。不是 Claude 的模型以 `[1m]` 结尾（`deepseek-v4-pro[1m]`）的是网关（`ANTHROPIC_BASE_URL`）自己的，普通 Claude Code 就能跑；其他的（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……）用 `--agent ttadk` |
 | `worker_permission_mode` | `"auto"` | worker 的 `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High） | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
 | `codex_worker_model` | `null`（codex 自己的默认） | `spawn --agent codex` 的默认模型（OpenAI 的 codex CLI，用它自己的登录：ChatGPT、`OPENAI_API_KEY`，或 `~/.codex/config.toml` 里的 `model_provider`）。第一次开 Codex worker（直接跑或经 ttadk）时会往 `~/.codex/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Codex worker 里生效。之后 codex 会在那个 worker 窗口里问一次要不要信任它们：选「2. Trust all and continue」（这一条 claudesec 不替你答；信任目录那一问它会自动答） |

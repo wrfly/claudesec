@@ -1902,8 +1902,12 @@ def fresh_prompt():
 
 def ttadk_model(model):
     """A model that isn't Claude (deepseek-…, glm-…, kimi-…, gpt-…). A Claude Code worker recorded
-    with one ran through `ttadk claude` before ttadk was an agent of its own (agent_of)."""
-    return not re.match(r"(claude|opus|sonnet|haiku|fable|default|best|opusplan)\b", model or "claude")
+    with one ran through `ttadk claude` before ttadk was an agent of its own (agent_of). One ending
+    in [1m] (deepseek-v4-pro[1m]) is a Claude Code name, the gateway's (ANTHROPIC_BASE_URL) own:
+    plain `claude --model` runs it; ttadk's names have no [1m] (deepseek-v4-pro-0813)."""
+    model = model or "claude"
+    return not (re.match(r"(claude|opus|sonnet|haiku|fable|default|best|opusplan)\b", model)
+                or model.endswith("[1m]"))
 
 
 # ---------- agents: what runs in a worker's window ----------

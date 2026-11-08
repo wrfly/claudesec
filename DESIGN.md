@@ -879,7 +879,9 @@ delegate 默认用它。同一天拆成两个 agent：`codex` 直接跑 codex CL
 
 ttadk 的模型不是 gpt-* / o<N>-* / codex-* 的，跑 Claude Code：
 worker 用 `ttadk claude -m <模型> --skip-check -- <原来的 claude 参数>` 启动。`spawn --agent claude` 加不像 Claude 的模型名
-（`ttadk_model()`：claude / opus / sonnet / haiku / fable / default / best / opusplan 开头之外）拒绝，提示改用 `--agent ttadk`。ttadk 把它的端点 env 合进我们的
+（`ttadk_model()`：claude / opus / sonnet / haiku / fable / default / best / opusplan 开头之外）拒绝，提示改用 `--agent ttadk`；
+以 `[1m]` 结尾的不算：那是 Claude Code 的写法，网关（`ANTHROPIC_BASE_URL`）直供的模型（`deepseek-v4-pro[1m]`），`claude --model` 直接跑
+（2026-11-08 实测：`deepseek-v4-pro[1m]`、`deepseek-v4-pro` 都通，`deepseek-v4-pro-0813` 网关说没有）。ttadk 把它的端点 env 合进我们的
 `--settings`，hook、规则、汇报都跟普通 worker 一样（插件看 `who["agent"]` 是 `"ttadk"` 还是 `"claude"`）。
 deepseek-v4-pro-0813 实测：auto 权限模式下 Bash、写文件都能跑，SessionStart hook 记下了 session。
 

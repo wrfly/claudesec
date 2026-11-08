@@ -133,6 +133,11 @@ class Agents(unittest.TestCase):
         self.assertEqual(of({"model": "claude-opus-5-5"}).name, "claude")
         old_ttadk_claude = of({"agent": "claude", "model": "deepseek-v4-pro-0813"})  # spawned before ttadk was an agent
         self.assertEqual((old_ttadk_claude.name, old_ttadk_claude.runtime_name), ("ttadk", "claude"))
+        gateway = of({"agent": "claude", "model": "deepseek-v4-pro[1m]"})  # the gateway's, plain Claude Code
+        self.assertIs(gateway, self.cs.AGENTS["claude"])
+        self.assertTrue(self.cs.ttadk_model("deepseek-v4-pro-0813"))
+        self.assertFalse(self.cs.ttadk_model("deepseek-v4-pro[1m]"))
+        self.assertFalse(self.cs.ttadk_model("opus[1m]"))
         old_codex = of({"agent": "codex", "model": "gpt-6.1-sol"})  # Codex ran through ttadk then
         self.assertEqual((old_codex.name, old_codex.runtime_name), ("ttadk", "codex"))
         self.assertEqual(of({"agent": "codex", "runtime": None, "model": None}).runtime_name, "codex")

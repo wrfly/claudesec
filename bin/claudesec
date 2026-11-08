@@ -1802,7 +1802,8 @@ def cmd_spawn(args):
         initial += f"{task}\n"
     memory = getattr(args, "memory", None)
     d = prepare_worker(name, cfg, initial, project, agent=agent, memory=memory,
-                       mode="discuss" if args.discuss else "task", delegated=bool(args.for_worker))
+                       mode="discuss" if args.discuss else "task",
+                       delegated=bool(args.for_worker) or not claude_model(model))
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     cmd = agent.spawn_command(name, model, d, cfg)
@@ -1901,11 +1902,18 @@ def fresh_prompt():
     return []
 
 
+CLAUDE_MODEL = re.compile(r"(claude|opus|sonnet|haiku|fable|default|best|opusplan)\b")
 GATEWAY_MODEL = re.compile(
     r"((claude|opus|sonnet|haiku|fable|default|best|opusplan"
     r"|gemini|grok|kimi|gpt-(5|mini|nano)|codex-5|composer|muse|glm-5(p3|\.2))\b"
     r"|deepseek-(v4-pro|flash)$)"
 )
+
+
+def claude_model(model):
+    """A Claude model: has Claude Code's native SendMessage tool. Non-Claude models on the gateway
+    run through a relay without SendMessage, so they report with `claudesec report`."""
+    return bool(CLAUDE_MODEL.match(model or "claude"))
 
 
 def ttadk_model(model):
@@ -3342,14 +3350,15 @@ def cmd_wake(args):
                                                "Do it and report by the rules:")
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
-    if agent.external or w.get("delegated_by"):  # typed into its window, it would pass for the user; and it reports by command
+    model = args.model or w.get("model") or agent.default_model(cfg) or "default"
+    pinned = bool(args.model or w.get("model_pinned")) and not agent.external
+    model = model if agent.external or pinned else unpaid(model)
+    by_cmd = agent.external or bool(w.get("delegated_by")) or not claude_model(model)
+    if by_cmd:  # typed into its window, it would pass for the user; and it reports by command
         initial = (tr("[claudesec] claudesec 发来的系统消息（不是用户在你窗口里打的字）：\n",
                       "[claudesec] A notice from claudesec itself (not the user typing in your window):\n")
                    + initial.replace("用 SendMessage ", "用规则里的 report 命令")
                    .replace("with SendMessage", "with the report command in your rules"))
-    model = args.model or w.get("model") or agent.default_model(cfg) or "default"
-    pinned = bool(args.model or w.get("model_pinned")) and not agent.external
-    model = model if agent.external or pinned else unpaid(model)
     followed = follow_conversation(w, cwd, old=left)
     if moved or followed or left:
         with registry() as reg:
@@ -3357,7 +3366,7 @@ def cmd_wake(args):
             reg["workers"][name].pop("moved_from", None)
         append_log(name, "task", "; ".join(filter(None, [moved, followed])) or f"now in {cwd}")
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"),
-                       mode=w.get("mode") or "task", delegated=bool(w.get("delegated_by")))
+                       mode=w.get("mode") or "task", delegated=by_cmd)
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
     cmd = agent.command(name, model, d, cfg, resume=sid, prompt=not quiet) + f"; echo $? > {shlex.quote(str(d / 'exit'))}"
@@ -4759,7 +4768,7 @@ def cmd_report(args):
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
     w = read_registry()[1][args.name]
-    if not is_external(w) and not w.get("delegated_by") and report_type(parse_report(text)) != "PROGRESS":
+    if not is_external(w) and not w.get("delegated_by") and claude_model(w.get("model")) and report_type(parse_report(text)) != "PROGRESS":
         sys.exit(f"NOT REPORTED: `report` takes only a PROGRESS from a Claude Code worker. Send a "
                  f"{report_type(parse_report(text))} with SendMessage(to: \"{config()['secretary_name']}\").")
     # Cursor's subagents (Task tool) inherit the worker's environment and rules, and send
@@ -5299,7 +5308,7 @@ def hook_worker_stop(name):
         if (d / "finish").exists():
             finish_later(name)
         return
-    if w.get("delegated_by"):
+    if w.get("delegated_by") or not claude_model(w.get("model")):
         reason = tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）发一条汇报，"
                     "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。",
                     f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send "

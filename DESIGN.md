@@ -562,12 +562,11 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - 标记名就是 agent 名（`<!-- if codex -->`、`<!-- if ttadk -->`），可以嵌套。`<!-- if delegate -->` 是 `claudesec delegate`
   有 agent 可开（`delegate_agents()` 里有一个可用），worker 规则里「把小活交出去」那段和秘书的外部 agent 段落用它。
 
-### worker 把小活委托给 Codex / Cursor（`claudesec delegate` / `wait`）
+### worker 把小活委托给外部 agent 或其他模型（`claudesec delegate` / `wait`）
 
-下面按 Cursor 写的，别的外部 agent 同样适用：delegate 没带 `--agent` 时开 config `delegate_agent`（默认
-`["ttadk", "codex", "cursor"]`）里第一个可用的；2026-10-30 起默认是经 ttadk 的 Codex（用户定的）。同名追加沿用原来那种
-（注册表里的，或归档 frontmatter 的 `agent` / `runtime` / tags）。只能开会用命令汇报的 agent：`--agent ttadk` 加非 gpt 模型
-跑的是 Claude Code，拒绝。
+下面按 Cursor 写的，别的外部 agent 和 `"claude"` 同样适用：delegate 没带 `--agent` 时开 config `delegate_agent`（默认
+`["ttadk", "codex", "cursor"]`，也可以写 `"claude"`）里第一个可用的，模型用 `--model` 或 `delegate_model`（没配就用该 agent 的默认模型）。同名追加沿用原来那种
+（注册表里的，或归档 frontmatter 的 `agent` / `runtime` / tags）。`"claude"` 委托出去的 worker 用 `worker-external.md` 提示词、经 `claudesec report` 向委托人交差（误调 SendMessage 也会被 PreToolUse hook 拦下并记账转交委托人，不吵秘书）；`--agent ttadk` 加非 gpt 模型仍拒绝。
 
 用户定了「独立、小任务尽量派 cursor 做」。第一版让 worker 发 TYPE: DELEGATE 给秘书、秘书 spawn、Cursor 的汇报
 经秘书转回：一次委托的任务书和结果各过秘书上下文两遍（约 1–2 万 token），每一步还要秘书推理。现在全由脚本做：
@@ -878,10 +877,10 @@ delegate 默认用它。同一天拆成两个 agent：`codex` 直接跑 codex CL
 ### 非 Claude 模型的 Claude worker（`spawn --agent ttadk --model deepseek-…`）
 
 ttadk 的模型不是 gpt-* / o<N>-* / codex-* 的，跑 Claude Code：
-worker 用 `ttadk claude -m <模型> --skip-check -- <原来的 claude 参数>` 启动。`spawn --agent claude` 加不像 Claude 的模型名
-（`ttadk_model()`：claude / opus / sonnet / haiku / fable / default / best / opusplan 开头之外）拒绝，提示改用 `--agent ttadk`；
-以 `[1m]` 结尾的不算：那是 Claude Code 的写法，网关（`ANTHROPIC_BASE_URL`）直供的模型（`deepseek-v4-pro[1m]`），`claude --model` 直接跑
-（2026-11-08 实测：`deepseek-v4-pro[1m]`、`deepseek-v4-pro` 都通，`deepseek-v4-pro-0813` 网关说没有）。ttadk 把它的端点 env 合进我们的
+worker 用 `ttadk claude -m <模型> --skip-check -- <原来的 claude 参数>` 启动。`spawn --agent claude` 加只有 ttadk 才有的模型名
+（`ttadk_model()`：`deepseek-v4-pro-0813`、`glm-5.3`、`gpt-6.1-sol` 等）拒绝，提示改用 `--agent ttadk`；
+网关（`ANTHROPIC_BASE_URL`）直供的非 Claude 模型（`GATEWAY_MODEL`：`gemini-*`、`gpt-5*`、`grok-*`、`kimi-*`、`glm-5p3`、`composer-*`、`deepseek-v4-pro` 等，以及任何以 `[1m]` 结尾的模型）不算，`claude --model` 直接跑
+（2026-11-08 实测：`gemini-4-argon`、`gemini-3.8-flash`、`gpt-5.6-sol`、`grok-4.7`、`kimi-k3`、`glm-5p3`、`composer-2.5-fast`、`deepseek-v4-pro[1m]` 都通，`deepseek-v4-pro-0813` 网关说没有）。ttadk 把它的端点 env 合进我们的
 `--settings`，hook、规则、汇报都跟普通 worker 一样（插件看 `who["agent"]` 是 `"ttadk"` 还是 `"claude"`）。
 deepseek-v4-pro-0813 实测：auto 权限模式下 Bash、写文件都能跑，SessionStart hook 记下了 session。
 

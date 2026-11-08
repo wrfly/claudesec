@@ -133,10 +133,11 @@ class Agents(unittest.TestCase):
         self.assertEqual(of({"model": "claude-opus-5-5"}).name, "claude")
         old_ttadk_claude = of({"agent": "claude", "model": "deepseek-v4-pro-0813"})  # spawned before ttadk was an agent
         self.assertEqual((old_ttadk_claude.name, old_ttadk_claude.runtime_name), ("ttadk", "claude"))
-        gateway = of({"agent": "claude", "model": "deepseek-v4-pro[1m]"})  # the gateway's, plain Claude Code
-        self.assertIs(gateway, self.cs.AGENTS["claude"])
-        self.assertTrue(self.cs.ttadk_model("deepseek-v4-pro-0813"))
-        self.assertFalse(self.cs.ttadk_model("deepseek-v4-pro[1m]"))
+        for m in ("deepseek-v4-pro[1m]", "gemini-4-argon", "gpt-5.6-sol", "grok-4.7", "kimi-k3", "glm-5p3"):
+            self.assertIs(of({"agent": "claude", "model": m}), self.cs.AGENTS["claude"], m)
+            self.assertFalse(self.cs.ttadk_model(m), m)
+        for m in ("deepseek-v4-pro-0813", "glm-5.3", "gpt-6.1-sol"):
+            self.assertTrue(self.cs.ttadk_model(m), m)
         self.assertFalse(self.cs.ttadk_model("opus[1m]"))
         old_codex = of({"agent": "codex", "model": "gpt-6.1-sol"})  # Codex ran through ttadk then
         self.assertEqual((old_codex.name, old_codex.runtime_name), ("ttadk", "codex"))
@@ -174,6 +175,8 @@ class Agents(unittest.TestCase):
         self.assertEqual(self.cs.delegate_agents(), ["ttadk", "codex", "cursor"])
         (self.home / "config.json").write_text(json.dumps({"delegate_agent": "cursor"}))
         self.assertEqual(self.cs.delegate_agents()[0], "cursor")
+        (self.home / "config.json").write_text(json.dumps({"delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"}))
+        self.assertEqual(self.cs.delegate_agents()[0], "claude")
         (self.home / "config.json").write_text(json.dumps({"ttadk_worker_model": "deepseek-v4-pro-0813"}))
         self.assertNotIn("ttadk", self.cs.delegate_agents())  # that runs Claude Code, which doesn't report by command
 
@@ -264,6 +267,50 @@ class Agents(unittest.TestCase):
         self.assertEqual(self.delegate("--agent", "ttadk", "--model", "deepseek-v4-pro-0813"), [])  # Claude Code
         self.on(ttadk=False)
         self.assertEqual(self.delegate(), ["codex"])
+
+    def test_delegate_runs_claude_with_delegate_model(self):
+        self.on(ttadk=False, codex=False, cursor=True)
+        (self.home / "config.json").write_text(json.dumps({
+            "language": "en", "delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"}))
+        spawned = []
+        self.cs.cmd_spawn = lambda args: spawned.append((args.agent, args.model, args.for_worker))
+        self.workers(boss={"status": "PROGRESS", "dir": str(self.root), "task": "t"})
+        out, saved_argv, saved_stdin = io.StringIO(), sys.argv, sys.stdin
+        try:
+            sys.argv = ["claudesec", "delegate", "boss", "--name", "j", "--dir", str(self.root)]
+            sys.stdin = io.StringIO("count files")
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+            sys.argv = ["claudesec", "delegate", "boss", "--name", "j2", "--dir", str(self.root), "--model", "gemini-4-argon"]
+            sys.stdin = io.StringIO("count files")
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+        self.assertEqual(spawned, [("claude", "gpt-5.6-sol", "boss"), ("claude", "gemini-4-argon", "boss")])
+        # A delegated Claude Code worker gets the command-reporting rules and finishes via cmd_report
+        self.cs.memory_settings = lambda cwd: {}
+        d = self.cs.prepare_worker("j", self.cs.config(), "task", str(self.root),
+                                   agent=self.cs.AGENTS["claude"], delegated=True)
+        self.assertIn("report j <<'EOF'", (d / "prompt.md").read_text())
+        self.assertNotIn("SendMessage", (d / "prompt.md").read_text())
+        self.workers(boss={"status": "PROGRESS", "dir": str(self.root), "task": "t"},
+                     j={"status": "PROGRESS", "dir": str(self.root), "task": "t", "agent": "claude",
+                        "model": "gpt-5.6-sol", "delegated_by": "boss", "window": "@9"})
+        out = self.hook(lambda: self.cs.cmd_report(self.cs.argparse.Namespace(name="j")), {}, "j") if False else None
+        buf, saved = io.StringIO(), sys.stdin
+        sys.stdin = io.StringIO("TYPE: DONE\nDID: counted\nRESULT: 42\nDECISIONS: none")
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.cs.cmd_report(self.cs.argparse.Namespace(name="j"))
+        finally:
+            sys.stdin = saved
+        self.assertIn("reported to boss", buf.getvalue())
+        self.assertTrue((d / "finish").exists())
+        finished = []
+        self.cs.finish_later = finished.append
+        self.hook(lambda: self.cs.hook_worker_stop("j"), {}, "j")
+        self.assertEqual(finished, ["j"])
 
 
 if __name__ == "__main__":

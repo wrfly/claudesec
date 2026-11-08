@@ -26,13 +26,14 @@
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `secretary_model` | `null` | 秘书用的模型；`null` 跟 Claude Code 的默认走。**建议写死**（如 `"claude-opus-5-5"`）：默认模型变成要额外额度的那种时，秘书启动会卡在确认框上 |
-| `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定。不是 Claude 的模型以 `[1m]` 结尾（`deepseek-v4-pro[1m]`）的是网关（`ANTHROPIC_BASE_URL`）自己的，普通 Claude Code 就能跑；其他的（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……）用 `--agent ttadk` |
+| `worker_model` | `"claude-opus-5-5"` | worker 默认模型，`claudesec spawn --model` 可单独指定。不是 Claude 的模型里，网关（`ANTHROPIC_BASE_URL`）直供的（`gemini-4-argon`、`gpt-5.6-sol`、`grok-4.7`、`kimi-k3`，以及以 `[1m]` 结尾的）普通 Claude Code 就能跑；只有 ttadk 才有的（`deepseek-v4-pro-0813`、`glm-5.3`……）用 `--agent ttadk` |
 | `worker_permission_mode` | `"auto"` | worker 的 `--permission-mode` |
 | `cursor_worker_model` | `"gpt-5.6-sol[context=1m,reasoning=high,fast=false]"`（GPT-5.6 Sol 1M High） | `spawn --agent cursor` 的默认模型（Cursor 的 `agent` CLI）。第一次开 Cursor worker 时会往 `~/.cursor/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Cursor worker 里生效。本机要在 `~/.cursor/cli-config.json` 开 `"network": {"useHttp1ForAgent": true}`，否则 agent 走 HTTP/2 会卡住 |
 | `codex_worker_model` | `null`（codex 自己的默认） | `spawn --agent codex` 的默认模型（OpenAI 的 codex CLI，用它自己的登录：ChatGPT、`OPENAI_API_KEY`，或 `~/.codex/config.toml` 里的 `model_provider`）。第一次开 Codex worker（直接跑或经 ttadk）时会往 `~/.codex/hooks.json` 加三条 hook（先备份），只在 claudesec 的 Codex worker 里生效。之后 codex 会在那个 worker 窗口里问一次要不要信任它们：选「2. Trust all and continue」（这一条 claudesec 不替你答；信任目录那一问它会自动答） |
 | `ttadk_worker_model` | `"gpt-6.1-sol"` | `spawn --agent ttadk` 的默认模型：经字节的 ttadk 启动 agent CLI，走 ttadk 的端点（不用别的登录）。模型决定跑哪个：`gpt-*`、`o<N>-*`、`codex-*` 跑 Codex（`ttadk codex --mode ttadk-only`），其他（`deepseek-v4-pro-0813`、`glm-5.3`、`kimi-k3`……，`ttadk models` 列出全部）跑 Claude Code（`ttadk claude`，跟普通 Claude Code worker 一样）。worker 一直用它开始时那个 |
 | `codex_args` | `["--dangerously-bypass-approvals-and-sandbox"]` | 除模型外 codex（直接跑或经 ttadk）带的参数：默认不沙箱、从不询问（窗口没人看着）。要沙箱又能汇报，可以写 `["-s", "workspace-write", "-a", "never", "--add-dir", "~/.claudesec"]` |
-| `delegate_agent` | `["ttadk", "codex", "cursor"]` | worker 的 `claudesec delegate` 没带 `--agent` 时开哪种：这台机器上可用的第一个（写一个名字也行） |
+| `delegate_agent` | `["ttadk", "codex", "cursor"]` | worker 的 `claudesec delegate` 没带 `--agent` 时开哪种：这台机器上可用的第一个（写一个名字也行；写 `"claude"` 则开用命令向委托人汇报的 Claude Code worker） |
+| `delegate_model` | `null` | `claudesec delegate` 没带 `--model` 时的默认模型；`null` 用所选 agent 自己的默认模型（比如配 `"delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"` 让委托的小活用 Claude Code 跑网关上的其他模型） |
 | `stale_days` | `7` | 巡检把放了这么多天的待问、待答、待办挑出来提示秘书（每再过这么多天再提一次）；`0` 不按天数查 |
 | `idle_ask_minutes` | `[5, 15, 30]` | 秘书闲置这么多分钟、还有待问 / 待答 / 待办时叫醒它去问用户；每次多等到下一个数，用完就不叫，用户一说话重新算；`[]` 关掉 |
 | `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | 没设额度的 worker 花得太多时告警：超过预算窗口上限的这个比例，或者上次汇报超过 M 分钟后又花了超过 $N |

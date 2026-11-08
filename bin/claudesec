@@ -118,8 +118,9 @@ DEFAULT_CONFIG = {
     # Codex workers' permissions (plain or through ttadk), before their other arguments. The user's
     # pick (2026-10-30): full access, never asking, as their Cursor's approvalMode "unrestricted".
     "codex_args": ["--dangerously-bypass-approvals-and-sandbox"],
-    # What `claudesec delegate` starts unless told --agent: the first of these available here.
+    # What `claudesec delegate` starts unless told --agent / --model: the first of these available here.
     "delegate_agent": ["ttadk", "codex", "cursor"],
+    "delegate_model": None,           # None: the picked agent's default model
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     # Each agent of agents/*.py: "auto" = if its commands are installed (and, for codex, logged in); true; false
     "cursor": "auto",
@@ -1801,7 +1802,7 @@ def cmd_spawn(args):
         initial += f"{task}\n"
     memory = getattr(args, "memory", None)
     d = prepare_worker(name, cfg, initial, project, agent=agent, memory=memory,
-                       mode="discuss" if args.discuss else "task")
+                       mode="discuss" if args.discuss else "task", delegated=bool(args.for_worker))
     (d / "task.md").write_text(task + "\n")
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     cmd = agent.spawn_command(name, model, d, cfg)
@@ -1830,7 +1831,7 @@ def cmd_spawn(args):
         print(f"{verb} {name} ({model}) in window {window}, dir {project}")
 
 
-def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=None, mode="task"):
+def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=None, mode="task", delegated=False):
     """Fresh log, rules prompt, first message and hook settings for a worker; returns its dir.
     agent: the adapter it runs on, Claude Code if None; an external one's hooks are global (Agent.install).
     memory: another auto memory dir than cwd's (the review worker tidies the secretary's).
@@ -1842,7 +1843,7 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=N
     d = worker_dir(name)
     for mark in ("reported", "finish", AFTER_REPORT):
         (d / mark).unlink(missing_ok=True)
-    prompt = render_prompt((PROMPTS / ("worker-external.md" if agent.external else "worker.md")).read_text())
+    prompt = render_prompt((PROMPTS / ("worker-external.md" if agent.external or delegated else "worker.md")).read_text())
     prompt = (prompt.replace("{{NAME}}", name).replace("{{SECRETARY}}", cfg["secretary_name"])
               .replace("{{CLAUDESEC}}", hook_cmd()).replace("{{AGENT}}", agent.describe))
     (d / "mode").write_text(mode)
@@ -1900,14 +1901,20 @@ def fresh_prompt():
     return []
 
 
+GATEWAY_MODEL = re.compile(
+    r"((claude|opus|sonnet|haiku|fable|default|best|opusplan"
+    r"|gemini|grok|kimi|gpt-(5|mini|nano)|codex-5|composer|muse|glm-5(p3|\.2))\b"
+    r"|deepseek-(v4-pro|flash)$)"
+)
+
+
 def ttadk_model(model):
-    """A model that isn't Claude (deepseek-…, glm-…, kimi-…, gpt-…). A Claude Code worker recorded
-    with one ran through `ttadk claude` before ttadk was an agent of its own (agent_of). One ending
-    in [1m] (deepseek-v4-pro[1m]) is a Claude Code name, the gateway's (ANTHROPIC_BASE_URL) own:
-    plain `claude --model` runs it; ttadk's names have no [1m] (deepseek-v4-pro-0813)."""
+    """A model that isn't Claude's or the gateway's (ANTHROPIC_BASE_URL), so Claude Code runs it
+    only through `ttadk claude` (deepseek-v4-pro-0813, glm-5.3…). Also maps a worker recorded
+    before ttadk was an agent of its own (agent_of). A name ending in [1m] is Claude Code's
+    syntax; ttadk's names never have it."""
     model = model or "claude"
-    return not (re.match(r"(claude|opus|sonnet|haiku|fable|default|best|opusplan)\b", model)
-                or model.endswith("[1m]"))
+    return not (GATEWAY_MODEL.match(model) or model.endswith("[1m]"))
 
 
 # ---------- agents: what runs in a worker's window ----------
@@ -2121,7 +2128,7 @@ class Agent:
 
 @register_agent
 class ClaudeCode(Agent):
-    name, label, external = "claude", "Claude Code", False
+    name, label, describe, external = "claude", "Claude Code", "Claude Code", False
     commands = ("claude",)
     model_key = "worker_model"
     resume_cmd = "claude --resume"
@@ -2236,13 +2243,20 @@ def agent_running(w):
     return tmux("display", "-p", "-t", w["window"], "#{pane_dead}", check=False).strip() == "0"
 
 
+def delegate_model(agent, cfg=None):
+    """The model `claudesec delegate` runs on `agent` when --model isn't given."""
+    cfg = cfg or config()
+    return cfg.get("delegate_model") or agent.default_model(cfg)
+
+
 def delegate_agents():
     """The agents `claudesec delegate` may start, best first: config delegate_agent (a name or a
-    list of them), then the rest that report by command, in the order they were loaded."""
-    want = config().get("delegate_agent") or []
+    list of them), then the external agents not listed, in the order they were loaded."""
+    cfg = config()
+    want = cfg.get("delegate_agent") or []
     want = [want] if isinstance(want, str) else list(want)
-    names = [n for n in want if n in AGENTS] + [n for n in AGENTS if n not in want]
-    return [n for n in names if AGENTS[n].runtime(AGENTS[n].default_model(config())).external]
+    names = [n for n in want if n in AGENTS] + [n for n in AGENTS if n not in want and AGENTS[n].external]
+    return [n for n in names if n == "claude" or AGENTS[n].runtime(delegate_model(AGENTS[n], cfg)).external]
 
 
 def load_agents():
@@ -2384,7 +2398,8 @@ def render_prompt(text):
     <!-- end X -->, X an agent (on when it is available here) or delegate (when `claudesec
     delegate` has an agent to start). Blocks nest."""
     on = {n: a.available()[0] for n, a in AGENTS.items()}
-    on["delegate"] = any(AGENTS[n].runtime(AGENTS[n].default_model(config())).available()[0] for n in delegate_agents())
+    cfg = config()
+    on["delegate"] = any(AGENTS[n].runtime(delegate_model(AGENTS[n], cfg)).available()[0] for n in delegate_agents())
 
     def pick(m):
         return m.group(2) if on.get(m.group(1)) else (m.group(3) or "")
@@ -3327,7 +3342,7 @@ def cmd_wake(args):
                                                "Do it and report by the rules:")
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
-    if agent.external:  # typed into its window, it would pass for the user; and it reports by command
+    if agent.external or w.get("delegated_by"):  # typed into its window, it would pass for the user; and it reports by command
         initial = (tr("[claudesec] claudesec 发来的系统消息（不是用户在你窗口里打的字）：\n",
                       "[claudesec] A notice from claudesec itself (not the user typing in your window):\n")
                    + initial.replace("用 SendMessage ", "用规则里的 report 命令")
@@ -3342,7 +3357,7 @@ def cmd_wake(args):
             reg["workers"][name].pop("moved_from", None)
         append_log(name, "task", "; ".join(filter(None, [moved, followed])) or f"now in {cwd}")
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"),
-                       mode=w.get("mode") or "task")
+                       mode=w.get("mode") or "task", delegated=bool(w.get("delegated_by")))
     (d / "exit").unlink(missing_ok=True)
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
     cmd = agent.command(name, model, d, cfg, resume=sid, prompt=not quiet) + f"; echo $? > {shlex.quote(str(d / 'exit'))}"
@@ -4654,14 +4669,33 @@ def hook_worker_send(name):
     progress pane, the secretary's progress inbox) and not sent. Delivered, it showed in the
     secretary's window as a message, and a turn that answered it with nothing got pushed by Claude
     Code to say something anyway. A worker's rules have it send PROGRESS with `report` instead,
-    since a refused call shows in its window as "Error:"; this catches the old habit."""
+    since a refused call shows in its window as "Error:"; this catches the old habit. Any report
+    from a delegated Claude Code worker is likewise recorded for its delegator and not sent."""
     data = hook_input()
     inp = data.get("tool_input") or {}
     text = str(inp.get("message", ""))
-    if not str(inp.get("to", "")).startswith(config()["secretary_name"]) or report_type(parse_report(text)) != "PROGRESS":
+    r = parse_report(text)
+    typ = report_type(r)
+    boss = (read_registry()[1].get(name) or {}).get("delegated_by")
+    how = f"{hook_cmd()} report {shlex.quote(name)} <<'EOF'"
+    if boss and typ:
+        record_report(name, text)
+        if typ in ("FAILED", "BLOCKED"):
+            why = (r.get("ISSUE") or r.get("DID") or text).splitlines()[0][:120]
+            receipt(tr(f"{name}（为 {boss}）{typ}：{why}", f"{name} (for {boss}) {typ}: {why}"))
+        if typ == "DONE":
+            (worker_dir(name) / "finish").write_text(now())
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": tr(
+                f"[claudesec] 这条 {typ} 汇报已经替你记下并交给委托你的 worker {boss}，不要重发。"
+                f"以后汇报别用 SendMessage，在 Bash 里跑 `{how}` + 汇报原文 + `EOF`。",
+                f"[claudesec] This {typ} report is recorded for you and handed to {boss}: don't resend it. "
+                f"From now on send reports in Bash: `{how}`, the report, `EOF`.")}},
+            ensure_ascii=False))
+        return
+    if not str(inp.get("to", "")).startswith(config()["secretary_name"]) or typ != "PROGRESS":
         return
     record_report(name, text)
-    how = f"{hook_cmd()} report {shlex.quote(name)} <<'EOF'"
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
         "permissionDecisionReason": tr(
             f"[claudesec] 这条 PROGRESS 已经替你记下，秘书下一轮会看到，不要重发，接着干活。"
@@ -4724,7 +4758,8 @@ def cmd_report(args):
     if args.name not in read_registry()[1]:
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
-    if not is_external(read_registry()[1][args.name]) and report_type(parse_report(text)) != "PROGRESS":
+    w = read_registry()[1][args.name]
+    if not is_external(w) and not w.get("delegated_by") and report_type(parse_report(text)) != "PROGRESS":
         sys.exit(f"NOT REPORTED: `report` takes only a PROGRESS from a Claude Code worker. Send a "
                  f"{report_type(parse_report(text))} with SendMessage(to: \"{config()['secretary_name']}\").")
     # Cursor's subagents (Task tool) inherit the worker's environment and rules, and send
@@ -4895,6 +4930,7 @@ def cmd_delegate(args):
     # More work for one it delegated before goes to the agent it ran on; a new one, to the one asked
     # for, else the first of config delegate_agent that is available here.
     past = None if name in workers else archived_delegation(name)
+    model = args.model
     if name in workers:
         agent = agent_of(workers[name])
     elif past:
@@ -4904,12 +4940,12 @@ def cmd_delegate(args):
         names = [args.agent] if getattr(args, "agent", None) else delegate_agents()
         picked = next((n for n in names if agent_named(n).available()[0]), names[0] if names else "claude")
         agent = agent_named(picked)
-        agent = agent.runtime(args.model or agent.default_model(config()))
-        if not agent.external:
-            sys.exit(f"NOT DELEGATED: --agent {picked}"
-                     + (f" with model {args.model} runs Claude Code" if agent.name != "claude" else " is Claude Code")
-                     + ", which doesn't report by command. Use a subagent, or spawn a worker through the secretary.")
-    if not agent.external:
+        model = args.model or delegate_model(agent, config())
+        agent = agent.runtime(model)
+        if not agent.external and agent.name != "claude":
+            sys.exit(f"NOT DELEGATED: --agent {picked} with model {model} runs Claude Code"
+                     ", which doesn't report by command. Use a subagent, or spawn a worker through the secretary.")
+    if not agent.external and agent.name != "claude":
         sys.exit(f"{name} is taken and isn't a worker you delegated to; pick another --name")
     label = agent.label
     ok, why = agent.available()
@@ -4933,7 +4969,7 @@ def cmd_delegate(args):
     since, start = time.time(), 0
     w = workers.get(name)
     if w:
-        if w.get("delegated_by") != boss or not is_external(w):
+        if w.get("delegated_by") != boss:
             sys.exit(f"{name} is taken and isn't a worker you delegated to; pick another --name")
         if not agent_running(w):
             sys.exit(f"{name} has no running agent any more (status {w['status']}); delegate under a new --name")
@@ -4989,7 +5025,7 @@ def cmd_delegate(args):
             sys.exit(f"--dir {project}: no such directory")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            err = quietly(cmd_spawn, name=name, dir=project, model=args.model, discuss=False, agent=agent.name,
+            err = quietly(cmd_spawn, name=name, dir=project, model=model, discuss=False, agent=agent.name,
                           for_worker=boss, task=task)
         if err:
             sys.exit(f"NOT DELEGATED: spawning {name} failed: {err}\n{out.getvalue()}")
@@ -5249,22 +5285,35 @@ def hook_worker_stop(name):
             w["pending_ask"] = None
     if data.get("background_tasks"):
         return  # waiting on its own background subagents; it will be woken and report then
-    if read_registry()[1].get(name, {}).get("mode") == "discuss":
+    w = read_registry()[1].get(name) or {}
+    if w.get("mode") == "discuss":
         return  # every turn of a discussion ends waiting for the user, who is in the window
-    if not secretary_alive():
+    if not w.get("delegated_by") and not secretary_alive():
         return  # nobody to report to; the report, if any, is in the log and registry already
-    marker = worker_dir(name) / "reported"
+    d = worker_dir(name)
+    marker = d / "reported"
     if marker.exists() or data.get("stop_hook_active"):
+        if not marker.exists():
+            (d / "ended-unreported").write_text(now())
         marker.unlink(missing_ok=True)
+        if (d / "finish").exists():
+            finish_later(name)
         return
-    sec = config()["secretary_name"]
-    print(json.dumps({"decision": "block", "reason":
-        tr(f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
-           "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
-           "若用户刚在你的窗口直接跟你说过话，汇报里注明。",
-           f"Before ending this turn, send a report with SendMessage(to: \"{sec}\") whose TYPE is "
-           "DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count). "
-           "If the user just talked to you in your window, say so in the report.")}, ensure_ascii=False))
+    if w.get("delegated_by"):
+        reason = tr(f"结束本轮前必须用 shell 执行 `{SELF} report {name}`（stdin 传入汇报正文）发一条汇报，"
+                    "TYPE 为 DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算），格式见规则里的「汇报」。",
+                    f"Before ending this turn, run `{SELF} report {name}` in a shell (the report on stdin) to send "
+                    "a report whose TYPE is DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count); "
+                    "the format is under \"Reporting\" in your rules.")
+    else:
+        sec = config()["secretary_name"]
+        reason = tr(f"结束本轮前必须用 SendMessage(to: \"{sec}\") 发一条汇报，TYPE 为 "
+                    "DONE / FAILED / BLOCKED / NEED_DECISION 之一（PROGRESS 不算）。"
+                    "若用户刚在你的窗口直接跟你说过话，汇报里注明。",
+                    f"Before ending this turn, send a report with SendMessage(to: \"{sec}\") whose TYPE is "
+                    "DONE / FAILED / BLOCKED / NEED_DECISION (PROGRESS doesn't count). "
+                    "If the user just talked to you in your window, say so in the report.")
+    print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
 
 
 def hook_secretary_session_start():
@@ -5812,8 +5861,9 @@ def hook_worker_stop_failure(name):
         watching = user_watching(w.get("window"))  # then they see it; check_stuck speaks up if it stays
         if not watching:
             w["alerted_for"] = f"API_ERROR|{w['last_report_at']}"
+    (worker_dir(name) / "ended-error").write_text(now())
     append_log(name, "api-error", err)
-    if not watching:
+    if not watching and not w.get("delegated_by"):
         raise_alert(tr(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}",
                        f"worker {name}'s turn broke off on an API error; it sits at its prompt and won't report on its own: {err}"))
 

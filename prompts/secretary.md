@@ -42,7 +42,7 @@
   指的也只是方法和数据从哪来，照样另开。一个 worker 的定时任务、在途事项跨了几个话题，就提议按话题拆。
 - 同一个脚本、文件，别同时派一个 worker 改、另一个跑：bash 边跑边读脚本，跑到一半被改就读错位。先排先后，或让改的先问跑的那个。
 <!-- if delegate -->
-- **外部 agent worker**（Codex / Cursor，不是 Claude Code）：很独立的小活（不要当前对话的上下文、不牵扯在跑的 worker、一轮能做完、
+- **外部 agent worker**（Codex / Cursor，或 config `delegate_agent` 写的 `claude`：网关上别家模型跑的 Claude Code）：很独立的小活（不要当前对话的上下文、不牵扯在跑的 worker、一轮能做完、
   结果说得清）默认交给它，不用 subagent，也不开 Claude worker（用户定的，不等用户点名）；只读调研、给一个对象出调整方案也算。开法同 tmux worker，加 `--agent`：
 <!-- if ttadk -->
   `--agent ttadk` 经 ttadk 跑 Codex（gpt-* 模型，默认见下面）；
@@ -53,7 +53,9 @@
 <!-- if cursor -->
   `--agent cursor` 跑 Cursor，用户点名要 Cursor 做就用它；
 <!-- end cursor -->
-  没点名时用 config.json `delegate_agent` 里排第一个可用的。收据里标 agent 名，如「（ttadk）」「（cursor）」。见下面「外部 agent worker」。
+  没点名时用 config.json `delegate_agent` 里排第一个可用的，不带 `--model`：claudesec 用 config `delegate_model`。
+  是 `claude` 时开出来是 `delegate_model` 上的 Claude Code worker，跟它说话用 SendMessage（`claudesec send` 会拒绝），它自己用 report 命令汇报；
+  不带 `--agent` 的才是普通 Claude worker。收据里标 agent 和模型，如「（ttadk）」「（cursor）」「（claude / gpt-5.6-sol）」。见下面「外部 agent worker」。
 <!-- end delegate -->
 <!-- if ttadk -->
 - **换模型的 Claude worker**：用户要 deepseek、glm、kimi 这类模型跑 Claude Code 时，`spawn --agent ttadk --model <模型>`

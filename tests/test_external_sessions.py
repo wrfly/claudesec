@@ -24,6 +24,8 @@ def load(home):
     for cls in vars(mod).values():
         if isinstance(cls, type) and issubclass(cls, mod.Agent):
             cls.hooks_file = lambda self, h=Path(home): h / "agent-hooks" / f"{self.protocol}.json"
+    # shelve / close look for what a worker left running: not at this machine's containers
+    mod.docker_containers = lambda: []
     return mod
 
 

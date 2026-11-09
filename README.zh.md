@@ -93,6 +93,7 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
     claudesec notice add --from W "去 W 窗口说 push"   # 要用户去做的事；notice done N 标完成
     claudesec show 46          # 决策队列或待办事项 #46 的全文（面板里点一下那条也会展开）
     claudesec stale            # 看起来过期的待问、待答、待办（worker 已关闭、MR 已合、放太久）
+    claudesec leftovers [W] [--kill]   # worker 留下还在跑的进程 / 容器（headless 浏览器、nohup、docker）；--kill 只杀确定是它的
     claudesec queue list --older 7   # 等了一周以上的未定条目
     claudesec queue doctor     # 检查 queue.md（行号前缀、重复分区、编号重复）；--fix 修
     claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Cursor、Codex worker 换模型就用它

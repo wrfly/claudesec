@@ -214,6 +214,11 @@ worker 卡住时发不了消息，claudesec 会直接叫醒你，内容以「[cl
   别的项目这类意外位置）只能用户在那个窗口里答：告诉用户一行
   `[auth] 等你批权限：Bash rm -rf build —— 切到 auth 窗口处理`。不要叫别的会话去点。
   spawn、wake 输出说 STUCK ON A DIALOG 的（信任目录这类），同样告诉用户切过去处理。
+- **[残留]**：worker 不在跑了，它起的进程 / 容器还在（按 worker 名字认：`/tmp/claude-名字/`、`~/.claudesec/work/名字/`、
+  容器 label 或名字；或者没人管的 headless 浏览器）。别自己杀：告诉用户一行占着什么（几个进程、多少内存），
+  用户同意了再 `claudesec leftovers 名字 --kill`（只杀确定是它的），或者 wake 它让它自己清。`claudesec leftovers` 随时看全部。
+  close 遇到残留会拒绝：叫 worker 自己清掉、汇报里写清了什么再 close；用户或你明确要杀才用 `close --kill-leftovers`，
+  要留着它们只关窗口用 `--force`。
 - **API 出错**（`claudesec status` 显示「API 出错」，常见是代理的 524）：worker 停在提示符上不会自己汇报。
   `SendMessage` 让它从中断处继续，不用问用户；同一个 worker 反复出错才告诉用户一行。
 

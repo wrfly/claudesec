@@ -3249,6 +3249,390 @@ def detached_jobs(sid, claude_pid):
     return [(p, c) for p, c in out if parents.get(p) not in {q for q, _ in out}]
 
 
+# ---------- leftovers: what a worker started and left behind ----------
+# 2026-11-09: modelaudit took screenshots with a headless Chrome started under `env -i`, so it had
+# no CLAUDE_CODE_SESSION_ID for detached_jobs to find; shelve and close missed it, and its dozen
+# processes (~900MB) ran 8 hours on the user's laptop. Besides that mark, a worker's things are
+# known by its name: a path under /tmp/claude-<name>/ or ~/.claudesec/work/<name>/ as their cwd,
+# an argument (or --flag=value), or HOME / TMPDIR / XDG_* in their environment; a docker container
+# by label, mount or name. A headless browser orphaned while the worker ran is only "maybe" its.
+# Anything still under a live tmux pane or Claude Code session is someone's live work: never these.
+
+BROWSERS = {"chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+            "chrome-headless-shell", "headless_shell", "firefox", "firefox-esr", "msedge", "microsoft-edge"}
+MARK_ENV = ("HOME", "PWD", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR")
+
+
+def leftover_roots(name):
+    roots = {f"/tmp/claude-{name}", str(Path(tempfile.gettempdir()) / f"claude-{name}"),
+             str(HOME / "work" / name), os.path.realpath(HOME / "work" / name)}
+    return sorted(roots)
+
+
+def under_root(path, roots):
+    return bool(path) and any(path == r or path.startswith(r + "/") for r in roots)
+
+
+def ps_snapshot():
+    """Every process this user can see, from /proc: {pid: SimpleNamespace(ppid, comm, argv, cwd,
+    env, start (epoch), rss (bytes))}. Linux only; elsewhere empty."""
+    from types import SimpleNamespace
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return {}
+    try:
+        btime = next(int(l.split()[1]) for l in (proc / "stat").read_text().splitlines() if l.startswith("btime"))
+    except (OSError, StopIteration, ValueError):
+        btime = 0
+    tick, page = os.sysconf("SC_CLK_TCK"), os.sysconf("SC_PAGE_SIZE")
+    out = {}
+    for d in proc.iterdir():
+        if not d.name.isdigit():
+            continue
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            stat = (d / "stat").read_text()
+            comm = stat[stat.index("(") + 1:stat.rindex(")")]
+            fields = stat.rsplit(")", 1)[1].split()
+            argv = [a.decode(errors="replace") for a in (d / "cmdline").read_bytes().split(b"\0")[:-1]]
+            if not argv:
+                continue  # a kernel thread
+            env = {}
+            with contextlib.suppress(OSError):
+                for kv in (d / "environ").read_bytes().split(b"\0"):
+                    k, _, v = kv.decode(errors="replace").partition("=")
+                    if k in MARK_ENV or k == "CLAUDE_CODE_SESSION_ID":
+                        env[k] = v
+            cwd = ""
+            with contextlib.suppress(OSError):
+                cwd = os.readlink(d / "cwd").removesuffix(" (deleted)")
+            rss = 0
+            with contextlib.suppress(OSError, ValueError, IndexError):
+                rss = int((d / "statm").read_text().split()[1]) * page
+            out[int(d.name)] = SimpleNamespace(ppid=int(fields[1]), comm=comm, argv=argv, cwd=cwd, env=env,
+                                               start=btime + int(fields[19]) / tick, rss=rss)
+    return out
+
+
+def live_trees(snap):
+    """Pids that are some live session's own: under a tmux pane or a Claude Code session, and
+    this very command with its callers."""
+    roots = set()
+    with contextlib.suppress(Exception):
+        roots |= {int(p) for p in tmux("list-panes", "-a", "-F", "#{pane_pid}", check=False).split() if p.isdigit()}
+    with contextlib.suppress(Exception):
+        roots |= {s["pid"] for s in claude_sessions() if s.get("pid")}
+    keep, pid = set(), os.getpid()
+    while pid and pid not in keep:  # the callers only, not all that's under them (systemd, init)
+        keep.add(pid)
+        pid = snap[pid].ppid if pid in snap else 0
+    roots.add(os.getpid())
+    for p in snap:
+        q, seen = p, set()
+        while q and q not in seen:
+            if q in roots:
+                keep.add(p)
+                break
+            seen.add(q)
+            q = snap[q].ppid if q in snap else 0
+    return keep
+
+
+def weak_roots(name):
+    """/tmp/<name>/: a worker's scratch as often as anything else of that name (grpscroll's
+    Chromes, 11-09), so a match there is only "maybe"."""
+    return sorted({f"/tmp/{name}", str(Path(tempfile.gettempdir()) / name)})
+
+
+def path_mark(p, roots):
+    if under_root(p.cwd, roots):
+        return f"cwd {p.cwd}"
+    for a in p.argv:
+        v = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+        if under_root(v, roots):
+            return tr(f"参数 {v}", f"arg {v}")
+    for k in MARK_ENV:
+        if under_root(p.env.get(k), roots):
+            return f"{k}={p.env[k]}"
+    return None
+
+
+def proc_mark(p, name, sid):
+    """Why process p is worker name's, and whether that is sure: (why, sure) or None. Paths
+    count as an argument of their own or a --flag=value, not inside a longer text: a worker's
+    own claude has its whole task, other workers' paths and all, in one argument."""
+    if sid and p.env.get("CLAUDE_CODE_SESSION_ID") == sid:
+        return tr("会话环境变量", "session env"), True
+    why = path_mark(p, leftover_roots(name))
+    if why:
+        return why, True
+    why = path_mark(p, weak_roots(name))
+    return (why, False) if why else None
+
+
+def orphan_headless(p, snap):
+    """A headless browser's main process with no live parent (adopted by init / systemd --user)."""
+    if Path(p.argv[0]).name not in BROWSERS or any(a.startswith("--type=") for a in p.argv):
+        return False
+    if not any(a.startswith(("--headless", "-headless")) for a in p.argv):
+        return False
+    return p.ppid <= 1 or (p.ppid in snap and snap[p.ppid].comm == "systemd")
+
+
+def group(pid, snap):
+    """pid and everything under it."""
+    kids, out, todo = {}, [], [pid]
+    for q, p in snap.items():
+        kids.setdefault(p.ppid, []).append(q)
+    while todo:
+        q = todo.pop()
+        if q not in out:
+            out.append(q)
+            todo += kids.get(q, [])
+    return out
+
+
+def epoch(stamp):
+    with contextlib.suppress(TypeError, ValueError):
+        return dt.datetime.fromisoformat(stamp).timestamp()
+    return None
+
+
+def docker_containers():
+    """Running containers: [{id, name, labels, mounts, created (epoch)}]; none without docker."""
+    if not shutil.which("docker"):
+        return []
+    try:
+        ids = subprocess.run(["docker", "ps", "-q", "--no-trunc"], capture_output=True, text=True,
+                             timeout=5).stdout.split()
+        if not ids:
+            return []
+        info = json.loads(subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True,
+                                         timeout=10).stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    out = []
+    for c in info:
+        created = c.get("Created", "")
+        m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)?$", created)
+        out.append({"id": c.get("Id", "")[:12], "name": c.get("Name", "").lstrip("/"),
+                    "labels": (c.get("Config") or {}).get("Labels") or {},
+                    "mounts": [x.get("Source", "") for x in c.get("Mounts") or []],
+                    "created": epoch(m.group(1) + ("+00:00" if m.group(2) in (None, "Z") else m.group(2)))
+                    if m else None})
+    return out
+
+
+def container_mark(c, name, roots, since):
+    """Why container c is the worker's, or None. A name alone counts only for one created while
+    the worker ran (since: its start), so the user's own `redis` isn't taken for worker redis's."""
+    if c["labels"].get("claudesec.worker") == name:
+        return "label claudesec.worker"
+    for k, v in c["labels"].items():
+        if under_root(v, roots):
+            return f"label {k}={v}"
+    for src in c["mounts"]:
+        if under_root(src, roots):
+            return tr(f"挂载 {src}", f"mount {src}")
+    n = c["name"]
+    named = (n == name or n.startswith((f"{name}-", f"{name}_", f"claude-{name}", f"claudesec-{name}"))
+             or n.endswith((f"-{name}", f"_{name}")) or c["labels"].get("com.docker.compose.project") == name)
+    if named and since and c["created"] and c["created"] >= since:
+        return tr("名字", "name")
+    return None
+
+
+def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None):
+    """What worker `name` left running: [{kind: proc|docker, id, what, why, sure, n, rss}].
+    sure=False: only under /tmp/<name>/, or a headless browser orphaned after `since` with
+    nothing else tying it to this worker (another worker running then could own it): shown and
+    alerted on, never refused on, never killed."""
+    snap = ps_snapshot() if snap is None else snap
+    keep = live_trees(snap) if keep is None else keep
+    roots = leftover_roots(name)
+    found = {}
+    for pid, p in snap.items():
+        if pid in keep:
+            continue
+        mark = proc_mark(p, name, sid)
+        if mark:
+            found[pid] = mark
+        elif since and p.start >= since and orphan_headless(p, snap):
+            found[pid] = (tr("孤儿无头浏览器，启动于它在跑期间", "orphan headless browser started while it ran"), False)
+    out = []
+    for pid, (why, sure) in found.items():
+        if snap[pid].ppid in found:
+            continue  # shown with its outermost
+        members = group(pid, snap)
+        out.append({"kind": "proc", "id": pid, "what": " ".join(" ".join(snap[pid].argv).split())[:160], "why": why, "sure": sure,
+                    "n": len(members), "rss": sum(snap[q].rss for q in members if q in snap)})
+    for c in docker_containers() if containers is None else containers:
+        why = container_mark(c, name, roots, since)
+        if why:
+            out.append({"kind": "docker", "id": c["id"], "what": c["name"], "why": why, "sure": True, "n": 1, "rss": 0})
+    return out
+
+
+def show_leftovers(found):
+    lines = []
+    for f in found:
+        if f["kind"] == "docker":
+            lines.append(tr(f"  docker {f['id']} {f['what']}（{f['why']}）", f"  docker {f['id']} {f['what']} ({f['why']})"))
+        else:
+            size = f", ~{f['rss'] // 2**20}MB" if f["rss"] else ""
+            maybe = tr("，不确定是它的", ", not sure it's its") if f.get("maybe", not f["sure"]) else ""
+            lines.append(tr(f"  {f['id']}  {f['what']}（{f['why']}；{f['n']} 个进程{size}{maybe}）",
+                            f"  {f['id']}  {f['what']} ({f['why']}; {f['n']} processes{size}{maybe})"))
+    return "\n".join(lines)
+
+
+def kill_leftovers(found):
+    """Stop what leftovers() was sure of: SIGTERM to each process group member, docker stop.
+    Returns the lines it acted on."""
+    done, snap = [], ps_snapshot()
+    for f in found:
+        if not f["sure"]:
+            continue
+        if f["kind"] == "docker":
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(["docker", "stop", f["id"]], capture_output=True, timeout=30)
+                done.append(f"docker {f['id']} {f['what']}")
+            continue
+        for q in group(f["id"], snap) if f["id"] in snap else [f["id"]]:
+            with contextlib.suppress(OSError):
+                os.kill(q, signal.SIGTERM)
+        done.append(f"{f['id']} {f['what'][:80]}")
+    return done
+
+
+def worker_leftovers(name, w):
+    return leftovers(name, sid=w.get("session"), since=epoch(w.get("started_at")))
+
+
+def refuse_if_leftovers(name, w):
+    found = [f for f in worker_leftovers(name, w) if f["sure"]]
+    if found:
+        sys.exit(tr(f"{name} 留下的进程 / 容器还在跑：\n{show_leftovers(found)}\n搁置会让它们没人管，醒来的 {name} 也不知道它们。"
+                    f"叫 {name} 清掉（或者说明还要留着），或者加 --force。没有搁置。",
+                    f"{name} left processes / containers running:\n{show_leftovers(found)}\nShelved, nobody would look "
+                    f"after them, and a woken {name} would not know of them. Ask {name} to clean them up (or say why they "
+                    f"stay), or pass --force. Not shelved."))
+
+
+LEFTOVER_CHECK_SECS = 600
+
+
+def mentioned(names, snap, keep, containers, reg):
+    """Of names, those that could have leftovers at all, so the full check runs for the few that
+    can rather than the hundreds of workers claudesec has known: named by a process's paths
+    (/tmp/<x>/, /tmp/claude-<x>/, work/<x>/) or session id, or found in a container's name,
+    labels or mounts."""
+    bases = {str(HOME / "work"), os.path.realpath(HOME / "work"), "/tmp", tempfile.gettempdir()}
+    sids = {w.get("session"): n for n, w in reg.items() if w.get("session")}
+    out = set()
+    for pid, p in snap.items():
+        if pid in keep:
+            continue
+        if p.env.get("CLAUDE_CODE_SESSION_ID") in sids:
+            out.add(sids[p.env["CLAUDE_CODE_SESSION_ID"]])
+        for v in [p.cwd, *p.env.values(), *(a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+                                              for a in p.argv)]:
+            for base in bases:
+                if v.startswith(base + "/"):
+                    first = v[len(base) + 1:].split("/", 1)[0]
+                    out |= {first, first.removeprefix("claude-")}
+    text = " ".join(x for c in containers for x in [c["name"], *c["labels"].values(), *c["mounts"]])
+    out |= {n for n in names if n in text}
+    return names & out
+
+
+def all_leftovers():
+    """What no running worker owns: [(name or None, [leftover])]. By name, for each worker
+    claudesec has known (registry, workers/, work/) that isn't running now; by itself, a
+    headless browser orphaned before any worker now running had started."""
+    reg = read_registry()[1]
+    windows = alive_windows()
+    live = {n for n, w in reg.items() if w["status"] != "SHELVED" and w.get("window") in windows}
+    names = set(reg) | {d.name for base in ("workers", "work") if (HOME / base).is_dir()
+                        for d in (HOME / base).iterdir() if d.is_dir()}
+    snap = ps_snapshot()
+    keep, containers = live_trees(snap), docker_containers()
+    out, seen = [], set()
+    for name in sorted(mentioned(names, snap, keep, containers, reg)):
+        w = reg.get(name) or {}
+        found = leftovers(name, sid=w.get("session"), snap=snap, containers=containers, keep=keep)
+        seen |= {f["id"] for f in found}
+        if found and name not in live:  # a running worker's are its own business
+            out.append((name, found))
+    first = min((epoch(reg[n].get("started_at")) or 0 for n in live), default=None)
+    stray = [{"kind": "proc", "id": pid, "what": " ".join(" ".join(p.argv).split())[:160], "sure": False, "maybe": False,
+              "why": tr("孤儿无头浏览器", "orphan headless browser"), "n": len(group(pid, snap)),
+              "rss": sum(snap[q].rss for q in group(pid, snap) if q in snap)}
+             for pid, p in snap.items() if pid not in keep and pid not in seen and orphan_headless(p, snap)
+             and (first is None or p.start < first)]
+    if stray:
+        out.append((None, stray))
+    return out
+
+
+def check_leftovers():
+    """Alert the secretary, once each, about processes / containers a worker left running
+    after it stopped (not shelved: shelve refuses; close refuses; this is what got past)."""
+    path = HOME / "leftovers.json"
+    try:
+        seen = json.loads(path.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    found, raised, current = all_leftovers(), [], {}
+    for name, items in found:
+        new = [f for f in items if f"{f['kind']}:{f['id']}" not in seen]
+        current |= {f"{f['kind']}:{f['id']}": seen.get(f"{f['kind']}:{f['id']}") or now() for f in items}
+        if not new:
+            continue
+        if name:
+            raised.append(tr(f"[残留] {name} 没在跑，但它留下的东西还在：\n{show_leftovers(new)}\n别自己杀：告诉用户占着什么，"
+                             f"用户同意了再 `claudesec leftovers {name} --kill`（只杀确定是它的），或者 wake {name} 让它自己清。",
+                             f"[leftovers] {name} isn't running, but what it left is:\n{show_leftovers(new)}\nDon't kill them "
+                             f"yourself: tell the user what they hold; once they agree, `claudesec leftovers {name} --kill` (only "
+                             f"what is surely its), or wake {name} to clean up."))
+        else:
+            raised.append(tr(f"[残留] 有无头浏览器没人管（父进程是 init / systemd，没有在跑的 worker 早于它启动）：\n"
+                             f"{show_leftovers(new)}\n多半是哪个 worker 截图留下的。告诉用户，由用户决定杀不杀。",
+                             f"[leftovers] headless browsers nobody owns (adopted by init / systemd; no worker running now "
+                             f"started before them):\n{show_leftovers(new)}\nMost likely a worker's screenshots. Tell the "
+                             f"user; killing them is theirs to decide."))
+    if current != seen:
+        tmp = path.with_name(f".leftovers.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(current))
+        os.replace(tmp, path)
+    for text in raised:
+        raise_alert(text)
+    return raised
+
+
+def cmd_leftovers(args):
+    if not args.name:
+        if args.kill:
+            sys.exit("--kill needs a worker name")
+        found = all_leftovers()
+        for name, items in found:
+            print(f"{name or tr('（没对上 worker）', '(no worker)')}:\n{show_leftovers(items)}")
+        if not found:
+            print(tr("没有发现残留", "no leftovers found"))
+        return
+    w = read_registry()[1].get(args.name) or {}
+    found = worker_leftovers(args.name, w)
+    if not found:
+        print(tr(f"{args.name} 没有留下在跑的进程或容器", f"{args.name} left nothing running"))
+        return
+    print(show_leftovers(found))
+    if args.kill:
+        done = kill_leftovers(found)
+        if done and w:
+            append_log(args.name, "task", "killed leftovers:\n" + "\n".join(done))
+        print(tr("已停掉：", "stopped: ") + ("; ".join(done) or tr("无", "none")) +
+              ("" if all(f["sure"] for f in found) else tr("（不确定的没动）", " (left the unsure ones alone)")))
+
+
 def cmd_shelve(args):
     workers = read_registry()[1]
     if args.name in workers:
@@ -3271,6 +3655,8 @@ def cmd_shelve(args):
         holder = None if is_external(w) else live_holder(sid)
         if holder and not args.force:
             refuse_if_working(name, holder)
+        if not args.force and getattr(args, "by", "user") not in ("exit", "model"):
+            refuse_if_leftovers(name, w)
         if holder:
             stop_foreground(holder)
         if w.get("window"):
@@ -3587,15 +3973,46 @@ def cmd_peek(args):
 
 
 def cmd_close(args):
+    """Leftovers (what it started and left running, see leftovers()) stop a close: the worker
+    knows what they are, so it should clean them up. --kill-leftovers stops them instead (only
+    when the user or the secretary asked for that), --force closes and leaves them."""
+    kill, force = getattr(args, "kill_leftovers", False), getattr(args, "force", False)
+    w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
+    before = worker_leftovers(args.name, w)
+    if any(f["sure"] for f in before) and not (kill or force):
+        sys.exit(tr(f"{args.name} 留下的进程 / 容器还在跑：\n{show_leftovers(before)}\n没有关。叫 {args.name} 自己清掉、"
+                    f"汇报里写清了什么（搁置了就先 wake），再 close；用户或你明确要杀，用 --kill-leftovers；要留着它们只关窗口，用 --force。",
+                    f"{args.name} left processes / containers running:\n{show_leftovers(before)}\nNot closed. Ask "
+                    f"{args.name} to clean them up and report what it cleaned (wake it first if shelved), then close; "
+                    f"--kill-leftovers if the user or you explicitly want them killed; --force to close and leave them."))
     with registry() as reg:
         w = reg["workers"].pop(args.name, None) or sys.exit(f"no worker {args.name}")
         if reg["focus"] == args.name:
             reg["focus"] = None
+    holder = None if is_external(w) else live_holder(w.get("session"))
     if w.get("window"):
         tmux("kill-window", "-t", w["window"], check=False)
+    for _ in range(20):  # its own children outlive the window by a moment, or for good (nohup)
+        try:
+            os.kill(holder["pid"], 0) if holder and holder.get("pid") else None
+        except OSError:
+            holder = None
+        if not holder:
+            break
+        time.sleep(0.1)
+    after = worker_leftovers(args.name, w) if w.get("window") else before
+    if kill:
+        done = kill_leftovers(after)
+        if done:
+            print(tr("已停掉它留下的：", "stopped what it left: ") + "; ".join(done))
+        after = [f for f in after if not f["sure"]]
     note = "" if w.get("archived") else tr("（注意：未归档）", " (note: not archived)")
     (HOME / "stale-due").touch()  # items tagged with it may be orphans now
     print(f"closed {args.name}{note}")
+    if after:
+        print(tr(f"它留下的这些还在跑，没动：\n{show_leftovers(after)}\n告诉用户；用户同意了再 `claudesec leftovers {args.name} --kill`。",
+                 f"These it left are still running, untouched:\n{show_leftovers(after)}\nTell the user; once they agree, "
+                 f"`claudesec leftovers {args.name} --kill`."))
 
 
 # ---------- history ----------
@@ -3675,6 +4092,11 @@ def cmd_archive(args):
                f"\nFull transcript: `{resume_hint(w)}`\n"))
         with registry() as reg:
             reg["workers"][args.name]["archived"] = str(path.relative_to(HOME / "history"))
+        found = worker_leftovers(args.name, w)
+        if found:
+            print(tr(f"注意：{args.name} 留下的进程 / 容器还在跑，close 前叫它清掉、汇报里写清了什么：\n{show_leftovers(found)}",
+                     f"Note: {args.name} left processes / containers running; before close, ask it to clean them up and "
+                     f"report what it cleaned:\n{show_leftovers(found)}"))
     rel = str(path.relative_to(HOME / "history"))
     project = Path(args.dir or (read_registry()[1].get(args.name, {}).get("dir", ""))).name
     index_add(rel, f"- {date} · {project} · {args.name} · {status} · {args.summary or ''} · "
@@ -4304,7 +4726,7 @@ def check_reminders(run_pid):
     """Runs alongside the secretary, for as long as its `claudesec run` is the current one.
     The lock hands over from an older checker whose secretary is gone. Runaway spending is
     looked at here too, less often."""
-    last_runaway = last_stale = 0.0
+    last_runaway = last_stale = last_leftovers = 0.0
     with open(HOME / "reminders-checker.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
@@ -4320,6 +4742,10 @@ def check_reminders(run_pid):
                 (HOME / "stale-due").unlink(missing_ok=True)
                 with contextlib.suppress(Exception):  # nor a broken queue.md or git checkout
                     check_stale()
+            if time.monotonic() - last_leftovers >= LEFTOVER_CHECK_SECS:
+                last_leftovers = time.monotonic()
+                with contextlib.suppress(Exception):  # nor a docker that hangs or a /proc that changes
+                    check_leftovers()
             with contextlib.suppress(Exception):
                 check_idle()
             time.sleep(REMINDER_CHECK_SECS)
@@ -6073,7 +6499,10 @@ def main():
     s = sub.add_parser("log"); s.add_argument("name"); s.add_argument("-n", type=int, default=3)
     s.set_defaults(fn=cmd_log)
     s = sub.add_parser("interrupt"); s.add_argument("name"); s.set_defaults(fn=cmd_interrupt)
-    s = sub.add_parser("close"); s.add_argument("name"); s.set_defaults(fn=cmd_close)
+    s = sub.add_parser("close"); s.add_argument("name"); s.add_argument("--kill-leftovers", action="store_true")
+    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_close)
+    s = sub.add_parser("leftovers"); s.add_argument("name", nargs="?"); s.add_argument("--kill", action="store_true")
+    s.set_defaults(fn=cmd_leftovers)
     s = sub.add_parser("peek"); s.add_argument("name"); s.add_argument("-n", type=int, default=15)
     s.set_defaults(fn=cmd_peek)
     s = sub.add_parser("sessions"); s.set_defaults(fn=cmd_sessions)

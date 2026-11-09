@@ -480,7 +480,9 @@ claudesec report NAME <<< 汇报       外部 agent worker 给秘书的汇报
 claudesec remind WHEN TARGET 内容 [--every 1d]   定时任务，到点叫醒秘书；--list [--all]、--cancel ID
 claudesec review [--print]       开当天的复盘 worker（整理秘书记忆、提提示词 diff）
 claudesec send NAME <<< 原话         秘书给外部 agent worker 说话（粘贴进它的窗口）
-claudesec status | log NAME [-n N] | interrupt NAME | close NAME
+claudesec status | log NAME [-n N] | interrupt NAME
+claudesec close NAME [--kill-leftovers | --force]   有残留（见「残留」一节）就拒绝；--kill-leftovers 停掉确定的，--force 留着只关
+claudesec leftovers [NAME] [--kill]   某个 / 所有不在跑的 worker 留下的进程、容器；--kill 只停确定是它的
 claudesec peek NAME [-n N]      窗口最后几行 + 它的 claude 忙不忙（收之前看一眼）；输入框 ❯ 后的灰色（SGR 2）文字是
                                 Claude Code 的建议或占位，标成「【CC 建议，不是用户输入】」，和用户没发出的草稿区分开
 claudesec archive NAME --summary S --tags a,b [--files x,y]
@@ -723,6 +725,29 @@ status 列出未到点的提醒。
 已验证（单测 tests/test_stale.py）：三种理由、搁置和记录不查、提一次不重复、过 14 天再提、条目清掉后忘掉、`stale_days: 0`、
 当天第一条消息附上并不再告警、DONE / close 触发、待办记加入日期和时刻、归档后加入的不算关闭（按天、按秒）。手跑：拿 10-23 的 queue.md 备份和真实注册表、历史，
 挑出 3 条标了已关闭 worker 的；造的条目里 !354 !355 认出已在 alert-atlas 合入，用时约 0.2 秒。
+
+### 残留：worker 留下还在跑的东西（`claudesec leftovers`）
+
+2026-11-09：modelaudit 截图时用 `env -i HOME=/tmp/claude-modelaudit google-chrome --headless …` 起了浏览器，没关；shelve、close 都没发现，
+十几个进程、约 900MB 在用户的笔记本上挂了 8 小时。原来只认 `detached_jobs`：进程环境里的 `CLAUDE_CODE_SESSION_ID`，`env -i` 一清就没了。
+- 认法（`leftovers()`，只读 /proc，Linux）：环境里有它的会话 id；或者 cwd、某个参数（整个参数或 `--flag=值`，不看长文本里提到的路径：
+  worker 自己的 claude 把整份任务书当一个参数，里面常有别人的路径）、HOME / PWD / TMPDIR / XDG_* 落在 `/tmp/claude-名字/`、
+  `~/.claudesec/work/名字/` 下面——这些算「确定」。`/tmp/名字/` 下的（grpscroll 那天就是）和它在跑期间被 init / systemd 收养的
+  headless 浏览器只算「可能」：显示、告警，不拦、不杀。docker 容器：label `claudesec.worker=名字`、label 值或挂载在那两个目录下；
+  名字（`名字`、`名字-*`、`claude-名字*` 等）只在容器建于 worker 开始之后才算，免得把用户自己的同名容器当成它的。
+- 永远不算：还在某个 tmux 窗格或 Claude Code 会话进程树里的（那是谁的活儿还在跑），和这条命令自己及其上级。
+- shelve 有确定的残留就拒绝（--force 过；秘书退出、换模型时的 shelve 不查）。close 先查：有确定的就拒绝，提示叫 worker 自己清掉、
+  汇报写清了什么；`--kill-leftovers`（用户或秘书明确要杀时）停掉确定的，`--force` 留着只关窗口；关掉窗口后再查一遍，还剩的打印出来。
+  archive 发现残留打一行提醒。worker.md 要求 DONE 前清掉并在汇报里写明，临时目录用 `/tmp/claude-名字/`、容器加 label。
+- watchdog：提醒检查器每 10 分钟 `check_leftovers`，对注册表、workers/、work/ 里出现过、现在不在跑的每个名字查一遍，再加上
+  没对上 worker、早于所有在跑 worker 启动的孤儿 headless 浏览器；新发现的发「[残留]」告警，每个进程 / 容器只报一次（`leftovers.json`）。
+- 不自动杀：杀不杀由用户定，秘书照告警里的命令做。
+
+已验证（单测 tests/test_leftovers.py）：env -i 起的真进程按 cwd 认出并能停掉；各种标记；别的 worker 的目录、长文本里提到的路径、
+别的会话 id、活着的进程树都不算；/tmp/名字 和孤儿浏览器只算可能；容器的 label、挂载、名字和「早于 worker 的同名容器不算」；
+close 拒绝 / --force / --kill-leftovers / 只有不确定的照关；shelve 拒绝、退出时不拦；watchdog 只报一次、不报在跑的 worker、
+报已关闭 worker 的和没人管的浏览器。手跑（只读）：真机上认出 edgerelay、subproxy 留下的 ssh ControlMaster，grpscroll 的两组
+headless Chrome（各约 750MB，记为「可能」），rcqueue 在跑所以它的 docker 容器不报，用户自己的 Chrome、kitty、容器都没误判。
 
 ### 闲置时主动问（`idle_ask_minutes`、`claudesec dnd`）
 

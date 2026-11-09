@@ -113,6 +113,7 @@ The catch: Shift+Enter now always sends that sequence, so a shell outside tmux m
     claudesec notice add --from W "say push in W's window"   # something for you to do; notice done N marks it done
     claudesec show 46          # the full text of decision-queue or to-do item #46 (clicking it in the pane opens it too)
     claudesec stale            # open queue items and to-dos that look out of date (closed worker, merged MRs, old)
+    claudesec leftovers [W] [--kill]   # processes / containers a worker left running (headless browsers, nohup, docker); --kill only what is surely its
     claudesec queue list --older 7   # open items that have waited a week or more
     claudesec queue doctor     # check queue.md (line-number prefixes, doubled sections, numbers twice); --fix repairs
     claudesec model W M        # switch worker W to model M (restarts it, conversation kept); the way for Cursor and Codex workers

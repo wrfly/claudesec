@@ -24,6 +24,7 @@
 - 要用户拍板的只有：有实质取舍的决定、破坏性或对外的动作（删数据、push、合并、改 DNS 或证书、动凭据）、改宪法。
   已经定下的（定稿、用户说过的话里有答案的）照办，不再拿去问。问之前想想用户凭什么答：纯技术参数（缓存规则和时长、超时、重试次数这类）
   用户手上也只有 worker 的建议，能回滚、不影响谁能用的，照建议定了，事后告诉用户一声。用户说先放着的话题，相关 worker 后来提的后续也一并放着。
+  用户要的是做出一个能力（「让…可以…」「以后能…」）时，交付的就是能力：用不用、什么时候切过去由用户提，别写进任务书当步骤，也别当成等用户定的下一件。
 - 用户已经批过上线的那条线上，审过、合入了的低风险补丁（只影响 off / dry_run 的功能、展示类修复）直接发版，给收据不再问；
   切 on、改线上正在跑的关键路径、动 prod 配置、首次上线的新功能仍要问。
 
@@ -54,7 +55,7 @@
   `--agent cursor` 跑 Cursor，用户点名要 Cursor 做就用它；
 <!-- end cursor -->
   没点名时用 config.json `delegate_agent` 里排第一个可用的，不带 `--model`：claudesec 用 config `delegate_model`。
-  是 `claude` 时开出来是 `delegate_model` 上的 Claude Code worker，跟它说话用 SendMessage（`claudesec send` 会拒绝），它自己用 report 命令汇报；
+  是 `claude` 时开出来是 `delegate_model` 上的 Claude Code worker，跟它说话用 SendMessage，它自己用 report 命令汇报；
   不带 `--agent` 的才是普通 Claude worker。收据里标 agent 和模型，如「（ttadk）」「（cursor）」「（claude / gpt-5.6-sol）」。见下面「外部 agent worker」。
 <!-- end delegate -->
 <!-- if ttadk -->
@@ -217,8 +218,6 @@ worker 卡住时发不了消息，claudesec 会直接叫醒你，内容以「[cl
 - **[残留]**：worker 不在跑了，它起的进程 / 容器还在（按 worker 名字认：`/tmp/claude-名字/`、`~/.claudesec/work/名字/`、
   容器 label 或名字；或者没人管的 headless 浏览器）。别自己杀：告诉用户一行占着什么（几个进程、多少内存），
   用户同意了再 `claudesec leftovers 名字 --kill`（只杀确定是它的），或者 wake 它让它自己清。`claudesec leftovers` 随时看全部。
-  close 遇到残留会拒绝：叫 worker 自己清掉、汇报里写清了什么再 close；用户或你明确要杀才用 `close --kill-leftovers`，
-  要留着它们只关窗口用 `--force`。
 - **API 出错**（`claudesec status` 显示「API 出错」，常见是代理的 524）：worker 停在提示符上不会自己汇报。
   `SendMessage` 让它从中断处继续，不用问用户；同一个 worker 反复出错才告诉用户一行。
 

@@ -93,6 +93,20 @@ class Marks(Base):
         windowed = proc(["/opt/google/chrome/chrome"], ppid=2, start=2000)
         self.assertEqual(self.find({2: systemd, 10: windowed}, since=1500), [])  # the user's own browser
 
+    def test_ssh_controlmaster_is_shared_not_a_leftover(self):
+        work = str(self.home / "work" / "w")
+        mux = proc(["ssh: /tmp/root@1.2.3.4:22 [mux]" + " " * 40], cwd=work, ppid=1, env={"CLAUDE_CODE_SESSION_ID": "sid"})
+        self.assertEqual(self.find({10: mux}, sid="sid"), [])
+        found = self.cs.leftovers("w", sid="sid", snap={10: mux}, containers=[], keep=set(), shared=True)
+        self.assertEqual([(f["sure"], f.get("shared")) for f in found], [(False, True)])
+        self.assertIn("shared ssh connection", self.cs.show_leftovers(found))
+        self.assertEqual(self.cs.kill_leftovers(found), [])
+        # a plain ssh session or a tunnel it left is still its own
+        for argv in (["ssh", "-N", "-L", "8080:x:80", "host"], ["ssh", "-S", "/tmp/claude-w/ctl", "-M", "host"]):
+            with self.subTest(argv):
+                self.assertFalse(self.cs.ssh_mux(argv))
+        self.assertEqual(len(self.find({10: proc(["ssh", "-N", "host"], cwd=work, ppid=1)})), 1)
+
     def test_containers(self):
         def c(name, labels=None, mounts=(), created=2000):
             return {"id": name[:12], "name": name, "labels": labels or {}, "mounts": list(mounts), "created": created}
@@ -134,7 +148,8 @@ class Commands(Base):
         (self.home / "workers" / "w").mkdir(parents=True)
         self.left = [{"kind": "proc", "id": 10, "what": "chrome --headless", "why": "cwd /tmp/claude-w",
                       "sure": True, "n": 12, "rss": 900 * 2**20}]
-        self.cs.worker_leftovers = lambda name, w: list(self.left)
+        self.real_worker_leftovers = self.cs.worker_leftovers
+        self.cs.worker_leftovers = lambda name, w, shared=False: list(self.left)
         self.killed = []
         self.cs.kill_leftovers = lambda found: self.killed.extend(found) or [str(f["id"]) for f in found if f["sure"]]
 
@@ -197,6 +212,18 @@ class Commands(Base):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": workers}))
         (self.home / "leftovers.json").unlink()
         self.assertEqual(self.cs.check_leftovers(), [])
+
+    def test_shared_ssh_neither_refuses_nor_alerts(self):
+        self.cs.worker_leftovers = self.real_worker_leftovers
+        mux = proc(["ssh: /tmp/u@h:22 [mux]"], cwd=str(self.home / "work" / "w"), ppid=1)
+        self.cs.ps_snapshot = lambda: {10: mux}
+        self.cs.docker_containers = lambda: []
+        self.cs.alive_windows = lambda: set()
+        self.cs.live_trees = lambda snap: set()
+        self.assertEqual(self.cs.check_leftovers(), [])
+        out = self.close()
+        self.assertNotIn("w", self.workers())
+        self.assertNotIn("ssh", out)
 
     def test_watchdog_finds_closed_workers_and_stray_browsers(self):
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {}}))

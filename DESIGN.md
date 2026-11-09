@@ -736,6 +736,10 @@ status 列出未到点的提醒。
   headless 浏览器只算「可能」：显示、告警，不拦、不杀。docker 容器：label `claudesec.worker=名字`、label 值或挂载在那两个目录下；
   名字（`名字`、`名字-*`、`claude-名字*` 等）只在容器建于 worker 开始之后才算，免得把用户自己的同名容器当成它的。
 - 永远不算：还在某个 tmux 窗格或 Claude Code 会话进程树里的（那是谁的活儿还在跑），和这条命令自己及其上级。
+- ssh ControlMaster（进程名 `ssh: <path> [mux]`）不算残留：本机 ~/.ssh/config 是 ControlMaster auto + ControlPersist yes，
+  worker 第一次 ssh 某台机器就会留一个，之后本机所有会话 ssh 那台都共用它（11-10 subproxy 因此 shelve 被拒，edgerelay 的 3 个被报）。
+  不拦 shelve / close（`detached_jobs` 也跳过），不告警，`claudesec leftovers` 里列成「可能」并注明是共用的 ssh 连接，--kill 不动。
+  worker 自己开的隧道（`ssh -N -L …`）、自己指定 -S 的 master 仍按原规则算。
 - shelve 有确定的残留就拒绝（--force 过；秘书退出、换模型时的 shelve 不查）。close 先查：有确定的就拒绝，提示叫 worker 自己清掉、
   汇报写清了什么；`--kill-leftovers`（用户或秘书明确要杀时）停掉确定的，`--force` 留着只关窗口；关掉窗口后再查一遍，还剩的打印出来。
   archive 发现残留打一行提醒。worker.md 要求 DONE 前清掉并在汇报里写明，临时目录用 `/tmp/claude-名字/`、容器加 label。

@@ -3266,7 +3266,8 @@ def detached_jobs(sid, claude_pid):
             continue  # still the session's own tree (its tools, hooks), or this very command's caller
         with contextlib.suppress(OSError):
             cmd = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
-            out.append((pid, cmd))
+            if not ssh_mux([cmd]):  # a shared ssh connection, not its job (see ssh_mux)
+                out.append((pid, cmd))
     # a detached shell and its sleep are one job: show the outermost
     return [(p, c) for p, c in out if parents.get(p) not in {q for q, _ in out}]
 
@@ -3463,11 +3464,22 @@ def container_mark(c, name, roots, since):
     return None
 
 
-def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None):
+SSH_MUX = re.compile(r"ssh: \S.*\[mux\]")
+
+
+def ssh_mux(argv):
+    """An ssh ControlMaster: with ControlMaster auto + ControlPersist (this machine's ~/.ssh/config,
+    ControlPath /tmp/%r@%h:%p) the first ssh to a host leaves one running, shared by every later
+    ssh to it from any session; it renames itself `ssh: <path> [mux]`."""
+    return bool(SSH_MUX.fullmatch(" ".join(" ".join(argv).split())))
+
+
+def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None, shared=False):
     """What worker `name` left running: [{kind: proc|docker, id, what, why, sure, n, rss}].
     sure=False: only under /tmp/<name>/, or a headless browser orphaned after `since` with
     nothing else tying it to this worker (another worker running then could own it): shown and
-    alerted on, never refused on, never killed."""
+    alerted on, never refused on, never killed. An ssh ControlMaster it started is no one's in
+    particular (subproxy, edgerelay 11-10): left out, or with shared, listed as unsure and shared."""
     snap = ps_snapshot() if snap is None else snap
     keep = live_trees(snap) if keep is None else keep
     roots = leftover_roots(name)
@@ -3476,7 +3488,10 @@ def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None)
         if pid in keep:
             continue
         mark = proc_mark(p, name, sid)
-        if mark:
+        if mark and ssh_mux(p.argv):
+            if shared:
+                found[pid] = (mark[0], None)
+        elif mark:
             found[pid] = mark
         elif since and p.start >= since and orphan_headless(p, snap):
             found[pid] = (tr("孤儿无头浏览器，启动于它在跑期间", "orphan headless browser started while it ran"), False)
@@ -3485,7 +3500,8 @@ def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None)
         if snap[pid].ppid in found:
             continue  # shown with its outermost
         members = group(pid, snap)
-        out.append({"kind": "proc", "id": pid, "what": " ".join(" ".join(snap[pid].argv).split())[:160], "why": why, "sure": sure,
+        out.append({"kind": "proc", "id": pid, "what": " ".join(" ".join(snap[pid].argv).split())[:160], "why": why,
+                    "sure": bool(sure), **({"shared": True} if sure is None else {}),
                     "n": len(members), "rss": sum(snap[q].rss for q in members if q in snap)})
     for c in docker_containers() if containers is None else containers:
         why = container_mark(c, name, roots, since)
@@ -3502,6 +3518,8 @@ def show_leftovers(found):
         else:
             size = f", ~{f['rss'] // 2**20}MB" if f["rss"] else ""
             maybe = tr("，不确定是它的", ", not sure it's its") if f.get("maybe", not f["sure"]) else ""
+            if f.get("shared"):
+                maybe = tr("，本机共用的 ssh 连接（ControlMaster），不是它独有的", ", a shared ssh connection (ControlMaster), not its own")
             lines.append(tr(f"  {f['id']}  {f['what']}（{f['why']}；{f['n']} 个进程{size}{maybe}）",
                             f"  {f['id']}  {f['what']} ({f['why']}; {f['n']} processes{size}{maybe})"))
     return "\n".join(lines)
@@ -3526,8 +3544,8 @@ def kill_leftovers(found):
     return done
 
 
-def worker_leftovers(name, w):
-    return leftovers(name, sid=w.get("session"), since=epoch(w.get("started_at")))
+def worker_leftovers(name, w, shared=False):
+    return leftovers(name, sid=w.get("session"), since=epoch(w.get("started_at")), shared=shared)
 
 
 def refuse_if_leftovers(name, w):
@@ -3567,7 +3585,7 @@ def mentioned(names, snap, keep, containers, reg):
     return names & out
 
 
-def all_leftovers():
+def all_leftovers(shared=False):
     """What no running worker owns: [(name or None, [leftover])]. By name, for each worker
     claudesec has known (registry, workers/, work/) that isn't running now; by itself, a
     headless browser orphaned before any worker now running had started."""
@@ -3581,7 +3599,7 @@ def all_leftovers():
     out, seen = [], set()
     for name in sorted(mentioned(names, snap, keep, containers, reg)):
         w = reg.get(name) or {}
-        found = leftovers(name, sid=w.get("session"), snap=snap, containers=containers, keep=keep)
+        found = leftovers(name, sid=w.get("session"), snap=snap, containers=containers, keep=keep, shared=shared)
         seen |= {f["id"] for f in found}
         if found and name not in live:  # a running worker's are its own business
             out.append((name, found))
@@ -3635,14 +3653,14 @@ def cmd_leftovers(args):
     if not args.name:
         if args.kill:
             sys.exit("--kill needs a worker name")
-        found = all_leftovers()
+        found = all_leftovers(shared=True)
         for name, items in found:
             print(f"{name or tr('（没对上 worker）', '(no worker)')}:\n{show_leftovers(items)}")
         if not found:
             print(tr("没有发现残留", "no leftovers found"))
         return
     w = read_registry()[1].get(args.name) or {}
-    found = worker_leftovers(args.name, w)
+    found = worker_leftovers(args.name, w, shared=True)
     if not found:
         print(tr(f"{args.name} 没有留下在跑的进程或容器", f"{args.name} left nothing running"))
         return

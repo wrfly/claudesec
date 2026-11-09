@@ -2029,7 +2029,10 @@ class Agent:
         raise NotImplementedError
 
     def first_message(self, d):
-        return f' "$(cat {shlex.quote(str(d / "initial.md"))})"'
+        """The first message on the command line: a pointer to d/initial.md, not its text. The
+        text in argv let `pkill -f claude-modelaudit` (11-09), meant for a browser, kill a worker
+        whose task named that path, and showed every task in full to ps."""
+        return " " + shlex.quote(pointer_message(d / "initial.md"))
 
     def spawn_command(self, name, model, d, cfg):
         """What a spawned worker's window runs: its agent, then `hook agent-exit`, which records a failed exit."""
@@ -2139,6 +2142,20 @@ class Agent:
         return {}
 
 
+def pointer_message(path):
+    return tr(f"先读 {path} 全文：那是秘书给你的消息原文（任务书或唤醒说明），放在文件里只为不让它出现在命令行上。照它做。",
+              f"First read all of {path}: it is the secretary's message to you (your task, or why you were woken), "
+              f"kept in a file only so it stays off the command line. Act on it.")
+
+
+def mention_message(path):
+    path = str(path)
+    at = f'@"{path}"' if any(c.isspace() for c in path) else f"@{path}"
+    return at + tr(" 附上的文件是秘书给你的消息原文（任务书或唤醒说明），等同于这条消息本身，放在文件里只为不让它出现在命令行上。照它做。",
+                   " The attached file is the secretary's message to you (your task, or why you were woken), as if typed "
+                   "here; it is in a file only so it stays off the command line. Act on it.")
+
+
 @register_agent
 class ClaudeCode(Agent):
     name, label, describe, external = "claude", "Claude Code", "Claude Code", False
@@ -2164,6 +2181,11 @@ class ClaudeCode(Agent):
 
     def spawn_command(self, name, model, d, cfg):
         return self.command(name, model, d, cfg)
+
+    def first_message(self, d):
+        """An @-mention: Claude Code attaches the file's text to the message itself, no Read
+        call and no permission prompt, wherever the file is."""
+        return " " + shlex.quote(mention_message(d / "initial.md"))
 
     def answer_dialog(self, name, target, screen):
         return answer_plugin_dialog(target, screen) or (name and answer_credit_dialog(name, target, screen))

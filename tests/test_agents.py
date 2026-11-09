@@ -110,7 +110,7 @@ class Agents(unittest.TestCase):
         self.assertIn("codex -m gpt-x -c", self.cs.AGENTS["codex"].command("w", "gpt-x", d, cfg))
         cmd = self.cs.TTADK_RUNTIMES["codex"].command("w", "gpt-6.1-sol", d, cfg)
         self.assertIn("ttadk codex --mode ttadk-only -m gpt-6.1-sol --skip-check -- -c", cmd)
-        self.assertTrue(cmd.endswith(f'"$(cat {d / "initial.md"})"'))
+        self.assertIn(str(d / "initial.md"), cmd.rsplit(" -- ", 1)[1])  # a pointer, not its text (test_task_off_argv)
 
     def test_ttadk_picks_the_runtime_by_model(self):
         ttadk = self.cs.AGENTS["ttadk"]

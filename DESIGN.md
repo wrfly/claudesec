@@ -742,6 +742,10 @@ status 列出未到点的提醒。
 - watchdog：提醒检查器每 10 分钟 `check_leftovers`，对注册表、workers/、work/ 里出现过、现在不在跑的每个名字查一遍，再加上
   没对上 worker、早于所有在跑 worker 启动的孤儿 headless 浏览器；新发现的发「[残留]」告警，每个进程 / 容器只报一次（`leftovers.json`）。
 - 不自动杀：杀不杀由用户定，秘书照告警里的命令做。
+- 任务书不上命令行：原来 worker 的第一条消息用 `"$(cat initial.md)"` 整份放进 agent 的参数，同一天 `pkill -f claude-modelaudit`
+  （本意是清那组 Chrome）把任务书里写着这个路径的 claudesec worker 也杀了，ps 里也能看到每份任务书全文。现在 Claude Code 收到的是
+  `@…/initial.md` 加一句说明（Claude Code 把文件内容附在这条消息里，不用 Read、不弹权限，手试过交互模式），Codex、Cursor 收到
+  「先读 …/initial.md」；文件内容不变（tests/test_task_off_argv.py）。
 
 已验证（单测 tests/test_leftovers.py）：env -i 起的真进程按 cwd 认出并能停掉；各种标记；别的 worker 的目录、长文本里提到的路径、
 别的会话 id、活着的进程树都不算；/tmp/名字 和孤儿浏览器只算可能；容器的 label、挂载、名字和「早于 worker 的同名容器不算」；

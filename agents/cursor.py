@@ -119,7 +119,7 @@ def cursor_command(name, model, *extra, d=None):
     """The worker's agent command; with d, its first message comes from d/initial.md."""
     env = f"CLAUDESEC_WORKER={shlex.quote(name)} CLAUDESEC_HOME={shlex.quote(str(HOME))}"
     return (env + " " + cursor_nice() + " ".join(shlex.quote(a) for a in ["agent", "--model", model, "--trust", *extra])
-            + (f' "$(cat {shlex.quote(str(d / "initial.md"))})"' if d else ""))
+            + (" " + shlex.quote(pointer_message(d / "initial.md")) if d else ""))
 
 
 def cursor_busy(but=None):
@@ -189,7 +189,7 @@ def hook_cursor_launch(name):
     again, CURSOR_FALLBACK_MODEL stands in for it, which the worker's summary and log say. Any
     other failure is left to hook_agent_exit."""
     model = os.environ.get("CLAUDESEC_MODEL") or config()["cursor_worker_model"]
-    first = (worker_dir(name) / "initial.md").read_text()
+    first = pointer_message(worker_dir(name) / "initial.md")  # not its text: see Agent.first_message
     pane = os.environ.get("TMUX_PANE", "")
     env = {**os.environ, "CLAUDESEC_WORKER": name, "CLAUDESEC_HOME": str(HOME)}
     env.pop("CLAUDESEC_MODEL", None)

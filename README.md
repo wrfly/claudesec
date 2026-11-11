@@ -118,7 +118,9 @@ The catch: Shift+Enter now always sends that sequence, so a shell outside tmux m
     claudesec leftovers [W] [--kill]   # processes / containers a worker left running (headless browsers, nohup, docker); --kill only what is surely its
     claudesec queue list --older 7   # open items that have waited a week or more
     claudesec queue doctor     # check queue.md (line-number prefixes, doubled sections, numbers twice); --fix repairs
-    claudesec model W M        # switch worker W to model M (restarts it, conversation kept); the way for Cursor and Codex workers
+    claudesec model W M [--effort E]  # switch worker W to model M (restarts it, conversation kept); the way for Cursor and Codex workers.
+                               # A Claude Code worker moves between plain Claude Code and `ttadk claude` as M needs;
+                               # --effort (low…max, also on spawn / wake) is `claude --effort`, kept for later wakes
     claudesec discuss W on|off # worker W into discussion mode (talks with the user in its window, no report each turn) or back
     claudesec plugin           # the plugins: loaded (hooks, commands), failed, and the repo's not yet linked in
 

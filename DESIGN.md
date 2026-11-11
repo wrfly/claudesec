@@ -809,6 +809,22 @@ SendMessage / `claudesec send` 告诉它，因为 worker 没有每轮注入的 h
 （网关的，或带 `[1m]`）时仍走 Claude Code，因为那是秘书点名要的，ttadk 端点不一定有。`--agent` 点名的照旧，不受这项影响。
 `claudesec review` 用 `review_agent` / `review_model`，没设就跟 `spawn` 不带 `--agent` 一样。
 
+### 换模型时换 agent、effort、wake 不卡 stdin（2026-11-12）
+
+用户要「重启当前所有 workers 用 opus5.5 模型 high effort」，秘书碰到三处：
+- `claudesec model X claude-opus-5-5` 对跑 ttadk + deepseek 的 worker 无效：wake 按 registry 里旧的 agent 和模型算，照样起
+  `ttadk claude --model claude-opus-5-5`，ttadk 报 E_INVALID_MODEL，留下死窗口。现在 `wake --model` / `model` 用 agent_for_model：
+  Claude Code 的对话（直接跑的，或经 `ttadk claude`，两者读同一份 transcript）按新模型换，Claude 的模型走 Claude Code，只有 ttadk
+  有的走 `ttadk claude`，并写回 registry 的 agent / runtime。Codex 的对话不能换到 Claude 模型，直接拒。wake 失败时关掉它开的窗口，
+  最后一屏放进报错里。
+- `claudesec wake X` 不带 heredoc 时，秘书 Bash 的 stdin 是个 socket，read 一直等。stdin_text：socket 上 1 秒没东西就当没有；
+  管道和文件照常读到底。
+- `--effort`（spawn / wake / model）传给 `claude --effort`，记在 registry 的 effort，以后 wake 沿用。没给就是 Claude Code 自己的
+  （用户 settings 的 modelSettings.<id>.effortLevel）。外部 agent 不接。
+
+没做：--rc 的会话每次起都弹「Loading development channels」确认框。想在 rc 插件里自动答，被 Claude Code 的权限分类器以
+「Security Weaken」拦了：那是 Claude Code 自己的安全确认，要不要自动点由用户定。
+
 ### 「[收尾]」
 
 `claudesec status` 和进度面板给 DONE 超过一小时、队列待问 / 待答里没有带它标签（`[名字]`）的事的 worker 标「[收尾]」，

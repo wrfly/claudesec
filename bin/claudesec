@@ -73,6 +73,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1791,6 +1792,19 @@ def wake_orphans():
                     + "\n".join(f"- {n}: {e.splitlines()[0][:400]}" for n, e in failed.items()))
 
 
+def stdin_text(wait=1.0):
+    """What came on stdin, or "" for none. A terminal is not read. A socket (the Bash of a Claude Code
+    session) is read only if something arrives within wait seconds: with nothing on it, a read
+    would wait forever (2026-11-12: `claudesec wake X` with no heredoc hung the secretary). A pipe or
+    file is read to its end, however long its writer takes."""
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        if stat.S_ISSOCK(os.fstat(sys.stdin.fileno()).st_mode) and not select.select([sys.stdin], [], [], wait)[0]:
+            return ""
+    return sys.stdin.read().strip()
+
+
 def spawn_default_agent(cfg, model=None):
     """The agent `spawn` starts when not told --agent: config spawn_agent, unless the model asked
     for is Claude's (the user, 2026-11-11: dispatch only on ttadk claude + deepseek-v4.1-flash; a
@@ -1799,6 +1813,18 @@ def spawn_default_agent(cfg, model=None):
     if not agent or agent == "claude" or (model and not ttadk_model(model)):
         return None
     return agent
+
+
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def set_effort(d, effort):
+    """A Claude Code worker's effort level (`claude --effort`), kept in its dir for its command;
+    none: Claude Code's own (the user's settings, modelSettings.<id>.effortLevel)."""
+    if effort:
+        (d / "effort").write_text(effort)
+    else:
+        (d / "effort").unlink(missing_ok=True)
 
 
 def cmd_spawn(args):
@@ -1813,7 +1839,7 @@ def cmd_spawn(args):
         sys.exit(f"{name} is a shelved worker: `claudesec wake {name}` it, or `claudesec close {name}` to forget it")
     if old and old.get("window") in alive_windows():
         sys.exit(f"worker {name} is already running in window {old['window']}")
-    task = getattr(args, "task", None) or sys.stdin.read().strip()
+    task = getattr(args, "task", None) or stdin_text()
     if not task:
         sys.exit("empty task: pass the user's words on stdin")
     if args.dir:
@@ -1868,6 +1894,10 @@ def cmd_spawn(args):
                        mode="discuss" if args.discuss else "task",
                        delegated=bool(args.for_worker) or not claude_model(model))
     (d / "task.md").write_text(task + "\n")
+    effort = getattr(args, "effort", None)
+    if effort and agent.external:
+        sys.exit(f"--effort: only for Claude Code workers, not {agent.label}")
+    set_effort(d, effort)
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
     cmd = agent.spawn_command(name, model, d, cfg)
     window = tmux("new-window", "-d", *target, "-P", "-F", "#{window_id}", "-n", name, "-c", project, cmd).strip()
@@ -1882,6 +1912,7 @@ def cmd_spawn(args):
             "last_summary": "", "pending_ask": None, "session": None, "archived": None,
             **({"budget_usd": budget_usd} if budget_usd else {}),
             **({"model_pinned": True} if args.model and not agent.external else {}),
+            **({"effort": effort} if effort else {}),
         }
         if not args.for_worker:  # a delegated one is its delegator's business, not the user's focus
             reg["focus"] = name
@@ -2234,6 +2265,7 @@ class ClaudeCode(Agent):
             "--settings", str(d / "settings.json"),
             "--append-system-prompt-file", str(d / "prompt.md"), *fresh_prompt(),
             *plugin_args(cfg, worker_who(name, self.name, d)),
+            *(["--effort", (d / "effort").read_text().strip()] if (d / "effort").exists() else []),
             *(["--resume", resume] if resume else []),
         ]) + (self.first_message(d) if prompt else "")
 
@@ -2289,6 +2321,27 @@ def agent_of(w):
         name, w = "ttadk", {**w, "runtime": "codex"}  # Codex workers all ran through ttadk then
     agent = AGENTS.get(name) or AGENTS["claude"]
     return agent.runtime(w.get("model") or agent.default_model(config()), w.get("runtime"))
+
+
+def agent_for_model(w, model):
+    """The adapter worker w's conversation runs on, moved to model. A Claude Code conversation runs
+    on plain Claude Code or through `ttadk claude`, whichever the model needs (both read the same
+    transcripts), so a switch between a Claude model and a ttadk-only one changes that too
+    (2026-11-12: `claudesec model release claude-opus-5-5` from deepseek kept ttadk, which refused the
+    model, E_INVALID_MODEL). A Codex or Cursor conversation stays with its agent."""
+    agent = agent_of(w)
+    if not model or agent.name not in ("claude", "ttadk"):
+        return agent
+    if agent.runtime_name == "codex":
+        if claude_model(model):
+            sys.exit(f"--model {model}: this worker's conversation is Codex's (through ttadk); Claude Code "
+                     "can't resume it. Spawn a new worker for that model.")
+        return agent
+    if not ttadk_model(model):
+        return AGENTS["claude"]
+    if "ttadk" not in AGENTS:
+        sys.exit(f"--model {model}: Claude Code runs that model only through ttadk, which isn't here")
+    return AGENTS["ttadk"].runtime(model, "claude")
 
 
 def agent_named(name):
@@ -3802,7 +3855,7 @@ def cmd_wake(args):
     if w["status"] != "SHELVED":
         sys.exit(f"{name} is not shelved (status {w['status']})")
     sid, cwd = w["session"], w["dir"]
-    agent = agent_of(w)
+    agent = agent_for_model(w, args.model)
     if not conversation_exists(w):
         sys.exit(f"{name}: conversation {sid} is gone; it can't be resumed")
     left = w.get("moved_from")  # set by redir: the directory it was in before the move
@@ -3833,13 +3886,16 @@ def cmd_wake(args):
         refuse_while_frozen(f"wake {name}")
     instruction = getattr(args, "instruction", None)
     if instruction is None:
-        instruction = "" if quiet or sys.stdin.isatty() else sys.stdin.read().strip()
+        instruction = "" if quiet else stdin_text()
     intro = getattr(args, "intro", None) or tr("秘书转来用户的新指令（原话），照做并按规则汇报：",
                                                "The secretary passes on the user's new instruction, in their own words. "
                                                "Do it and report by the rules:")
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
     model = args.model or w.get("model") or agent.default_model(cfg) or "default"
+    effort = getattr(args, "effort", None)
+    if effort and agent.external:
+        sys.exit(f"--effort: only for Claude Code workers ({name} runs {agent.label})")
     pinned = bool(args.model or w.get("model_pinned")) and not agent.external
     model = model if agent.external or pinned else unpaid(model)
     by_cmd = agent.external or bool(w.get("delegated_by")) or not claude_model(model)
@@ -3857,6 +3913,7 @@ def cmd_wake(args):
     d = prepare_worker(name, cfg, initial, cwd, fresh_log=False, agent=agent, memory=w.get("memory"),
                        mode=w.get("mode") or "task", delegated=by_cmd)
     (d / "exit").unlink(missing_ok=True)
+    set_effort(d, effort or w.get("effort"))
     # Quiet: just reopen the conversation; no first prompt, so no model turn and no report.
     cmd = agent.command(name, model, d, cfg, resume=sid, prompt=not quiet) + f"; echo $? > {shlex.quote(str(d / 'exit'))}"
     target = ["-t", f"={cfg['tmux_session']}:"] if has_session(cfg["tmux_session"]) else []
@@ -3866,6 +3923,13 @@ def cmd_wake(args):
     with registry() as reg:  # an external agent keeps its session id (a resumed Cursor chat reports none)
         reg["workers"][name].update(window=window, model=model, status="STARTING",
                                     session=sid if agent.external else None)
+        if args.model:  # what the model runs on (agent_for_model), for the next wake too
+            reg["workers"][name]["agent"] = agent.name
+            reg["workers"][name].pop("runtime", None)
+            if agent.runtime_name:
+                reg["workers"][name]["runtime"] = agent.runtime_name
+        if effort:
+            reg["workers"][name]["effort"] = effort
         reg["workers"][name].pop("model_pinned", None)
         if pinned:
             reg["workers"][name]["model_pinned"] = True
@@ -3905,7 +3969,8 @@ def cmd_wake(args):
             print(f"woke {name} ({model}); it has finished its turn and been archived already")
             return
         reg["workers"][name].update(status="SHELVED", window=None, session=sid)
-    sys.exit(f"wake FAILED ({verdict}): {name} stays shelved. Window {window} is left as it is. "
+    tmux("kill-window", "-t", window, check=False)  # a dead pane would only be cleaned up by hand
+    sys.exit(f"wake FAILED ({verdict}): {name} stays shelved; its window is closed. Its last screen is below. "
              f"The conversation is intact: `{resume_hint(w)}` in {cwd}.\n{tail}")
 
 
@@ -5371,11 +5436,13 @@ def cmd_model(args):
             sys.exit(f"model: {err}")
     with registry() as reg:
         reg["workers"][args.name]["shelved_by"] = "model"
-    err = quietly(cmd_wake, name=args.name, model=args.model, quiet=True)
+    err = quietly(cmd_wake, name=args.name, model=args.model, quiet=True, effort=getattr(args, "effort", None))
     if err:
         sys.exit(f"model: {args.name} is shelved now, but waking it on {args.model} failed: {err}. "
                  f"`claudesec wake {args.name} --model <model>` tries again.")
-    print(f"{args.name} now runs {args.model} (conversation kept; it waits for your next message)")
+    effort = getattr(args, "effort", None)
+    print(f"{args.name} now runs {args.model}" + (f" at {effort} effort" if effort else "")
+          + " (conversation kept; it waits for your next message)")
 
 
 def cmd_send(args):
@@ -6594,7 +6661,7 @@ def main():
     s.add_argument("--model"); s.add_argument("--discuss", action="store_true")
     s.add_argument("--agent", choices=list(AGENTS))  # named: delegate_model if listed in delegate_agent
     s.add_argument("--for", dest="for_worker", metavar="WORKER"); s.add_argument("--budget", type=float, metavar="USD")
-    s.set_defaults(fn=cmd_spawn)
+    s.add_argument("--effort", choices=EFFORTS); s.set_defaults(fn=cmd_spawn)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("budget"); s.add_argument("--until"); s.add_argument("--from", dest="start")
     s.add_argument("--usd", type=float); s.add_argument("--add", type=float); s.add_argument("--off", action="store_true")
@@ -6617,7 +6684,7 @@ def main():
     s.add_argument("--as", dest="as_name"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_shelve)
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.add_argument("--dir")
-    s.set_defaults(fn=cmd_wake)
+    s.add_argument("--effort", choices=EFFORTS); s.set_defaults(fn=cmd_wake)
     s = sub.add_parser("redir"); s.add_argument("old"); s.add_argument("new"); s.set_defaults(fn=cmd_redir)
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
@@ -6648,7 +6715,8 @@ def main():
     s = sub.add_parser("report"); s.add_argument("name"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("send"); s.add_argument("name"); s.set_defaults(fn=cmd_send)
     s = sub.add_parser("model"); s.add_argument("name"); s.add_argument("model")
-    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_model)
+    s.add_argument("--force", action="store_true"); s.add_argument("--effort", choices=EFFORTS)
+    s.set_defaults(fn=cmd_model)
     s = sub.add_parser("delegate"); s.add_argument("boss"); s.add_argument("--name", required=True)
     s.add_argument("--dir"); s.add_argument("--model"); s.add_argument("--ack"); s.add_argument("--budget", type=float)
     s.add_argument("--agent", choices=list(AGENTS))

@@ -74,7 +74,7 @@ DECISIONS 只为日后溯源，秘书不会转给用户，但会原样存档。�
 
 - 秘书的话会直接出现在你的输入里（秘书用 `claudesec send` 粘贴进来）。
   以「用户决策：」开头的，是用户对你 NEED_DECISION 的回答。
-- 自己起的浏览器（含 headless）、docker 容器、后台进程（nohup、setsid、`&`、ssh ControlMaster），用完就关；汇报 DONE / FAILED 前
+- 自己起的浏览器（含 headless）、docker 容器、后台进程（nohup、setsid、`&`、ssh 隧道），用完就关；汇报 DONE / FAILED 前
   必须清掉，汇报里写明清了什么、还有什么故意留着及原因。临时目录用 `/tmp/claude-{{NAME}}/`，容器加 `--label claudesec.worker={{NAME}}`：
   claudesec 靠这些认出你留下的东西，没清的会挡住 shelve / close。
 - 别用 `git stash` 搬改动：一个仓库的所有 worktree 共用一个 stash，里面可能有用户自己的改动，pop、drop 错一条就丢了；

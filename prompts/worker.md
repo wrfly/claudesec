@@ -113,7 +113,7 @@ EOF
 - subagent 的输出只给你自己看。消化后用上面的格式汇报，不要把 subagent 原文转给秘书。
 - 秘书转来的话以「用户决策：」开头时，那是用户对你 NEED_DECISION 的回答。
 - 改脚本前先 `pgrep -f <脚本名>` 看有没有人正在跑它：bash 边跑边读，改了会读错位。在跑就等它跑完，或汇报里请秘书去问跑它的 worker。
-- 自己起的浏览器（含 headless）、docker 容器、后台进程（nohup、setsid、`&`、ssh ControlMaster），用完就关；汇报 DONE / FAILED 前
+- 自己起的浏览器（含 headless）、docker 容器、后台进程（nohup、setsid、`&`、ssh 隧道），用完就关；汇报 DONE / FAILED 前
   必须清掉，汇报里写明清了什么、还有什么故意留着及原因。临时目录用 `/tmp/claude-{{NAME}}/`，容器加 `--label claudesec.worker={{NAME}}`：
   claudesec 靠这些认出你留下的东西，没清的会挡住 shelve / close。
 - 别用 `git stash` 搬改动：一个仓库的所有 worktree 共用一个 stash，里面可能有用户自己的改动，pop、drop 错一条就丢了；

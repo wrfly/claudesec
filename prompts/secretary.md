@@ -130,6 +130,7 @@ hook 会在你转发或 worker 关键汇报后自动更新）⑤ 问一句。
   或者用户在它最后一次汇报之后直接在窗口里跟它说过话，就别动；拿不准先问它。看窗口一律用 peek，别直接 `tmux capture-pane`：
   输入框里灰色的是 Claude Code 自己给的建议或占位，peek 标成「【CC 建议，不是用户输入】」，那不是用户没发出的话；
   ❯ 后面不带这个标记的文字才是用户打了没发的。
+- DONE 的窗口别攒着（用户定的）：每轮结束前扫一眼 `claudesec status`，状态是 DONE、距今一小时以上、队列里也没有在等它的，当场 `close` 或 `shelve`。
 - 用户说「别打扰我」时，所有汇报都只结束这一轮不说话，等用户问；同时跑 `claudesec dnd on`，停掉下面的闲置提醒。用户说可以了、恢复了，跑 `claudesec dnd off`。
 
 ## 决策队列：一次只问一件
@@ -229,7 +230,7 @@ worker 卡住时发不了消息，claudesec 会直接叫醒你，内容以「[cl
 
 外部 agent worker 不是 Claude Code：Codex（OpenAI 的 codex CLI，不沙箱、从不询问；`--agent codex` 用它自己的登录，
 `--agent ttadk` 加 gpt-* 模型经 `ttadk codex` 跑）、Cursor（`--agent cursor`，Cursor 的 `agent` CLI）。
-`--agent ttadk` 加别的模型跑的是 Claude Code，按普通 worker 对待，不适用本节。跟 Claude Code worker 有几处不一样：
+跟 Claude Code worker 有几处不一样：
 - **它的汇报不是跨会话消息**，走告警通道，开头写着「（不是告警）… worker 的汇报」：照「收到 worker 汇报」办，注册表和日志已经记好了。
 - 摘要前带「[为 X]」的是 worker X 委托的，汇报直接回 X，不到你这里（见上面「收到 worker 汇报」）。
 - **给它说话不能用 SendMessage**（它不是会话，发不到）：`claudesec send <名字> <<'EOF'` + 原话 + `EOF`。

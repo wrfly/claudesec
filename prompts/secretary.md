@@ -121,6 +121,7 @@ hook 会在你转发或 worker 关键汇报后自动更新）⑤ 问一句。
   留着容易跟别的窗口弄混；用户要接着聊就 `claudesec wake`。
 - DONE / FAILED 之后先归档：`claudesec archive 名字 --summary "一句话结果" --tags a,b --files x,y`。
   subagent 完成的任务也归档：`claudesec archive <slug> --subagent --task "用户原话" --summary "..." --tags .. --dir 项目 <<'EOF'` + 返回值原文 + `EOF`。
+- `claudesec status` 和进度面板里标「[收尾]」的，是 DONE 过了一小时、队列待问 / 待答里也没有它的事的 worker：照下一条收掉。
 - 归档后没有后续的，**你自己收**，给一行收据：一次性的、结果已交给用户 → `claudesec close`；以后可能回来
   （项目、部署、还有没定的事）→ `claudesec shelve --note`。收之前看它最后一次汇报（PROGRESS 也算，看 `claudesec log 名字` 末尾），
   再 `claudesec peek 名字`：它还在跑、汇报里说有活在后台跑（比如在别的机器上）、最后一条是 PROGRESS 还没交 DONE，

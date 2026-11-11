@@ -121,6 +121,13 @@ DEFAULT_CONFIG = {
     # What `claudesec delegate` starts unless told --agent / --model: the first of these available here.
     "delegate_agent": ["ttadk", "codex", "cursor"],
     "delegate_model": None,           # None: the picked agent's default model
+    # What `spawn` starts without --agent: None = Claude Code on worker_model. A --model of Claude's
+    # (the gateway's, or ending in [1m]) still runs plain Claude Code. spawn_model None: the agent's default
+    "spawn_agent": None,
+    "spawn_model": None,
+    # What `claudesec review` starts: None = as spawn without --agent (above)
+    "review_agent": None,
+    "review_model": None,
     "tmux_session": "claudesec",           # the secretary and all workers live in this tmux session
     # Each agent of agents/*.py: "auto" = if its commands are installed (and, for codex, logged in); true; false
     "cursor": "auto",
@@ -893,6 +900,25 @@ def status_line(cols, focused, name, mark, word, color, summary, age, tokens, mo
     return fit(head + mid + right, cols)
 
 
+WRAP_UP_SECS = 3600
+
+
+def to_wrap_up(workers, now=None):
+    """Workers done over an hour ago with nothing of theirs in the queue's 待问 / 待答: for the
+    secretary to close or shelve (review-1111, 2026-11-11: windows left open long after their DONE).
+    A delegated one is archived by claudesec itself."""
+    now = now or dt.datetime.now().astimezone()
+    asked = {tag.split()[0] for section, _, tag, _, _ in queue_items(queue_text())
+             if tag and section in ("todo", "doing")}
+    out = set()
+    for name, w in workers.items():
+        if w["status"] != "DONE" or w.get("delegated_by") or name in asked or not w.get("last_report_at"):
+            continue
+        if (now - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds() >= WRAP_UP_SECS:
+            out.add(name)
+    return out
+
+
 def status_blocks(cols, now=None):
     """The progress pane: (title bar, blocks, footer). A worker folds to its status line; unfolded
     it adds its last report (the question, for those waiting on the user). Today's spend is the
@@ -902,10 +928,13 @@ def status_blocks(cols, now=None):
     active = {n: w for n, w in workers.items() if w["status"] != "SHELVED"}
     shelved = [n for n, w in workers.items() if w["status"] == "SHELVED"]
     usage = worker_usage(active)
+    wrapping = to_wrap_up(active)
     rows = []
     for name, w in active.items():
         group, mark, word, color = STATUS_LOOK.get(w["status"], (2, "▸", (w["status"],) * 2, ""))
         word = tr(*word)
+        if name in wrapping:
+            word += tr(" [收尾]", " [wrap up]")
         if w.get("mode") == "discuss" and group == 2:
             word, color = tr("讨论中", "discussing"), CYAN
         if w.get("window") not in alive and group < 3 and w["status"] != "FAILED":
@@ -1749,6 +1778,16 @@ def wake_orphans():
                     + "\n".join(f"- {n}: {e.splitlines()[0][:400]}" for n, e in failed.items()))
 
 
+def spawn_default_agent(cfg, model=None):
+    """The agent `spawn` starts when not told --agent: config spawn_agent, unless the model asked
+    for is Claude's (the user, 2026-11-11: dispatch only on ttadk claude + deepseek-v4.1-flash; a
+    `--model claude-opus-5-5` is still Claude Code). None: Claude Code."""
+    agent = cfg.get("spawn_agent")
+    if not agent or agent == "claude" or (model and not ttadk_model(model)):
+        return None
+    return agent
+
+
 def cmd_spawn(args):
     cfg = config()
     name = args.name
@@ -1771,12 +1810,18 @@ def cmd_spawn(args):
         project = str((HOME / "work" / name).resolve())
     if args.for_worker and args.for_worker not in workers:
         sys.exit(f"--for {args.for_worker}: no such worker")
-    agent = agent_named(args.agent or "claude")
+    chosen = args.agent or spawn_default_agent(cfg, args.model)
+    agent = agent_named(chosen or "claude")
     # --agent named outright is how the secretary opens an external agent worker: one listed in
     # config delegate_agent runs on delegate_model, as `claudesec delegate` would start it.
     listed = cfg.get("delegate_agent") or []
     listed = [listed] if isinstance(listed, str) else listed
-    default = delegate_model(agent, cfg) if args.agent in listed else agent.default_model(cfg)
+    if args.agent in listed:
+        default = delegate_model(agent, cfg)
+    elif chosen and not args.agent:  # config spawn_agent
+        default = cfg.get("spawn_model") or agent.default_model(cfg)
+    else:
+        default = agent.default_model(cfg)
     model = args.model or default or "default"  # default: the agent's own
     if agent.name == "claude" and ttadk_model(model):
         sys.exit(f"--model {model}: not a Claude model, which Claude Code runs through ttadk: "
@@ -1787,7 +1832,7 @@ def cmd_spawn(args):
         sys.exit(f"--budget: only for Claude Code workers (claudesec can't see what a {agent.label} "
                  "agent spends), and above 0" if agent.external else "--budget must be above 0")
     model = model if agent.external or args.model else unpaid(model)  # a model asked for by name is kept
-    agent.require(f"spawn --agent {args.agent or 'claude'}")
+    agent.require(f"spawn --agent {chosen or 'claude'}" + ("" if args.agent or not chosen else " (config spawn_agent)"))
     if not args.for_worker:  # a delegation was checked by delegate, which says it its own way
         agent.room(f"spawn {name}")
     agent.preflight()
@@ -3961,6 +4006,7 @@ def print_workers(focus, workers):
                                ("model", "status", "ago", "tokens", "$ today", "latest", "you?")))]
     usage = worker_usage(workers)
     moneys = worker_moneys(workers)
+    wrapping = to_wrap_up(workers)
     for name, w in workers.items():
         status = w["status"]
         if status in LABELS:
@@ -3969,6 +4015,8 @@ def print_workers(focus, workers):
             status = tr("讨论中", "discussing")
         if w.get("window") not in alive and status not in ("DONE", "FAILED"):
             status += tr("(窗口已关)", " (window closed)")
+        if name in wrapping:
+            status += tr(" [收尾]", " [wrap up]")
         age = ""
         if w.get("last_report_at"):
             secs = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds()
@@ -5130,7 +5178,9 @@ def cmd_review(args):
         sys.exit(f"{name} is already running (status {w['status']})")
     if w:
         quietly(cmd_close, name=name)
-    cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=None, discuss=False, agent=None,
+    cfg = config()
+    cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=cfg.get("review_model"), discuss=False,
+                                 agent=cfg.get("review_agent"),
                                  for_worker=None, task=brief, intro=tr("claudesec 每日例行派给你的任务：\n\n", "claudesec's daily routine task for you:\n\n"),
                                  memory=str(memory)))
 

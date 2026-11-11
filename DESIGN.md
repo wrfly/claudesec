@@ -802,6 +802,18 @@ SendMessage / `claudesec send` 告诉它，因为 worker 没有每轮注入的 h
 
 已验证：单测 tests/test_discuss_switch.py（切前拦、切后放行、off 后又拦；DONE 切回秘书；自己切不提示告诉自己）。
 
+### 默认 agent 和模型（config `spawn_agent` / `spawn_model`，`review_agent` / `review_model`）
+
+用户 2026-11-11：「以后派任务，只用 ttadk claude + deepseek-v4.1-flash 模型」。`spawn` 不带 `--agent` 时用 `spawn_agent`，
+模型用 `spawn_model`（没设就是那个 agent 自己的默认）；都没设还是 Claude Code + `worker_model`。`--model` 给的是 Claude 的模型
+（网关的，或带 `[1m]`）时仍走 Claude Code，因为那是秘书点名要的，ttadk 端点不一定有。`--agent` 点名的照旧，不受这项影响。
+`claudesec review` 用 `review_agent` / `review_model`，没设就跟 `spawn` 不带 `--agent` 一样。
+
+### 「[收尾]」
+
+`claudesec status` 和进度面板给 DONE 超过一小时、队列待问 / 待答里没有带它标签（`[名字]`）的事的 worker 标「[收尾]」，
+秘书一眼看到去 close / shelve（review-1111 提的：DONE 后窗口挂着没人收）。委托来的不标，claudesec 自己归档。
+
 ### 1M 上下文（模型名带 `[1m]`）
 
 模型名以 `[1m]` 结尾（`claude-opus-5-5[1m]`、`opus[1m]`）的 Claude Code worker，claudesec 在它的 settings.json 里写

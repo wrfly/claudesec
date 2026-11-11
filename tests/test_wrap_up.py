@@ -43,6 +43,15 @@ class WrapUp(unittest.TestCase):
     def test_which(self):
         self.assertEqual(self.cs.to_wrap_up(self.workers), {"old"})
 
+    def test_not_with_something_running_in_the_background(self):
+        d = self.cs.worker_dir("old")
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "last-stop.json").write_text(json.dumps({"background_tasks": [
+            {"id": "b1", "type": "shell", "status": "running", "command": "poll.sh"}], "session_crons": []}))
+        self.assertEqual(self.cs.to_wrap_up(self.workers), set())
+        (d / "last-stop.json").write_text(json.dumps({"background_tasks": [{"status": "completed"}]}))
+        self.assertEqual(self.cs.to_wrap_up(self.workers), {"old"})
+
     def test_shown_in_status(self):
         self.cs.alive_windows = lambda: {"@1", "@2", "@3", "@4", "@5"}
         self.cs.worker_usage = lambda ws: {n: None for n in ws}

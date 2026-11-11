@@ -812,7 +812,8 @@ SendMessage / `claudesec send` 告诉它，因为 worker 没有每轮注入的 h
 ### 「[收尾]」
 
 `claudesec status` 和进度面板给 DONE 超过一小时、队列待问 / 待答里没有带它标签（`[名字]`）的事的 worker 标「[收尾]」，
-秘书一眼看到去 close / shelve（review-1111 提的：DONE 后窗口挂着没人收）。委托来的不标，claudesec 自己归档。
+秘书一眼看到去 close / shelve（review-1111 提的：DONE 后窗口挂着没人收）。委托来的不标，claudesec 自己归档。最后一轮结束时还有后台命令或定时 prompt 在跑的不标（Claude Code 的 Stop 输入里的
+`background_tasks` / `session_crons`）：oncall 这种靠后台轮询过一会儿叫醒自己的，DONE 只是这一轮的。
 
 ### 1M 上下文（模型名带 `[1m]`）
 

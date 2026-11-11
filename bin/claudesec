@@ -903,8 +903,19 @@ def status_line(cols, focused, name, mark, word, color, summary, age, tokens, mo
 WRAP_UP_SECS = 3600
 
 
+def still_running(name):
+    """Background shells or scheduled prompts of its own going on when its last turn ended (Claude
+    Code's Stop input says): a watcher like oncall's alert poller, which wakes it later."""
+    with contextlib.suppress(OSError, ValueError):
+        stop = json.loads((worker_dir(name) / "last-stop.json").read_text())
+        return any(t.get("status") == "running" for t in stop.get("background_tasks") or []) \
+            or bool(stop.get("session_crons"))
+    return False
+
+
 def to_wrap_up(workers, now=None):
-    """Workers done over an hour ago with nothing of theirs in the queue's 待问 / 待答: for the
+    """Workers done over an hour ago with nothing of theirs in the queue's 待问 / 待答 and nothing
+    left running in the background (still_running): for the
     secretary to close or shelve (review-1111, 2026-11-11: windows left open long after their DONE).
     A delegated one is archived by claudesec itself."""
     now = now or dt.datetime.now().astimezone()
@@ -913,6 +924,8 @@ def to_wrap_up(workers, now=None):
     out = set()
     for name, w in workers.items():
         if w["status"] != "DONE" or w.get("delegated_by") or name in asked or not w.get("last_report_at"):
+            continue
+        if still_running(name):
             continue
         if (now - dt.datetime.fromisoformat(w["last_report_at"])).total_seconds() >= WRAP_UP_SECS:
             out.add(name)

@@ -162,6 +162,8 @@ These are not in the repo:
   plugins directory nothing changes. Optional plugins that anyone may want come in the repo's
   `plugins/`, each off until linked into `~/.claudesec/plugins/`; `claudesec plugin` lists what's loaded and what isn't:
   [`plugins/telegram`](plugins/telegram/README.md) sends you what you ask the secretary to send, through a Telegram bot.
+  [`plugins/rc`](plugins/rc/README.md) starts a session joined to Claude's web page (`--rc`), and answers the
+  development-channels box it begins with when `server:remote` is its only channel.
 
 To bring the history along, copy `~/.claudesec/history/`. The session ids in its task files can be
 `--resume`d only on the original machine.

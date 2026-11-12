@@ -125,6 +125,7 @@ repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法�
 接口见 `bin/claudesec` 里 `load_plugins` 上面的注释；没有插件目录就什么都不变。
 谁都可能用得上的可选插件放在 repo 的 `plugins/` 里，链接进 `~/.claudesec/plugins/` 才生效（`claudesec plugin` 列出加载了哪些、哪些还没启用）：
 [`plugins/telegram`](plugins/telegram/README.md) 把你让秘书「发给我」的东西（文件、截图、文字）通过 Telegram bot 发到一个群里，配置步骤见它的 README。
+[`plugins/rc`](plugins/rc/README.md) 让会话带 --rc 起来（连到 Claude 网页），并自动点它开头的 development channels 确认框——只在唯一的 channel 是 server:remote 时。
 要连历史一起搬，复制 `~/.claudesec/history/` 即可（任务文件里的 session id 只在原机器上能 `--resume`）。
 
 ## 改 claudesec 本身

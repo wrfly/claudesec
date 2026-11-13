@@ -280,6 +280,18 @@ subagent；接着做同一个 worker 不算新增。停在提示符上的不算�
 worker 卡在确认框上时自己发不了 `SendMessage`，hook 是 shell 也发不了，Claude Code 又没有发跨会话消息的 CLI，
 所以告警走「文件 + 秘书侧 asyncRewake watcher」。已实测：空闲的秘书会被叫醒并收到告警。
 
+watcher 只在 SessionStart、Stop、StopFailure 时挂上，所以一轮没有正常结束，告警就没人送。11-12 23:37 一条告警叫醒秘书，
+那一轮被 safeguards 截断，Claude Code 的「continuing once」续写请求再没回来，秘书 busy 到第二天 10:35 用户来：
+没有 Stop，夜里的定时任务全积在 alerts/，oncall 的跨会话消息排在这一轮后面。Esc 打断的一轮同样没有 Stop，只是停在提示符。
+提醒检查器每轮跑 `check_watch` 兜这两种：
+- 秘书 busy 超过 30 分钟、transcript（含前台 subagent 的文件）30 分钟没写过东西，又有告警或排队消息在等 → 按一次 Esc，
+  并留一条告警告诉秘书上一轮被打断了（每个卡住的轮次一条）。确认框是 `waiting` 不是 `busy`，不会被按掉。
+- 秘书 idle 至少 2 分钟、有告警等了 2 分钟以上、没有 watcher 在跑（watcher 拿到锁后写 `watch.pid`）→ 往秘书窗口打一行
+  `[claudesec] 告警监听断了…直接结束这一轮`，这一轮结束的 Stop 挂上 watcher，告警随即送到。输入框里有用户没发的草稿就不打，
+  等用户那条消息的 Stop。以 `[claudesec` 开头，UserPromptSubmit 不把它当用户说话。
+同一种办法 10 分钟内只用一次。「别打扰我」不影响：定时任务照样送到秘书，只是秘书不告诉用户。
+检查器跟秘书一起活好几天，以前改了 claudesec 要重启秘书才生效；现在它发现 `bin/claudesec` 变了、新文件能编译，就 exec 成新代码。
+
 ### 3.3 注册表（秘书的外脑）
 
 ```json

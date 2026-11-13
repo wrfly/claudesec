@@ -4893,10 +4893,18 @@ def check_reminders(run_pid):
     The lock hands over from an older checker whose secretary is gone. Runaway spending is
     looked at here too, less often."""
     last_runaway = last_stale = last_leftovers = 0.0
+    code = code_stamp()
     with open(HOME / "reminders-checker.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
+            code = restart_if_updated(code, run_pid)
             fire_due_reminders()
+            with contextlib.suppress(Exception):  # a transcript or pane that can't be read
+                did = check_watch()
+                if did:
+                    print(f"{now()} secretary: " + {"escaped": "turn hung, pressed Esc",
+                                                    "typed": "alerts waiting with no watcher, typed a line to re-arm it"}[did],
+                          flush=True)
             with contextlib.suppress(Exception):  # nor a window that vanished mid-look
                 check_stuck()
             if time.monotonic() - last_runaway >= RUNAWAY_CHECK_SECS:
@@ -4915,6 +4923,28 @@ def check_reminders(run_pid):
             with contextlib.suppress(Exception):
                 check_idle()
             time.sleep(REMINDER_CHECK_SECS)
+
+
+def code_stamp():
+    with contextlib.suppress(OSError):
+        return SELF.stat().st_mtime
+    return None
+
+
+def restart_if_updated(stamp, run_pid):
+    """The checker lives as long as the secretary, for days: a fix to claudesec reached it only
+    when the secretary was restarted. Once the file changes and still compiles, it starts over on
+    the new code (the lock goes with the old process: Python opens files close-on-exec)."""
+    new = code_stamp()
+    if new == stamp:
+        return stamp
+    try:
+        compile(SELF.read_text(), str(SELF), "exec")
+    except (OSError, SyntaxError, ValueError):
+        return new  # half-written or broken: keep running the old code, and don't try it every round
+    print(f"=== {now()} claudesec changed: the reminder checker restarts on the new code", flush=True)
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, str(SELF), "lifecycle", "reminders", str(run_pid)])
 
 
 def print_reminders():
@@ -6570,6 +6600,7 @@ def hook_secretary_watch(delay=0):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return  # already armed
+    (HOME / WATCH_PID).write_text(str(os.getpid()))  # for check_watch: is one armed?
     owner = next((s["pid"] for s in claude_sessions() if s.get("sessionId") == data.get("session_id")),
                  os.getppid())
     alerts, done = HOME / "alerts", HOME / "alerts" / "delivered"
@@ -6607,6 +6638,130 @@ def hook_secretary_watch(delay=0):
         except OSError:
             return  # the secretary is gone
         time.sleep(1)
+
+
+# ---------- the watcher lost: alerts that nothing will deliver ----------
+# 11-12 23:37 an alert woke the secretary; Claude Code's safeguards cut that turn short, and the
+# one retry it makes ("continuing once") never came back. The turn hung, busy, until the user
+# came by at 10:35 the next morning: no Stop hook, so no watcher was armed again, and the night's
+# reminders (r82 six times, r92, r95) sat in alerts/; oncall's messages queued behind the turn.
+# A turn that ends with no Stop hook at all (Esc; a cut-short turn that gives up) leaves the same
+# hole, at the prompt instead of busy. The reminder checker looks for both: a turn busy long after
+# its transcript went quiet gets an Esc; an idle secretary with alerts waiting and no watcher gets
+# a line typed into its window, whose turn end arms one. Not held back by "don't disturb me":
+# the secretary must still get them, it just keeps them from the user.
+
+WATCH_PID = "watch.pid"
+WATCH_LOST_SECS = 120          # an alert waiting this long with no watcher: not between two turns
+TURN_HUNG_SECS = 30 * 60       # busy this long with nothing new in the transcript: hung, not working
+RESCUE_RETRY_SECS = 10 * 60    # the same remedy again only after this long
+WATCH_RESCUE = "watch-rescue.json"
+WATCH_LOST = ("[claudesec] 告警监听断了（上一轮没有正常结束），这一条是 claudesec 打进来重新挂监听的，不是用户说的话："
+              "什么都不用做、不用回复，直接结束这一轮；积压的告警随后就到。")
+WATCH_LOST_EN = ("[claudesec] The alert watcher was lost (the last turn didn't end normally); claudesec typed this to "
+                 "re-arm it, the user didn't: do nothing and don't reply, just end this turn; the waiting alerts follow.")
+# What a turn writes to its transcript as it goes; queue-operation lines are messages queued for
+# later, written while the turn is stuck too.
+TURN_ENTRIES = ("user", "assistant", "system", "attachment", "api-request")
+
+
+def watcher_armed():
+    """A secretary-watch hook is running (the one holding watch.lock wrote its pid)."""
+    try:
+        pid = int((HOME / WATCH_PID).read_text())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    with contextlib.suppress(OSError):  # no /proc: alive will do
+        return b"secretary-watch" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    return True
+
+
+def secretary_session():
+    """The secretary's entry in Claude Code's sessions/, or None when it isn't running."""
+    with contextlib.suppress(OSError):
+        sid = (HOME / "secretary.session").read_text().strip()
+        return next((s for s in claude_sessions() if s.get("sessionId") == sid), None)
+    return None
+
+
+def transcript_tail(sid, size=1 << 20):
+    """(last time the turn wrote something, a message still queued) from the transcript's end,
+    and its subagents' files (a foreground subagent works there). (None, False) if not found."""
+    path = transcript(sid)
+    if path is None:
+        return None, False
+    last, queued = None, False
+    with contextlib.suppress(OSError):
+        with open(path, "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - size))
+            lines = f.read().splitlines()[1:]
+        for line in lines:
+            try:
+                e = json.loads(line)
+                if e.get("type") == "queue-operation":
+                    queued = e.get("operation") == "enqueue"
+                elif e.get("type") in TURN_ENTRIES and e.get("timestamp"):
+                    t = dt.datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+                    last = t if last is None else max(last, t)
+            except (ValueError, TypeError, AttributeError):
+                continue
+    for f in (path.parent / sid).glob("subagents/*.jsonl"):
+        with contextlib.suppress(OSError):
+            last = max(last or 0, f.stat().st_mtime)
+    return last, queued
+
+
+def session_pane(s):
+    """The tmux pane a Claude Code session runs in ("claudesec:@0.%0" → "%0")."""
+    return (s.get("tmux") or "").rpartition(".")[2] or secretary_pane(config()["tmux_session"])
+
+
+def check_watch(now_t=None):
+    """Runs with the reminders. Returns what it did, for the log: None, "escaped", "typed"."""
+    now_t = time.time() if now_t is None else now_t
+    s = secretary_session()
+    if not s or not s.get("statusUpdatedAt"):
+        return None
+    since = now_t - s["statusUpdatedAt"] / 1000
+    alerts = sorted((HOME / "alerts").glob("*.txt"))
+    waiting = bool(alerts) and now_t - min(f.stat().st_mtime for f in alerts) >= WATCH_LOST_SECS
+    try:
+        done = json.loads((HOME / WATCH_RESCUE).read_text())
+    except (OSError, ValueError):
+        done = {}
+    pane = session_pane(s)
+    if s.get("status") == "busy" and since >= TURN_HUNG_SECS:
+        last, queued = transcript_tail(s["sessionId"])
+        quiet = now_t - last if last else since
+        if quiet < TURN_HUNG_SECS or not (waiting or queued) or now_t - done.get("escaped", 0) < RESCUE_RETRY_SECS:
+            return None
+        tmux("send-keys", "-t", pane, "Escape", check=False)
+        done["escaped"] = now_t
+        mins = int(quiet // 60)
+        if done.get("hung_turn") != s["statusUpdatedAt"]:  # one note for a turn, however many Escs
+            done["hung_turn"] = s["statusUpdatedAt"]
+            raise_alert(tr(f"[claudesec] 你上一轮卡住了：{mins} 分钟没有任何进展（多半是请求没回来），claudesec 按了 Esc 把它打断。"
+                           "那一轮要做的事可能没做完，看一眼上面再接着办；告警和消息是卡住期间攒下的。",
+                           f"[claudesec] Your last turn hung: no progress for {mins} minutes (most likely a request that "
+                           "never came back), so claudesec pressed Esc to cut it off. What it was doing may be unfinished: "
+                           "look above and carry on. The alerts and messages piled up while it was stuck."))
+        what = "escaped"
+    elif s.get("status") == "idle" and waiting and since >= WATCH_LOST_SECS and not watcher_armed():
+        if now_t - done.get("typed", 0) < RESCUE_RETRY_SECS:
+            return None
+        box = [line for line in pane_text(pane, suggestion="drop").splitlines() if line.startswith("❯")]
+        if not box or box[-1].strip() != "❯":
+            return None  # the user has a draft there: their message's turn end arms one
+        tmux("send-keys", "-t", pane, "-l", tr(WATCH_LOST, WATCH_LOST_EN), check=False)
+        time.sleep(0.5)  # Enter apart from the text, as when typed by hand
+        tmux("send-keys", "-t", pane, "Enter", check=False)
+        done["typed"] = now_t
+        what = "typed"
+    else:
+        return None
+    (HOME / WATCH_RESCUE).write_text(json.dumps(done))
+    return what
 
 
 load_agents()

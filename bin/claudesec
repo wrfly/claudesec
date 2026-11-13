@@ -2945,6 +2945,10 @@ def background_tasks(conv):
 # working: worker disk was at its prompt while its background Bash ran paced DELETEs on a production
 # database, and the shelve killed the script mid-run.
 WORKING = ("busy", "waiting", "background")
+# At its prompt, whether or not a background shell runs: for the secretary, waiting on the user
+# or an alert all the same. Only "idle" counted here before, so while the secretary had a background
+# Bash going neither the idle nudges nor the lost-watcher rescue came.
+AT_PROMPT = ("idle", "shell")
 
 
 def session_status(conv):
@@ -5451,9 +5455,10 @@ def print_reminders():
 # worker, no alert since its last turn ended) with items for the user (待问, 待答, 待办) is woken
 # to ask one. Unanswered, the next wait is longer (idle_ask_minutes), until there are none left;
 # the user speaking starts them over, and so do new items. Not while "don't disturb me" (dnd).
-# Idle is Claude Code's own word for it, in its sessions/<pid>.json: status "idle" since
-# statusUpdatedAt. Any turn (a message, an alert, a nudge) moves that on; so does Esc, which
-# runs no Stop hook.
+# Idle is Claude Code's own word for it, in its sessions/<pid>.json: status "idle" (or "shell",
+# a background command of its own still running) since statusUpdatedAt. Any turn (a message, an
+# alert, a nudge) moves that on; so does Esc, which runs no Stop hook, and so does that background
+# command ending ("shell" to "idle"): the wait starts over from there.
 
 IDLE_NUDGES = "idle-nudges.json"    # {"items": [numbers], "sent": nudges since the user last spoke}
 DND = "dnd"
@@ -5464,7 +5469,7 @@ def secretary_idle_minutes():
     with contextlib.suppress(OSError):
         sid = (HOME / "secretary.session").read_text().strip()
         s = next((s for s in claude_sessions() if s.get("sessionId") == sid), None)
-        if s and s.get("status") == "idle" and s.get("statusUpdatedAt"):
+        if s and s.get("status") in AT_PROMPT and s.get("statusUpdatedAt"):
             return (time.time() - s["statusUpdatedAt"] / 1000) / 60
     return None
 
@@ -7234,7 +7239,7 @@ def check_watch(now_t=None):
                            "never came back), so claudesec pressed Esc to cut it off. What it was doing may be unfinished: "
                            "look above and carry on. The alerts and messages piled up while it was stuck."))
         what = "escaped"
-    elif s.get("status") == "idle" and waiting and since >= WATCH_LOST_SECS and not watcher_armed():
+    elif s.get("status") in AT_PROMPT and waiting and since >= WATCH_LOST_SECS and not watcher_armed():
         if now_t - done.get("typed", 0) < RESCUE_RETRY_SECS:
             return None
         box = [line for line in pane_text(pane, suggestion="drop").splitlines() if line.startswith("❯")]

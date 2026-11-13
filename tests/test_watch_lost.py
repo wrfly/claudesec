@@ -76,6 +76,11 @@ class WatchLost(unittest.TestCase):
         self.assertEqual(self.keys[-1], ("send-keys", "-t", "%0", "Enter"))
         self.assertTrue(list(self.alerts.glob("*.txt")))  # left for the watcher that turn arms
 
+    def test_a_background_command_of_its_own_doesnt_hold_it_back(self):
+        self.session["status"] = "shell"  # at its prompt, its own background Bash still running
+        self.alert("a", NOW - 300)
+        self.assertEqual(self.cs.check_watch(NOW), "typed")
+
     def test_not_while_a_watcher_is_armed_or_the_alert_is_new(self):
         self.alert("a", NOW - 30)
         self.assertIsNone(self.cs.check_watch(NOW))  # it may be on its way already

@@ -92,6 +92,17 @@ class Idle(unittest.TestCase):
             self.cs.cmd_notice(argparse.Namespace(action="add", words=["去 X 窗口说 push"], source="w"))
         self.assertEqual(len(self.check(60)), 1)
 
+    def test_a_background_command_of_its_own_still_counts_as_idle(self):
+        """At its prompt with a background Bash running, Claude Code says "shell", not "idle"."""
+        self.add("[w] 一")
+        self.session.update(status="shell", statusUpdatedAt=(time.time() - 5 * 60) * 1000)
+        self.cs.check_idle()
+        self.assertEqual(len(self.nudges()), 1)
+        self.add("[w] 二")
+        self.session.update(status="waiting", statusUpdatedAt=(time.time() - 60 * 60) * 1000)
+        self.cs.check_idle()  # a permission prompt or a question in the window: mid-turn
+        self.assertEqual(self.nudges(), [])
+
     def test_not_while_busy_not_running_dnd_or_off(self):
         self.add("[w] 一")
         self.session["status"] = "busy"

@@ -509,6 +509,14 @@ def secretary_pane(sess):
     return plain[0][1] if plain else None
 
 
+def in_secretary_pane(sess):
+    """Is this process in the secretary's pane? `claudesec` starts `claudesec run` there (new-session,
+    new-window or respawn-pane, in a window named secretary), and tmux tells each pane's processes
+    their pane in TMUX_PANE; a shell or a Claude session elsewhere has its own pane, or none."""
+    pane = os.environ.get("TMUX_PANE")
+    return bool(pane) and has_session(sess) and secretary_pane(sess) == pane
+
+
 # ---------- window order: the secretary's window first, a worker's back where it was ----------
 # tmux puts a new window at the first free index. A secretary window opened again (11-13 15:49,
 # after a restart) came up at index 11, behind the workers and the user's own windows; a worker
@@ -1673,6 +1681,15 @@ def notices_blocks(cols):
 def cmd_run(args):
     """Runs inside the secretary's tmux window: the secretary's Claude Code process itself."""
     cfg = config()
+    if not in_secretary_pane(cfg["tmux_session"]):
+        # 11-13 17:18-17:27 a Claude session debugging a failed start ran `claudesec run` in scratch
+        # tmux sessions, against the real state directory: each run became "the secretary", its
+        # wake-all brought the shelved workers back, and its shelve-all put them all away again.
+        sys.exit(f"claudesec run is the secretary's own process and runs only in the secretary's pane "
+                 f"(tmux session '{cfg['tmux_session']}', window 'secretary'), where `claudesec` starts it. "
+                 f"Anywhere else it would take the workers over: wake the shelved ones now, and shelve every "
+                 f"worker when its claude exits. Start the secretary with `claudesec`, reload it with "
+                 f"`claudesec --restart`. Nothing was started.")
     HOME.mkdir(parents=True, exist_ok=True)
     if not (HOME / "queue.md").exists():
         (HOME / "queue.md").write_text(queue_template())
@@ -1703,7 +1720,12 @@ def cmd_run(args):
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"{cmd} hook secretary-prompt"}]}],
         },
     }, indent=2) + "\n")
-    argv = ["claude", "-n", cfg["secretary_name"],
+    # The path, not the name: given a name, Popen tries every `claude` on PATH in turn, and one that
+    # can't be exec'd is skipped. 11-13 a launcher script whose first line had become "# !/bin/sh"
+    # (fine from a shell, which runs such a file itself) was passed over for the bare claude after it,
+    # without the launcher's CLAUDE_CONFIG_DIR: "No conversation found", and the secretary was gone.
+    exe = shutil.which("claude") or sys.exit("claude is not on PATH; nothing was started")
+    argv = [exe, "-n", cfg["secretary_name"],
             "--settings", str(settings),
             "--append-system-prompt-file", str(secretary_prompt()), *fresh_prompt(),
             "--allowedTools", "Bash(claudesec *)"]
@@ -1729,7 +1751,20 @@ def cmd_run(args):
     def default_signals():  # ignored signals are inherited; claude needs its own
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGHUP, signal.SIG_DFL)
-    child = subprocess.Popen(argv, preexec_fn=default_signals)
+    try:
+        child = subprocess.Popen(argv, preexec_fn=default_signals)
+    except OSError as e:
+        # No secretary: give up being the current run, so wake-all wakes nothing and nothing is shelved.
+        with contextlib.suppress(OSError):
+            if (HOME / "run.pid").read_text() == str(os.getpid()):
+                (HOME / "run.pid").unlink()
+        print(f"claudesec: could not start {exe}: {e}.\nIf it is a script, its very first line must start "
+              f"with #! (a shell runs one without it; claudesec doesn't). The workers were left as they are.",
+              file=sys.stderr)
+        with contextlib.suppress(EOFError, OSError):
+            if sys.stdin.isatty():
+                input("Enter closes this window. ")
+        sys.exit(1)
     if os.environ.get("TMUX_PANE") and any(callable(p.get("answer_dialog")) for p in PLUGINS):
         threading.Thread(target=answer_own_dialogs, args=(os.environ["TMUX_PANE"],), daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: child.terminate())
@@ -2708,7 +2743,7 @@ def worker_busy(name, w):
     if is_external(w):
         return agent_running(w) and (HOME / "workers" / name / "busy").exists()
     holder = live_holder(w.get("session"))
-    return bool(holder) and session_status(holder)[0] in ("busy", "background")
+    return bool(holder) and session_status(holder)[0] in WORKING
 
 
 def stuck_on_dialog(name, target, agent, wait=8):
@@ -2829,12 +2864,25 @@ def background_tasks(conv):
     return [what for what, until in running.values() if until is None or until > time.time()]
 
 
+# Claude Code's own status for a session, in its sessions/<pid>.json: "busy" (mid-turn), "waiting"
+# (mid-turn, on a permission prompt or a question), "idle" (at its prompt) and "shell" (at its
+# prompt, a background shell command still running). 11-13 17:11 shelve-all took "shell" for not
+# working: worker disk was at its prompt while its background Bash ran paced DELETEs on a production
+# database, and the shelve killed the script mid-run.
+WORKING = ("busy", "waiting", "background")
+
+
 def session_status(conv):
-    """A live session's status and its background tasks. Idle at the prompt with background
-    tasks still running is "background": as unsafe to restart as busy."""
+    """A live session's status and its background tasks. At the prompt with background tasks still
+    running is "background": as unsafe to restart as busy. Claude Code says so itself for a shell
+    ("shell"); subagents and monitors are read off the transcript."""
     status = conv.get("status", "?")
-    tasks = background_tasks(conv) if status == "idle" else []
-    return ("background" if tasks else status), tasks
+    if status not in ("idle", "shell"):
+        return status, []
+    tasks = background_tasks(conv)
+    if status == "shell" and not any(t == tr("后台命令", "bg command") for t in tasks):
+        tasks.append(tr("后台命令", "bg command"))  # the transcript may not tell which; Claude Code knows one runs
+    return ("background" if tasks else "idle"), tasks
 
 
 def status_label(conv):
@@ -3434,6 +3482,9 @@ def refuse_if_working(name, conv):
     status, tasks = session_status(conv)
     if status == "busy":
         sys.exit(f"{name} is busy; shelving would cut it off mid-task. Wait for it, or pass --force")
+    if status == "waiting":
+        sys.exit(f"{name} is mid-turn, waiting on a permission prompt or a question in its window; shelving "
+                 f"would drop that turn. Have it answered first, or pass --force")
     if tasks:
         sys.exit(f"{name} is at its prompt, but its background tasks are still running ({', '.join(tasks)}); "
                  f"shelving would kill them. Wait for them, or pass --force")

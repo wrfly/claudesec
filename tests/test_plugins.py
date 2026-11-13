@@ -77,6 +77,8 @@ class Plugins(unittest.TestCase):
                 mock.patch.object(cs, "memory_settings", lambda d: {}), \
                 mock.patch.object(cs.signal, "signal", lambda *a: None), \
                 mock.patch.object(cs.os, "chdir", lambda d: None), \
+                mock.patch.object(cs, "in_secretary_pane", lambda sess: True), \
+                mock.patch.object(cs.shutil, "which", lambda name: "/x/claude"), \
                 mock.patch.dict(os.environ, {"TMUX_PANE": ""}):
             cs.cmd_run(argparse.Namespace(new=False))
         return started[0]

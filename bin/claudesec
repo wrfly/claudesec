@@ -54,6 +54,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec wake NAME [--model M] [--dir D] [< instruction]   resume a shelved one in a new window (history
                                     kept); --dir: in D, for a worker whose directory moved
   claudesec redir OLD NEW                a directory moved (repo renamed): workers recorded in OLD go to NEW
+  claudesec rename OLD NEW               a worker's new name, everywhere (registry, window, its dir and log,
+                                    reminders, open items tagged [OLD], its Claude Code session), no restart
   claudesec archive NAME [--summary S] [--tags a,b] [--files x,y]
   claudesec archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
   claudesec lesson TYPE SITUATION CORRECTION
@@ -73,6 +75,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -1832,6 +1835,9 @@ def cmd_spawn(args):
     name = args.name
     if not NAME_RE.match(name):
         sys.exit(f"bad worker name {name!r}: use lowercase letters, digits, dashes")
+    if name in renamed_aliases():
+        sys.exit(f"{name} was {renamed_aliases()[name]}'s name, and {renamed_aliases()[name]}'s process still calls "
+                 f"its hooks with it until it is restarted; pick another name")
     refuse_while_frozen(f"spawn {name}")
     _, workers = read_registry()
     old = workers.get(name)
@@ -1932,6 +1938,7 @@ def prepare_worker(name, cfg, initial, cwd, fresh_log=True, agent=None, memory=N
     memory: another auto memory dir than cwd's (the review worker tidies the secretary's).
     mode: "task" or "discuss", kept in the dir for what starts its agent (worker_who)."""
     agent = agent or AGENTS["claude"]
+    settle_rename(name)  # its new process looks in workers/<name>/, not under a name it had before
     # A reused name starts a fresh log; the old one stays next to it.
     if fresh_log and log_path(name).exists():
         log_path(name).rename(log_path(name).with_suffix(f".{int(time.time())}.log"))
@@ -3159,7 +3166,7 @@ def worker_name_for(s, conv, as_name):
     name = as_name or re.sub(r"-[0-9a-f]{2}$", "", (s.get("name") or conv.get("jobId")
                                                     or Path(conv["cwd"]).name).lower())
     name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")[:32].strip("-")
-    if not NAME_RE.match(name) or name in read_registry()[1]:
+    if not NAME_RE.match(name) or name in read_registry()[1] or name in renamed_aliases():
         sys.exit(f"can't use {name!r} as the worker name; pass --as NAME")
     return name
 
@@ -3397,9 +3404,11 @@ BROWSERS = {"chrome", "google-chrome", "google-chrome-stable", "chromium", "chro
 MARK_ENV = ("HOME", "PWD", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR")
 
 
-def leftover_roots(name):
-    roots = {f"/tmp/claude-{name}", str(Path(tempfile.gettempdir()) / f"claude-{name}"),
-             str(HOME / "work" / name), os.path.realpath(HOME / "work" / name)}
+def leftover_roots(names):
+    """names: a worker's name and those it had before a rename, whose rules it may still follow."""
+    names = [names] if isinstance(names, str) else names
+    roots = {r for name in names for r in (f"/tmp/claude-{name}", str(Path(tempfile.gettempdir()) / f"claude-{name}"),
+                                           str(HOME / "work" / name), os.path.realpath(HOME / "work" / name))}
     return sorted(roots)
 
 
@@ -3471,10 +3480,11 @@ def live_trees(snap):
     return keep
 
 
-def weak_roots(name):
+def weak_roots(names):
     """/tmp/<name>/: a worker's scratch as often as anything else of that name (grpscroll's
     Chromes, 11-09), so a match there is only "maybe"."""
-    return sorted({f"/tmp/{name}", str(Path(tempfile.gettempdir()) / name)})
+    names = [names] if isinstance(names, str) else names
+    return sorted({r for name in names for r in (f"/tmp/{name}", str(Path(tempfile.gettempdir()) / name))})
 
 
 def path_mark(p, roots):
@@ -3490,16 +3500,16 @@ def path_mark(p, roots):
     return None
 
 
-def proc_mark(p, name, sid):
+def proc_mark(p, names, sid):
     """Why process p is worker name's, and whether that is sure: (why, sure) or None. Paths
     count as an argument of their own or a --flag=value, not inside a longer text: a worker's
     own claude has its whole task, other workers' paths and all, in one argument."""
     if sid and p.env.get("CLAUDE_CODE_SESSION_ID") == sid:
         return tr("会话环境变量", "session env"), True
-    why = path_mark(p, leftover_roots(name))
+    why = path_mark(p, leftover_roots(names))
     if why:
         return why, True
-    why = path_mark(p, weak_roots(name))
+    why = path_mark(p, weak_roots(names))
     return (why, False) if why else None
 
 
@@ -3556,10 +3566,12 @@ def docker_containers():
     return out
 
 
-def container_mark(c, name, roots, since):
+def container_mark(c, names, roots, since):
     """Why container c is the worker's, or None. A name alone counts only for one created while
-    the worker ran (since: its start), so the user's own `redis` isn't taken for worker redis's."""
-    if c["labels"].get("claudesec.worker") == name:
+    the worker ran (since: its start), so the user's own `redis` isn't taken for worker redis's.
+    names: its name and those it had before a rename."""
+    names = [names] if isinstance(names, str) else names
+    if c["labels"].get("claudesec.worker") in names:
         return "label claudesec.worker"
     for k, v in c["labels"].items():
         if under_root(v, roots):
@@ -3568,8 +3580,9 @@ def container_mark(c, name, roots, since):
         if under_root(src, roots):
             return tr(f"挂载 {src}", f"mount {src}")
     n = c["name"]
-    named = (n == name or n.startswith((f"{name}-", f"{name}_", f"claude-{name}", f"claudesec-{name}"))
-             or n.endswith((f"-{name}", f"_{name}")) or c["labels"].get("com.docker.compose.project") == name)
+    named = any(n == name or n.startswith((f"{name}-", f"{name}_", f"claude-{name}", f"claudesec-{name}"))
+                or n.endswith((f"-{name}", f"_{name}")) or c["labels"].get("com.docker.compose.project") == name
+                for name in names)
     if named and since and c["created"] and c["created"] >= since:
         return tr("名字", "name")
     return None
@@ -3585,7 +3598,7 @@ def ssh_mux(argv):
     return bool(SSH_MUX.fullmatch(" ".join(" ".join(argv).split())))
 
 
-def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None, shared=False):
+def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None, shared=False, former=None):
     """What worker `name` left running: [{kind: proc|docker, id, what, why, sure, n, rss}].
     sure=False: only under /tmp/<name>/, or a headless browser orphaned after `since` with
     nothing else tying it to this worker (another worker running then could own it): shown and
@@ -3593,12 +3606,13 @@ def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None,
     particular (subproxy, edgerelay 11-10): left out, or with shared, listed as unsure and shared."""
     snap = ps_snapshot() if snap is None else snap
     keep = live_trees(snap) if keep is None else keep
-    roots = leftover_roots(name)
+    names = [name, *(former_names(read_registry()[1].get(name)) if former is None else former)]
+    roots = leftover_roots(names)
     found = {}
     for pid, p in snap.items():
         if pid in keep:
             continue
-        mark = proc_mark(p, name, sid)
+        mark = proc_mark(p, names, sid)
         if mark and ssh_mux(p.argv):
             if shared:
                 found[pid] = (mark[0], None)
@@ -3615,7 +3629,7 @@ def leftovers(name, sid=None, since=None, snap=None, containers=None, keep=None,
                     "sure": bool(sure), **({"shared": True} if sure is None else {}),
                     "n": len(members), "rss": sum(snap[q].rss for q in members if q in snap)})
     for c in docker_containers() if containers is None else containers:
-        why = container_mark(c, name, roots, since)
+        why = container_mark(c, names, roots, since)
         if why:
             out.append({"kind": "docker", "id": c["id"], "what": c["name"], "why": why, "sure": True, "n": 1, "rss": 0})
     return out
@@ -3656,7 +3670,8 @@ def kill_leftovers(found):
 
 
 def worker_leftovers(name, w, shared=False):
-    return leftovers(name, sid=w.get("session"), since=epoch(w.get("started_at")), shared=shared)
+    return leftovers(name, sid=w.get("session"), since=epoch(w.get("started_at")), shared=shared,
+                     former=former_names(w))
 
 
 def refuse_if_leftovers(name, w):
@@ -3693,6 +3708,7 @@ def mentioned(names, snap, keep, containers, reg):
                     out |= {first, first.removeprefix("claude-")}
     text = " ".join(x for c in containers for x in [c["name"], *c["labels"].values(), *c["mounts"]])
     out |= {n for n in names if n in text}
+    out |= {n for n, w in reg.items() for old in former_names(w) if old in out or old in text}
     return names & out
 
 
@@ -3705,6 +3721,7 @@ def all_leftovers(shared=False):
     live = {n for n, w in reg.items() if w["status"] != "SHELVED" and w.get("window") in windows}
     names = set(reg) | {d.name for base in ("workers", "work") if (HOME / base).is_dir()
                         for d in (HOME / base).iterdir() if d.is_dir()}
+    names -= {old for w in reg.values() for old in former_names(w)} - set(reg)  # checked as the worker's
     snap = ps_snapshot()
     keep, containers = live_trees(snap), docker_containers()
     out, seen = [], set()
@@ -3842,6 +3859,7 @@ def cmd_shelve(args):
                                 "last_report_at": entry.get("last_report_at") or now()}
         if reg["focus"] == name:
             reg["focus"] = None
+    settle_rename(name)  # nothing of it runs now
     (worker_dir(name) / "waiting-permission").unlink(missing_ok=True)
     append_log(name, "shelved", f"session {sid}, {cwd}\n{summary}")
     print(f"shelved {label} as {name}: nothing is running for it now. Session {sid} in {cwd}. "
@@ -3998,6 +4016,243 @@ def cmd_redir(args):
         reg.setdefault("moved", {})[old] = new
     print(f"{old} → {new}: " + ("\n  " + "\n  ".join(moved) if moved else "no worker was recorded there")
           + "\nRemembered for archived delegations too. `claudesec wake NAME` resumes a shelved one there.")
+
+
+# ---------- rename: a worker's name, while it runs ----------
+# A worker's name is in more places than the registry: its tmux window, workers/<name>/ and
+# reports/<name>.log, the reminders and the open queue items / to-dos tagged [name], and, for a
+# Claude Code worker, the name of its session, which is the address SendMessage delivers to. A
+# running process also has the name baked in: its hook commands (`hook worker-stop NAME`), the
+# paths of its --settings and --append-system-prompt-file under workers/NAME/, its rules
+# (`claudesec report NAME`), an external agent's CLAUDESEC_WORKER. Those can't change without a
+# restart, so until it is restarted the old name stays an alias (registry "renamed") that
+# resolve() turns into the new one, and workers/NEW is a symlink to workers/OLD, which stays where
+# the process looks. settle_rename() moves the directory over once no such process runs.
+
+def renamed_aliases():
+    """{old name: worker}: names of running workers' processes, from before a rename."""
+    with contextlib.suppress(OSError, ValueError):
+        return json.loads((HOME / "registry.json").read_text()).get("renamed") or {}
+    return {}
+
+
+def resolve(name):
+    """The worker a name means now: a running worker's name from before a rename means it."""
+    return renamed_aliases().get(name, name) if name else name
+
+
+def former_names(w):
+    """The names a worker had before (`claudesec rename`), oldest first."""
+    return [r["name"] for r in (w or {}).get("renamed_from") or []]
+
+
+def settle_rename(name):
+    """No process started under an old name of worker name runs any more (it was shelved or
+    closed, or is about to be started again): the aliases go, and its directory, kept under the
+    old name for that process's paths, moves to the new name."""
+    if name not in renamed_aliases().values():
+        return
+    base = HOME / "workers"
+    with registry() as reg:
+        aliases = reg.get("renamed") or {}
+        for old in [o for o, n in aliases.items() if n == name]:
+            del aliases[old]
+        if not aliases:
+            reg.pop("renamed", None)
+        link = base / name
+        if link.is_symlink():
+            real = link.resolve()
+            link.unlink()
+            if real.is_dir() and real.parent == base.resolve():
+                real.rename(link)
+
+
+def put_aside(path):
+    """What a closed worker of that name left at path (a directory, a log) is kept beside it,
+    as a reused name's log is (prepare_worker)."""
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        path.rename(path.with_name(f"{path.stem}.{int(time.time())}{path.suffix}"))
+
+
+def message_socket(path, frames):
+    """Write JSON frames, one per line, to a Claude Code session's messaging socket."""
+    with socket.socket(socket.AF_UNIX) as c:
+        c.settimeout(5)
+        c.connect(path)
+        c.sendall("".join(json.dumps(f) + "\n" for f in frames).encode())
+
+
+def rename_session(s, new, wait=8):
+    """Rename live Claude Code session s in place, as peers address it. Claude Code's messaging
+    socket (sessions/<pid>.json messagingSocketPath, where SendMessage is delivered) takes a
+    control frame {"action": "rename"}, which renames it as /rename would: the name in its
+    sessions file and status bar, a custom-title in the transcript. Its conversation and input
+    box are not touched. Not /rename typed into its window: that would be mixed into whatever the
+    user has half typed there, or wait behind a turn. The auth frame is the peers' own, from the
+    key file the session publishes (only required on Windows). Returns (name it shows, error)."""
+    path = s.get("messagingSocketPath")
+    if not path:
+        return s.get("name"), "its sessions file names no messaging socket (Claude Code too old?)"
+    frames = []
+    with contextlib.suppress(OSError, ValueError, StopIteration, AttributeError):
+        key = next((claude_dir() / "sessions").glob(f"{s['pid']}.*.key"))
+        frames.append({"type": "auth", "token": json.loads(key.read_text())["peerToken"]})
+    frames.append({"type": "control", "action": "rename", "name": new, "session_id": s["sessionId"]})
+    try:
+        message_socket(path, frames)
+    except OSError as e:
+        return s.get("name"), f"its messaging socket {path}: {e}"
+    shown = s.get("name")
+    for _ in range(wait * 4):
+        time.sleep(0.25)
+        shown = (live_holder(s["sessionId"]) or {}).get("name")
+        if shown == new:
+            return new, None
+    return shown, f"it still calls itself {shown!r} after {wait}s"
+
+
+def retag(path, old, new, is_open):
+    """Open items of queue.md or notices.md tagged [old] are tagged [new]; the rest, closed ones
+    included (a name can be reused, so an old [old] may be another worker's), is left as it is.
+    is_open: whether a "## …" heading starts a section of open items. Returns the item numbers."""
+    if not path.exists():
+        return []
+    lines, section, done = path.read_text().splitlines(), False, []
+    item = re.compile(r"^(\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(?:#(\d+)\s+)?)\[" + re.escape(old) + r"\]")
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            section = is_open(line)
+            continue
+        m = item.match(line) if section else None
+        if m:
+            lines[i] = f"{m[1]}[{new}]{line[m.end():]}"
+            done.append(f"#{m[2]}" if m[2] else line.strip()[:40])
+    if done:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    return done
+
+
+def cmd_rename(args):
+    """A worker gets another name, everywhere claudesec keeps it, without a restart (see above).
+    A Claude Code worker's session is renamed through its messaging socket first; when that
+    fails nothing else is changed."""
+    cfg = config()
+    old, new = args.old, args.new
+    workers = read_registry()[1]
+    if old not in workers:
+        now_as = resolve(old)
+        sys.exit(f"no worker {old}" + (f" (it is called {now_as} now)" if now_as != old else "; see `claudesec status`"))
+    if new == old:
+        sys.exit(f"{old} is called that already")
+    if not NAME_RE.match(new):
+        sys.exit(f"bad worker name {new!r}: lowercase letters, digits, dashes, up to 32, starting with a letter or digit")
+    if new == cfg["secretary_name"]:
+        sys.exit(f"{new} is the secretary's name")
+    if new in workers:
+        sys.exit(f"{new} is taken by another worker ({workers[new]['status']}); pick another name, or close that one first")
+    aliases = renamed_aliases()
+    if new in aliases and aliases[new] != old:
+        sys.exit(f"{new} was {aliases[new]}'s name, and {aliases[new]}'s process still calls its hooks with it until "
+                 f"it is restarted; pick another name")
+    w = workers[old]
+    agent = agent_of(w)
+    running = agent_running(w)
+    holder = None if agent.external else live_holder(w.get("session"))
+    if running and not agent.external and not holder:
+        sys.exit(f"NOT RENAMED: {old} is running in {w['window']}, but no live Claude Code session of its "
+                 f"({w.get('session') or 'none recorded yet'}) is found, so its session would keep the old name. "
+                 f"Try again once it is up (`claudesec peek {old}`).")
+    clash = [s for s in claude_sessions() if (s.get("name") or "").lower() == new
+             and s.get("sessionId") != (holder or {}).get("sessionId")]
+    if clash:
+        c = clash[0]
+        sys.exit(f"a live Claude Code session is already called {new} (pid {c.get('pid')}, "
+                 f"{c.get('tmux') or c.get('cwd')}): SendMessage(to: {new!r}) would not know which one, and Claude "
+                 f"Code would give {old} another name. Pick another name.")
+    said = []
+    if holder:
+        shown, err = rename_session(holder, new)
+        if err:
+            sys.exit(f"NOT RENAMED: {old}'s Claude Code session could not be renamed ({err}); nothing was changed. "
+                     f"By hand: `/rename {new}` in its window, when its input box is empty, then run this again.")
+        said.append(tr(f"会话名 {holder.get('name')} → {new}（经它的消息 socket，对话和输入框都没碰）",
+                       f"session name {holder.get('name')} → {new} (through its messaging socket; conversation and "
+                       f"input box untouched)"))
+    base = HOME / "workers"
+    with registry() as reg:
+        if new in reg["workers"] or old not in reg["workers"]:
+            sys.exit(f"NOT RENAMED: the registry changed meanwhile; check `claudesec status` and try again")
+        # The same place in the table: a rename isn't a new worker.
+        reg["workers"] = {(new if n == old else n): v for n, v in reg["workers"].items()}
+        w = reg["workers"][new]
+        w["renamed_from"] = [*(w.get("renamed_from") or []), {"name": old, "at": now()}]
+        delegates = [n for n, v in reg["workers"].items() if v.get("delegated_by") == old]
+        for n in delegates:
+            reg["workers"][n]["delegated_by"] = new
+        if reg.get("focus") == old:
+            reg["focus"] = new
+        real = (base / old).resolve() if (base / old).exists() else None
+        if (base / old).is_symlink():
+            (base / old).unlink()
+        if real and real.name != new:
+            put_aside(base / new)
+            if running:  # its process keeps using workers/<the name it started with>/
+                (base / new).symlink_to(real.name)
+            else:
+                real.rename(base / new)
+        elif real is None:
+            put_aside(base / new)
+        kept = {o: n for o, n in (reg.get("renamed") or {}).items() if n != old}
+        start = real.name if real else old
+        if running and start != new:
+            kept[start] = new
+        if kept:
+            reg["renamed"] = kept
+        else:
+            reg.pop("renamed", None)
+        if log_path(old).exists():
+            put_aside(log_path(new))
+            log_path(old).rename(log_path(new))
+    if delegates:
+        said.append(tr(f"委托关系：{'、'.join(delegates)} 的委托人改成 {new}", f"delegations: {', '.join(delegates)} now for {new}"))
+    if w.get("window") in alive_windows():
+        tmux("rename-window", "-t", w["window"], new, check=False)
+        # A name of its own: tmux's automatic-rename (the running command) or the program's own
+        # escape sequences would otherwise put another back.
+        tmux("set-option", "-w", "-t", w["window"], "automatic-rename", "off", check=False)
+        tmux("set-option", "-w", "-t", w["window"], "allow-rename", "off", check=False)
+        said.append(tr(f"tmux 窗口 {w['window']} 改名 {new}（automatic-rename、allow-rename 关）",
+                       f"tmux window {w['window']} renamed {new} (automatic-rename, allow-rename off)"))
+    moved = []
+    with reminders() as data:
+        for r in data["items"]:
+            if r["status"] == "pending" and r.get("target") == old:
+                r["target"] = new
+                moved.append(r["id"])
+    if moved:
+        said.append(tr(f"定时任务 {'、'.join(moved)} 改给 {new}", f"reminders {', '.join(moved)} now for {new}"))
+    tagged = retag(HOME / "queue.md", old, new, lambda h: queue_section(h) not in (None, "done"))
+    tagged += retag(HOME / "notices.md", old, new, lambda h: notice_section(h) == "open")
+    if tagged:
+        said.append(tr(f"标着 [{old}] 的未结条目 {' '.join(tagged)} 改标 [{new}]",
+                       f"open items tagged [{old}] retagged [{new}]: {' '.join(tagged)}"))
+    append_log(new, "renamed", f"{old} → {new}")
+    print(tr(f"{old} 已改名 {new}：", f"renamed {old} to {new}: ") + tr("注册表、workers/ 目录、汇报日志；", "registry, workers/ dir, report log; ")
+          + tr("；", "; ").join(said) + tr("。", "."))
+    if running:
+        print(tr(f"它的进程是以 {start} 起的：hook、规则里的 `claudesec report {start}` 等仍用旧名，claudesec 当作 {new}，"
+                 f"不用告诉它；下次 wake / 换模型时换成新名。{start} 这个名字到那时才能再给别的 worker 用。",
+                 f"Its process started as {start}: its hooks and the `claudesec report {start}` in its rules still use "
+                 f"that name, which claudesec takes as {new}; no need to tell it. Its next wake or model switch "
+                 f"brings the new name in. Until then {start} can't be given to another worker."))
+    if holder:
+        print(tr(f"给它发消息用 SendMessage(to: {new!r})。", f"Message it with SendMessage(to: {new!r})."))
+    elif not agent.external and w.get("session"):
+        print(tr(f"它没在跑：下次 wake 时会话名改成 {new}。", f"Not running: its session takes the name {new} at its next wake."))
 
 
 def confirm_resume(name, pane, d, sid):
@@ -4166,6 +4421,7 @@ def cmd_close(args):
         if not holder:
             break
         time.sleep(0.1)
+    settle_rename(args.name)
     after = worker_leftovers(args.name, w) if w.get("window") else before
     if kill:
         done = kill_leftovers(after)
@@ -4241,6 +4497,7 @@ def cmd_archive(args):
                         project=w["dir"], worker=args.name, model=w["model"],
                         session=w.get("session"), status=status, files=files, tags=tags,
                         **({"delegated_by": w["delegated_by"]} if w.get("delegated_by") else {}),
+                        **({"renamed_from": former_names(w)} if w.get("renamed_from") else {}),
                         **agent_fields(w)) +
             tr(f"## 任务\n{w['task']}\n\n"
                f"## 用户决策\n{chr(10).join(user_decisions) or '无'}\n\n"
@@ -5035,6 +5292,7 @@ def cmd_discuss(args):
     user things one by one in its window, which otherwise sent a BLOCKED each turn to get past the
     hook, waking the secretary every time (review30, 2026-11-04). The worker runs it on itself, or
     the secretary on a worker and then tells it. on switches the user to its window."""
+    args.name = resolve(args.name)
     w = read_registry()[1].get(args.name) or sys.exit(f"no worker {args.name}")
     if args.state:
         mode = "discuss" if args.state == "on" else "task"
@@ -5047,7 +5305,7 @@ def cmd_discuss(args):
     mode = read_registry()[1][args.name].get("mode") or "task"
     print(tr(f"{args.name}：{'讨论模式' if mode == 'discuss' else '任务模式'}",
              f"{args.name}: {'discussion' if mode == 'discuss' else 'task'} mode"))
-    if args.state and os.environ.get("CLAUDESEC_WORKER") != args.name:
+    if args.state and resolve(os.environ.get("CLAUDESEC_WORKER")) != args.name:
         how = (f"`claudesec send {args.name}`" if is_external(w) else f"SendMessage(to: {args.name!r})")
         print(tr(f"它自己还不知道：用 {how} 告诉它" + ("「你已切到讨论模式：按规则里的「讨论模式」跟用户在窗口里直接对话，"
                                                     "每轮不用汇报，结束时发 DONE」。" if mode == "discuss" else
@@ -5393,6 +5651,7 @@ def cmd_report(args):
     then delivered to the secretary through the alert channel, which wakes it; a delegated
     worker's goes to its delegator instead (see cmd_wait). A PROGRESS, from either kind, is only
     recorded: the secretary reads it at its next turn (hook_secretary_prompt)."""
+    args.name = resolve(args.name)
     if args.name not in read_registry()[1]:
         sys.exit(f"no worker {args.name}")
     text = sys.stdin.read().strip() or sys.exit("empty report: pass it on stdin")
@@ -5560,11 +5819,11 @@ def cmd_delegate(args):
                  "whose spending claudesec can't see. Delegate without it, or do the work with a budgeted spawn.")
     refuse_while_frozen(f"NOT DELEGATED: delegate {args.name}")
     workers = read_registry()[1]
-    boss = args.boss
+    boss = resolve(args.boss)
     if boss not in workers:
         sys.exit(f"no worker {boss}: the first argument is your own worker name")
     task = sys.stdin.read().strip() or sys.exit("empty task: pass the task brief on stdin")
-    name = args.name
+    name = resolve(args.name)
     if not NAME_RE.match(name):
         sys.exit(f"bad name {name!r}: lowercase letters, digits, dashes")
     # More work for one it delegated before goes to the agent it ran on; a new one, to the one asked
@@ -5712,6 +5971,7 @@ def cmd_wait(args):
                     print(tr(f"{kind} worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}",
                              f"Report from {kind} worker {name} (delegated by you, {header[11:16]}):\n{body}"))
                     return
+        name = resolve(name)  # renamed meanwhile
         w = read_registry()[1].get(name)
         if w is None:
             sys.exit(f"{name} was closed without a final report; `claudesec log {name}` has what it said")
@@ -5782,7 +6042,7 @@ def hook_agent_finish(name):
 
 def hooked_worker():
     """The worker an external agent's hook runs for, if any."""
-    name = os.environ.get("CLAUDESEC_WORKER", "")
+    name = resolve(os.environ.get("CLAUDESEC_WORKER", ""))
     return name if name in read_registry()[1] else None
 
 
@@ -6798,7 +7058,7 @@ for _agent in AGENTS.values():
 
 def cmd_hook(args):
     fn = HOOKS[args.event]
-    fn(args.name) if args.name else fn()
+    fn(resolve(args.name)) if args.name else fn()
 
 
 # ---------- cli ----------
@@ -6841,6 +7101,7 @@ def main():
     s = sub.add_parser("wake"); s.add_argument("name"); s.add_argument("--model"); s.add_argument("--dir")
     s.add_argument("--effort", choices=EFFORTS); s.set_defaults(fn=cmd_wake)
     s = sub.add_parser("redir"); s.add_argument("old"); s.add_argument("new"); s.set_defaults(fn=cmd_redir)
+    s = sub.add_parser("rename"); s.add_argument("old"); s.add_argument("new"); s.set_defaults(fn=cmd_rename)
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)

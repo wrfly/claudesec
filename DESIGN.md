@@ -509,6 +509,7 @@ claudesec wake NAME [--model M] [--dir D] [<<< 新指令]     --resume 拉起，
                                                 redir 记过的搬家照着走；都不是就拒绝并提示 redir / --dir。
                                                 换了目录时对话跟着挪（Claude 的 transcript 按启动目录存，Cursor 的按目录 md5）
 claudesec redir OLD NEW                         目录搬了（仓库改名）：登记在 OLD 及其下的 worker 都改到 NEW，搬家记进注册表
+claudesec rename OLD NEW                        worker 改名，在跑的也不重启（见「worker 改名」一节）
 claudesec --restart                             重载秘书的 prompt 和 hook，对话保留，worker 不动
 claudesec adopt SESSION [--as NAME] [--wait]   SESSION = 会话名 / 后台 job id / session id 前缀（已退出的只能用 id）
 ```
@@ -813,6 +814,48 @@ SendMessage / `claudesec send` 告诉它，因为 worker 没有每轮注入的 h
 没用「PROGRESS 里写明在等用户就放行」：那要 Stop hook 去解析最近一条 PROGRESS 的文字，等用户这件事一轮轮持续，模式开关更直接。
 
 已验证：单测 tests/test_discuss_switch.py（切前拦、切后放行、off 后又拦；DONE 切回秘书；自己切不提示告诉自己）。
+
+### worker 改名（`claudesec rename OLD NEW`，2026-11-13）
+
+用户要把讨论中的 talk 改叫 claude-mod-audit。光改 tmux 窗口名不够：名字还在注册表、`workers/<名字>/`、`reports/<名字>.log`、
+定时任务的 target、决策队列和待办的 `[名字]` 标签里；Claude Code worker 的会话名就是 SendMessage 投递的地址。
+在跑的进程身上也带着旧名，不重启改不掉：hook 命令（`hook worker-stop OLD`）、`--settings` / `--append-system-prompt-file`
+指向 `workers/OLD/`、规则里的 `claudesec report OLD`、外部 agent 的 `CLAUDESEC_WORKER=OLD`。
+
+做法：
+- **会话名**：Claude Code（2.1.323 实测）的消息 socket（sessions/<pid>.json 的 messagingSocketPath，peers 投递 SendMessage 的那个）
+  收 `{"type":"control","action":"rename","name":NEW,"session_id":…}`，会话原地改名，跟 /rename 一样（sessions 文件里 name、
+  nameSource=peer、formerNames，状态栏，transcript 记 custom-title）。不往窗口里打 `/rename`：那会混进用户在输入框里打了一半的字，
+  忙的时候还要排到这一轮之后。实测：输入框里没发出的字（含中文）原样还在；空闲、忙、有后台 shell 时都立刻生效，不打断这一轮。
+  先发 peers 自己用的 auth 帧（token 在 sessions/<pid>.<hash>.key，Linux 上不强制）。会话改名失败就整个拒绝，别的都不动。
+  所以不用重启，也就不必因为它在忙、有后台任务而拒绝。
+- **在跑的进程**：旧名留作别名（注册表 `renamed: {OLD: NEW}`），`resolve()` 把它换成新名：`hook`、`report`、`discuss`、
+  `delegate`（委托人和 --name）、`wait`、外部 agent 的 `CLAUDESEC_WORKER`。所以不用告诉 worker 它改名了。
+  `workers/OLD/` 原地不动（进程的 settings、prompt、hook 里测的标记文件都按这个路径），`workers/NEW` 是指向它的软链；
+  进程没了（shelve、close，或 wake / 换模型重新 prepare_worker）时 `settle_rename` 去掉别名、把目录真搬成 `workers/NEW/`，
+  新进程的规则和 hook 都是新名。别名在的时候，OLD 这个名字不能再 spawn / adopt / 改给别人。连改两次（A→B→C）别名是 A→C；改回 A 别名就没了。
+  不在跑的 worker 直接搬目录，不留别名。
+- **注册表**：条目原位改键（状态表顺序不变），记 `renamed_from`；别的 worker 的 `delegated_by`、focus 跟着改。
+- **tmux 窗口**：`rename-window`（按窗口 id，位置不动），并把这个窗口的 automatic-rename、allow-rename 关掉。
+- **日志**：`reports/OLD.log` 改成 `NEW.log`。NEW 以前用过（有旧日志、旧目录）就像 spawn 复用名字一样挪到旁边加时间戳。
+- **定时任务**：未到点、target 是 OLD 的改成 NEW；已发的、正文里提到的不改。
+- **决策队列 / 待办**：只改未结分区（待问、待答、搁置、记录；待办）里打头是 `[OLD]` 的条目。已处理、已完成的不改：名字会复用，
+  旧条目里的 `[OLD]` 可能是早先另一个同名 worker 的。不改的话，巡检会把 `[OLD]` 当成「标的 worker 已关闭」。
+- **历史**：已归档的文件和 INDEX 行是当时的记录，不改。之后再 archive 还写进同一个文件（注册表的 archived 跟着走），
+  frontmatter 写 `worker: NEW` 和 `renamed_from`，INDEX 那一行换成新名字。
+- **残留**：它还按旧规则用 `/tmp/claude-OLD/`、容器 label `claudesec.worker=OLD`，所以 leftovers 把 renamed_from 里的旧名都算它的；
+  旧名不再单独当一个「不在跑的 worker」去报残留。
+- **外部 agent worker**（Codex、Cursor）：没有会话名这回事，注册表、窗口、目录、日志、别名照上面做，`CLAUDESEC_WORKER` 走别名。
+- **报错**：OLD 不存在（已经改过名的提示现在叫什么）、NEW 不合 NAME_RE、是秘书的名字、已有 worker 叫 NEW、NEW 是别人在跑的进程的旧名、
+  本机有别的活着的 Claude 会话叫 NEW（SendMessage 会分不清，Claude Code 也会给它改个带后缀的名）、Claude Code worker 窗口在
+  但找不到它的活会话（还在启动）。
+
+不改的：worker 的工作目录（默认 `work/OLD`，是进程的 cwd，搬了在跑的进程就断了）；stuck.json、runaway.json 这类告警去重记录
+（最多再报一次）；plugin 自己 config 里按名字列的 worker（如 rc 的 `rc_workers`）；进度收件箱、告警里已经写下的旧名。
+
+已验证：单测 tests/test_rename.py（在跑的 Claude worker：socket 帧、不发按键、注册表顺序、软链、日志、定时任务、标签只改未结的；
+旧名的 hook / report 落到新名；shelve 后目录真搬、旧名可用；wake 后规则和 hook 是新名；连改两次和改回；不在跑的直接搬；
+外部 agent；会话改名失败什么都不动；各种名字冲突；残留按旧名找；再 archive 的记录）。会话改名另用临时 Claude Code 会话手测过。
 
 ### 默认 agent 和模型（config `spawn_agent` / `spawn_model`，`review_agent` / `review_model`）
 

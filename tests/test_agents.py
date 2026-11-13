@@ -178,7 +178,10 @@ class Agents(unittest.TestCase):
         (self.home / "config.json").write_text(json.dumps({"delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"}))
         self.assertEqual(self.cs.delegate_agents()[0], "claude")
         (self.home / "config.json").write_text(json.dumps({"ttadk_worker_model": "deepseek-v4-pro-0813"}))
-        self.assertNotIn("ttadk", self.cs.delegate_agents())  # that runs Claude Code, which doesn't report by command
+        self.assertIn("ttadk", self.cs.delegate_agents())  # Claude Code, reporting by command when delegated
+        (self.home / "config.json").write_text(json.dumps({"delegate_agent": "ttadk",
+                                                           "delegate_model": "deepseek-v4.1-flash"}))
+        self.assertEqual(self.cs.delegate_agents(), ["ttadk", "codex", "cursor"])
 
     def test_session_start_records_the_id_and_hands_over_the_rules(self):
         self.workers(c={"status": "STARTING", "agent": "codex", "window": "@1", "dir": "/tmp", "task": "t"})
@@ -264,7 +267,7 @@ class Agents(unittest.TestCase):
         self.on(ttadk=True, codex=True, cursor=True)
         self.assertEqual(self.delegate(), ["ttadk"])
         self.assertEqual(self.delegate("--agent", "cursor"), ["cursor"])
-        self.assertEqual(self.delegate("--agent", "ttadk", "--model", "deepseek-v4-pro-0813"), [])  # Claude Code
+        self.assertEqual(self.delegate("--agent", "ttadk", "--model", "deepseek-v4-pro-0813"), ["ttadk"])  # Claude Code
         self.on(ttadk=False)
         self.assertEqual(self.delegate(), ["codex"])
 
@@ -311,6 +314,75 @@ class Agents(unittest.TestCase):
         self.cs.finish_later = finished.append
         self.hook(lambda: self.cs.hook_worker_stop("j"), {}, "j")
         self.assertEqual(finished, ["j"])
+
+    def test_delegate_ttadk_on_claude_code_reports_by_command(self):
+        # ttadk on a model that isn't Codex's (deepseek…) runs Claude Code, which `delegate` used to
+        # refuse. A delegated Claude Code worker reports with `claudesec report`, so it works like
+        # any other delegation: same rules, same stop-hook nag, `wait` reads the answer.
+        self.on(ttadk=True, codex=False, cursor=False)
+        (self.home / "config.json").write_text(json.dumps({
+            "language": "en", "delegate_agent": "ttadk", "delegate_model": "deepseek-v4.1-flash"}))
+        spawned = []
+        self.cs.cmd_spawn = lambda args: spawned.append((args.agent, args.model, args.for_worker))
+        self.workers(boss={"status": "PROGRESS", "dir": str(self.root), "task": "t"})
+        out, saved_argv, saved_stdin = io.StringIO(), sys.argv, sys.stdin
+        try:
+            sys.argv = ["claudesec", "delegate", "boss", "--name", "j", "--dir", str(self.root)]
+            sys.stdin = io.StringIO("count files")
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+        self.assertEqual(spawned, [("ttadk", "deepseek-v4.1-flash", "boss")])
+        self.cs.memory_settings = lambda cwd: {}
+        agent = self.cs.AGENTS["ttadk"].runtime("deepseek-v4.1-flash")
+        self.assertEqual(agent.runtime_name, "claude")
+        d = self.cs.prepare_worker("j", self.cs.config(), "task", str(self.root), agent=agent, delegated=True)
+        self.assertIn("report j <<'EOF'", (d / "prompt.md").read_text())
+        self.assertNotIn("SendMessage", (d / "prompt.md").read_text())
+        self.workers(boss={"status": "PROGRESS", "dir": str(self.root), "task": "t"},
+                     j={"status": "PROGRESS", "dir": str(self.root), "task": "t", "agent": "ttadk",
+                        "runtime": "claude", "model": "deepseek-v4.1-flash", "delegated_by": "boss",
+                        "window": "@9"})
+        # Its turn ends without a report: the stop hook asks for one by command, not SendMessage.
+        stop = json.loads(self.hook(lambda: self.cs.hook_worker_stop("j"), {}, "j"))
+        self.assertEqual(stop["decision"], "block")
+        self.assertIn("report j", stop["reason"])
+        buf, saved = io.StringIO(), sys.stdin
+        sys.stdin = io.StringIO("TYPE: DONE\nDID: counted\nRESULT: 42\nDECISIONS: none")
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.cs.cmd_report(self.cs.argparse.Namespace(name="j"))
+        finally:
+            sys.stdin = saved
+        self.assertIn("reported to boss", buf.getvalue())
+        self.assertTrue((d / "finish").exists())
+        finished = []
+        self.cs.finish_later = finished.append
+        self.hook(lambda: self.cs.hook_worker_stop("j"), {}, "j")
+        self.assertEqual(finished, ["j"])
+
+    def test_delegate_more_work_to_a_ttadk_claude_worker(self):
+        # The same worker, still running: the follow-up is pasted into its window, not spawned anew.
+        self.on(ttadk=True)
+        (self.home / "config.json").write_text(json.dumps({"language": "en"}))
+        self.workers(boss={"status": "PROGRESS", "dir": str(self.root), "task": "t"},
+                     j={"status": "DONE", "dir": str(self.root), "task": "t", "agent": "ttadk",
+                        "runtime": "claude", "model": "deepseek-v4.1-flash", "delegated_by": "boss",
+                        "window": "@9"})
+        self.cs.agent_running = lambda w: True
+        sent = []
+        self.cs.send_text = lambda name, w, text, by="secretary": sent.append((name, text, by))
+        out, saved_argv, saved_stdin = io.StringIO(), sys.argv, sys.stdin
+        try:
+            sys.argv = ["claudesec", "delegate", "boss", "--name", "j"]
+            sys.stdin = io.StringIO("again, please")
+            with contextlib.redirect_stdout(out):
+                self.cs.main()
+        finally:
+            sys.argv, sys.stdin = saved_argv, saved_stdin
+        self.assertEqual(sent, [("j", "again, please", "boss")])
+        self.assertIn("sent to", out.getvalue())
 
 
 if __name__ == "__main__":

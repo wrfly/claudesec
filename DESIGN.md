@@ -586,7 +586,7 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 
 下面按 Cursor 写的，别的外部 agent 和 `"claude"` 同样适用：delegate 没带 `--agent` 时开 config `delegate_agent`（默认
 `["ttadk", "codex", "cursor"]`，也可以写 `"claude"`）里第一个可用的，模型用 `--model` 或 `delegate_model`（没配就用该 agent 的默认模型）；秘书 `spawn --agent A`（A 列在 `delegate_agent` 里、没带 `--model`）同样用 `delegate_model`，所以 `delegate_agent: "claude"` 时 `spawn --agent claude` 开的是网关模型的 Claude Code worker，不带 `--agent` 的才是普通 worker。同名追加沿用原来那种
-（注册表里的，或归档 frontmatter 的 `agent` / `runtime` / tags）。`"claude"` 委托出去的 worker 用 `worker-external.md` 提示词、经 `claudesec report` 向委托人交差（误调 SendMessage 也会被 PreToolUse hook 拦下并记账转交委托人，不吵秘书）；`--agent ttadk` 加非 gpt 模型仍拒绝。
+（注册表里的，或归档 frontmatter 的 `agent` / `runtime` / tags）。`"claude"` 委托出去的 worker 用 `worker-external.md` 提示词、经 `claudesec report` 向委托人交差（误调 SendMessage 也会被 PreToolUse hook 拦下并记账转交委托人，不吵秘书）；`--agent ttadk` 加非 gpt 模型照样可以：那是 `ttadk claude` 跑的 Claude Code worker，同样走 `worker-external.md` 和 report 命令，`wait` 照常取结果（2026-11-13 用户规定除声明 opus5 外都用 ttadk claude + deepseek，委托的小活也包括）。
 
 用户定了「独立、小任务尽量派 cursor 做」。第一版让 worker 发 TYPE: DELEGATE 给秘书、秘书 spawn、Cursor 的汇报
 经秘书转回：一次委托的任务书和结果各过秘书上下文两遍（约 1–2 万 token），每一步还要秘书推理。现在全由脚本做：

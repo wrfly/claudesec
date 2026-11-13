@@ -2499,12 +2499,12 @@ def delegate_model(agent, cfg=None):
 
 def delegate_agents():
     """The agents `claudesec delegate` may start, best first: config delegate_agent (a name or a
-    list of them), then the external agents not listed, in the order they were loaded."""
-    cfg = config()
-    want = cfg.get("delegate_agent") or []
+    list of them), then the external agents not listed, in the order they were loaded. Any
+    runtime of them qualifies: a delegated Claude Code worker (plain, or ttadk's on a model that
+    isn't Codex's) reports with `claudesec report` like an external one."""
+    want = config().get("delegate_agent") or []
     want = [want] if isinstance(want, str) else list(want)
-    names = [n for n in want if n in AGENTS] + [n for n in AGENTS if n not in want and AGENTS[n].external]
-    return [n for n in names if n == "claude" or AGENTS[n].runtime(delegate_model(AGENTS[n], cfg)).external]
+    return [n for n in want if n in AGENTS] + [n for n in AGENTS if n not in want and AGENTS[n].external]
 
 
 def load_agents():
@@ -5944,11 +5944,9 @@ def cmd_delegate(args):
         agent = agent_named(picked)
         model = args.model or delegate_model(agent, config())
         agent = agent.runtime(model)
-        if not agent.external and agent.name != "claude":
-            sys.exit(f"NOT DELEGATED: --agent {picked} with model {model} runs Claude Code"
-                     ", which doesn't report by command. Use a subagent, or spawn a worker through the secretary.")
-    if not agent.external and agent.name != "claude":
-        sys.exit(f"{name} is taken and isn't a worker you delegated to; pick another --name")
+        if not agent.external and not isinstance(agent, ClaudeCode):
+            sys.exit(f"NOT DELEGATED: --agent {picked} with model {model} runs an agent that doesn't "
+                     "report by command. Use a subagent, or spawn a worker through the secretary.")
     label = agent.label
     ok, why = agent.available()
     if not ok:

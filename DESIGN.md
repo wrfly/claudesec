@@ -270,6 +270,11 @@ subagent；接着做同一个 worker 不算新增。停在提示符上的不算�
   pane 当作「从零恢复」顶掉。去掉之后，开机后跑 `claudesec`：秘书由 claudesec 拉起，worker 由 wake-all 恢复。
 - `claudesec` 发现 secretary 窗口里跑的不是 `claudesec run`（一个 shell，或者恢复出来的裸 `claude --resume`），就接管：
   用 `claudesec run` 重开这个 pane，对话照样 `--resume`。
+- 窗口顺序：秘书窗口永远是 claudesec session 的第一个（base-index 那一位）。tmux 的 new-window 占第一个空位，
+  秘书窗口重开（11-13 15:49 一次重启后）排到了第 11 位，在 worker 和用户自己开的窗口后面。现在每次秘书启动、
+  每次 client 接入或改尺寸（`dashboard layout` 那个 hook）、每次给 worker 开窗口，都 `move-window -b` 把它挪回第一位。
+  worker 被搁置（切模型、秘书退出时的 shelve-all）时记下前后邻居窗口（id 和名字，`window_place`），唤醒时插回
+  最近一个还在的邻居旁边；shelve-all 在关第一个窗口之前给所有 worker 一起记，否则后关的不知道先关的在哪。
 - 这些都是 claudesec 自己执行的代码，不是秘书的工具调用，所以不会被 auto mode 分类器拦，用户也不用做杂活。
 - 秘书不在时，worker 的 Stop hook 不再逼汇报；SendMessage 失败的汇报也照样记进 log 和 registry（PostToolUseFailure）。
 - `CLAUDE_CONFIG_DIR` 可能只在 claude 的启动脚本里设，tmux 起的 claudesec 进程看不到。hook 运行在 claude 之下，

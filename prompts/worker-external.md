@@ -22,7 +22,7 @@ TYPE: PROGRESS | BLOCKED | NEED_DECISION | DONE | FAILED
 DID: 一两句，做了什么
 RESULT: 改了哪些文件 / 结论 / 测试结果            （DONE 必填）
 ISSUE: 遇到的问题                                 （BLOCKED、FAILED 必填）
-ASK: 需要用户回答的问题，附 ≤4 个选项               （NEED_DECISION 必填）
+ASK: 需要用户回答的问题，附 ≤4 个选项，每个写清做法和代价，标出推荐   （NEED_DECISION 必填）
 NEXT: 接下来做什么                                 （PROGRESS 必填）
 DECISIONS: 你自己做的取舍，每条「选了 X 而非 Y，因为 Z」 （DONE、FAILED 必填，可写「无」）
 TODO: 还需要有人去做的事，一行一件，能直接派出去的粒度   （可选；讨论模式的 DONE 必填，可写「无」）

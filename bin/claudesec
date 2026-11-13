@@ -446,7 +446,14 @@ def cmd_start(args):
              f"run-shell -b {shlex.quote(hook_cmd() + ' dashboard layout')}", check=False)
     if args.detach:
         print(f"secretary is in tmux session '{sess}'")
-    elif os.environ.get("TMUX"):
+        return
+    # Land on the secretary, not on whatever window the session showed last: run from another
+    # window of this same session (2026-11-13, a shell the user opened beside the workers),
+    # switch-client to the session it is already in moved nothing, and `claudesec` looked dead.
+    # Not with -d: the secretary runs `--restart -d` itself, and this would pull the user's view.
+    tmux("select-window", "-t", pane, check=False)
+    tmux("select-pane", "-t", pane, check=False)
+    if os.environ.get("TMUX"):
         tmux("switch-client", "-t", f"={sess}")
     else:
         os.execvp("tmux", ["tmux", "attach-session", "-t", f"={sess}"])

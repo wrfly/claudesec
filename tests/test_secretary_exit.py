@@ -179,6 +179,57 @@ class Run(Base):
         self.assertNotIn("shelve-all", self.detached)
 
 
+class Resume(Run):
+    """11-15: secretary.session named a transcript of only a title and a name; `claude --resume` of it
+    said "No conversation found" and exited, and every `claudesec` closed its window within seconds."""
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.cs.claude_project(self.home)
+        self.project.mkdir(parents=True)
+
+    def transcript(self, sid, name=None, messages=True, mtime=None):
+        name = name or self.cs.config()["secretary_name"]
+        lines = [{"type": "custom-title", "customTitle": name, "sessionId": sid},
+                 {"type": "agent-name", "agentName": name, "sessionId": sid}]
+        if messages:
+            lines += [{"type": "user", "message": {"content": "hi"}}, {"type": "assistant", "message": {}}]
+        p = self.project / f"{sid}.jsonl"
+        p.write_text("".join(json.dumps(l, separators=(",", ":")) + "\n" for l in lines))
+        if mtime:
+            os.utime(p, (mtime, mtime))
+
+    def resumed(self):
+        Child, started = self.child()
+        self.run_secretary(Child)
+        argv = started[0]
+        return argv[argv.index("--resume") + 1] if "--resume" in argv else None
+
+    def test_a_session_with_a_conversation_is_resumed(self):
+        self.transcript("good")
+        (self.home / "secretary.session").write_text("good\n")
+        self.assertEqual(self.resumed(), "good")
+
+    def test_an_empty_session_falls_back_to_the_last_secretary_conversation(self):
+        self.transcript("old", mtime=1000)
+        self.transcript("real", mtime=2000)
+        self.transcript("worker", name="other", mtime=3000)
+        self.transcript("empty", messages=False, mtime=4000)
+        (self.home / "secretary.session").write_text("empty\n")
+        self.assertEqual(self.resumed(), "real")
+        self.assertEqual((self.home / "secretary.session").read_text().strip(), "real")
+
+    def test_no_conversation_anywhere_starts_fresh(self):
+        self.transcript("empty", messages=False)
+        (self.home / "secretary.session").write_text("empty\n")
+        self.assertIsNone(self.resumed())
+        self.assertFalse((self.home / "secretary.session").exists())
+
+    def test_no_session_recorded_starts_fresh(self):
+        self.transcript("real")
+        self.assertIsNone(self.resumed())
+
+
 class SecretaryPane(unittest.TestCase):
     """in_secretary_pane against a tmux server of its own."""
 

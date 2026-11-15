@@ -1732,9 +1732,20 @@ def cmd_run(args):
     if cfg["secretary_model"]:
         argv += ["--model", cfg["secretary_model"]]
     argv += plugin_args(cfg, SECRETARY_WHO)
-    session = HOME / "secretary.session"
-    if session.exists() and not args.new:
-        argv += ["--resume", session.read_text().strip()]
+    if not args.new:
+        sid, stale = secretary_resume_id(cfg["secretary_name"])
+        if stale:
+            note = (f"claudesec: secretary session {stale} has no conversation to resume; "
+                    + (f"resuming {sid}, the last secretary conversation." if sid else "starting a new secretary."))
+            print(note, file=sys.stderr)
+            with contextlib.suppress(OSError), open(HOME / "lifecycle.log", "a") as log:
+                log.write(f"{now()} {note}\n")
+            if sid:
+                (HOME / "secretary.session").write_text(sid + "\n")
+            else:
+                (HOME / "secretary.session").unlink(missing_ok=True)
+        if sid:
+            argv += ["--resume", sid]
     # Fixed cwd: the secretary is cross-project, and Claude Code's auto memory is keyed by cwd,
     # so a fixed cwd gives it one stable memory directory.
     os.chdir(HOME)
@@ -1768,7 +1779,8 @@ def cmd_run(args):
     if os.environ.get("TMUX_PANE") and any(callable(p.get("answer_dialog")) for p in PLUGINS):
         threading.Thread(target=answer_own_dialogs, args=(os.environ["TMUX_PANE"],), daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: child.terminate())
-    child.wait()
+    started = time.time()
+    code = child.wait()
     restarting = HOME / "restarting"
     try:
         deliberate = time.time() - float(restarting.read_text()) < 120
@@ -1777,6 +1789,69 @@ def cmd_run(args):
     restarting.unlink(missing_ok=True)
     if not deliberate:
         detach("shelve-all")
+        # A claude that fails at start takes its error with the window: keep it on screen.
+        if code and time.time() - started < QUICK_EXIT:
+            print(f"\nclaudesec: the secretary's claude exited with status {code} right after it started; "
+                  f"its error is above.", file=sys.stderr)
+            with contextlib.suppress(EOFError, OSError):
+                if sys.stdin.isatty():
+                    input("Enter closes this window. ")
+
+
+def has_conversation(sid):
+    """Whether sid's transcript holds a message. `claude --resume` of one that doesn't exits at once
+    ("No conversation found"): 11-14 01:55 a secretary start died before its first message, leaving a
+    transcript of only its title and name, and its id in secretary.session; every `claudesec` after
+    that opened a window that closed again within seconds."""
+    path = transcript(sid) if sid else None
+    if not path:
+        return False
+    with contextlib.suppress(OSError), open(path, "rb") as f:
+        for line in f:
+            if b'"type"' not in line:
+                continue
+            with contextlib.suppress(ValueError):
+                if json.loads(line).get("type") in ("user", "assistant"):
+                    return True
+    return False
+
+
+def named_in_transcript(path, name, size=4 << 20):
+    """Whether the transcript at path carries the session name `name` (its title or agent name),
+    looked for in its last and first `size` bytes: a long one is not read whole."""
+    keys = [f'"{k}":{json.dumps(name)}'.encode() for k in ("agentName", "customTitle")]
+    with contextlib.suppress(OSError), open(path, "rb") as f:
+        end = f.seek(0, os.SEEK_END)
+        f.seek(max(0, end - size))
+        tail = f.read()
+        f.seek(0)
+        head = f.read(min(size, max(0, end - size)))
+        return any(k in tail or k in head for k in keys)
+    return False
+
+
+def secretary_resume_id(name):
+    """(the session `claudesec run` resumes, the recorded one if that has no conversation).
+    secretary.session when it has one; otherwise the newest transcript in the secretary's directory
+    named `name` that has one; (None, …): nothing to resume, the secretary starts fresh."""
+    try:
+        recorded = (HOME / "secretary.session").read_text().strip() or None
+    except OSError:
+        recorded = None
+    if recorded is None or has_conversation(recorded):
+        return recorded, None
+    def mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0
+    for p in sorted(claude_project(HOME).glob("*.jsonl"), key=mtime, reverse=True):
+        if p.stem != recorded and named_in_transcript(p, name) and has_conversation(p.stem):
+            return p.stem, recorded
+    return None, recorded
+
+
+QUICK_EXIT = 30  # seconds: a secretary claude that fails sooner is shown, not closed with its window
 
 
 def detach(job):

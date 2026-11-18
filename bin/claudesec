@@ -6064,8 +6064,12 @@ def cmd_send(args):
 # BLOCKED, a dialog, a guard overridden. A task that looks like it goes beyond a small job is
 # refused back to the delegator, who either does it itself or says why it's fine (--ack).
 
+# MR / PR only as capitals standing alone: case-blind, \bMR\b took the user name in /home/mr/... for
+# a merge request and refused a read-only task. Chinese push only as 推送 / 推到远端 and the like;
+# a bare 推 is everyday wording (策略推给单元).
 DELEGATE_GUARD = [
-    (("push / merge",) * 2, r"\bgit\s+push\b|\bpush\b|\bmerge\b|合入|合并到|\bMR\b|\bPR\b"),
+    (("push / merge",) * 2, r"\bgit\s+push\b|\bpush\b|\bmerge\b|合入|合并到|(?<![\w/.-])(?-i:MR|PR)(?![\w/.-])"
+                            r"|推送|推到\s*(远端|远程|上游|origin|github|gitlab|仓库|主干|main|master)|推上去"),
     (("部署 / 发版", "deploy / release"), r"部署|发版|上线|发布|\bdeploy|\brelease\b|\brollout\b|回滚|\brollback\b"),
     (("凭据", "credentials"), r"凭据|凭证|密码|私钥|\bcredential|\bpassword|\bsecret|\btoken|\bAK\b|\bSK\b|access[ _-]?key"
            r"|\.ssh\b|\.pem\b|\bcookie"),

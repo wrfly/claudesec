@@ -1084,6 +1084,8 @@ def status_blocks(cols, now=None):
             more.append([("", "  "), (DIM, tr(f"模型 {model}", f"model {model}"))])
         if use is not None:
             more += [[("", "  ")] + line for line in wrap([(DIM, usage_detail(use))], cols - 2)]
+        if active[name].get("window") in alive:  # a click anywhere below the title goes there
+            more.append([("", "  "), (DIM, tr("→ 点这里去它的窗口", "→ click to open its window"))])
         blocks.append((("s", name), [head], [head] + more))
     if not rows:
         blocks.append(fixed([(DIM, tr("没有在跑的 worker。", "No workers running."))]))
@@ -1122,6 +1124,45 @@ def unfold(blocks, opened):
         body += lines
         keys += [key] * len(lines)
     return body, keys
+
+
+def block_starts(blocks, opened):
+    """The body line each block's title line is: a click there folds or unfolds the block, and a
+    click below it (an unfolded one's content) goes somewhere."""
+    starts, at = {}, 0
+    for key, folded, full in blocks:
+        if key is not None:
+            starts[key] = at
+        at += len(full if key in opened else folded)
+    return starts
+
+
+def jump_window(key):
+    """The window a click on an unfolded progress item's content goes to: its worker's, while
+    that one is open. None for other panes' items, and for a worker whose window is gone."""
+    if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "s"):
+        return None
+    window = (read_registry()[1].get(key[1]) or {}).get("window")
+    return window if window in alive_windows() else None
+
+
+def click_action(row, rowmap, keys, blocks, opened):
+    """What a click on shown row asks for: ("all", None) on the title bar (every item folds or
+    unfolds), ("jump", window) on a line of an unfolded item's content (the user 2026-11-18:
+    the title opens a worker, its content goes to the worker's window), ("fold", key) on a
+    title line, None where there is nothing to click."""
+    if row == 0:
+        return "all", None
+    if row >= len(rowmap) or rowmap[row] is None:
+        return None
+    key, at = keys[rowmap[row]], rowmap[row]
+    if not key:
+        return None
+    if at > block_starts(blocks, opened).get(key, at):
+        window = jump_window(key)
+        if window:
+            return "jump", window
+    return "fold", key
 
 
 def dash_view(title, body, rows, top, footer=()):
@@ -1178,8 +1219,8 @@ def dash_input(data, page):
 
 def show_dashboard(what):
     """The loop in a dashboard pane: redraw when the content or the pane size changes, scroll
-    on the wheel and keys, fold and unfold on clicks; leave when the secretary's pane is gone,
-    which closes the window with it."""
+    on the wheel and keys, fold and unfold on clicks, go to a worker's window when its unfolded
+    content is clicked; leave when the secretary's pane is gone, which closes the window with it."""
     me = os.environ.get("TMUX_PANE", "")
     fd = sys.stdin.fileno()
     saved = None
@@ -1238,10 +1279,15 @@ def show_dashboard(what):
             top += scroll
             every = {key for key, _, _ in content[2] if key}
             for row in clicks:
-                if row == 0:
+                action = click_action(row, rowmap, keys, content[2], opened)
+                if action is None:
+                    continue
+                if action[0] == "all":
                     everything = not everything
-                elif row < len(rowmap) and rowmap[row] is not None and keys[rowmap[row]]:
-                    opened ^= {keys[rowmap[row]]}
+                elif action[0] == "jump":
+                    tmux("select-window", "-t", action[1], check=False)
+                else:
+                    opened ^= {action[1]}
             if everything:
                 opened = set() if every <= opened else every
             if clicks and sec and me:  # a click selects this pane; typing should go on to the secretary

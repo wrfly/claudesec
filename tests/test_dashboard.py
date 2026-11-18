@@ -412,6 +412,43 @@ class Dashboard(unittest.TestCase):
         self.assertLess(di(b"g")[0], -1000)
         self.assertGreater(di(b"\x1b[F")[0], 1000)
 
+    def test_a_click_on_a_workers_title_opens_it_and_on_its_content_goes_there(self):
+        # (the user, 2026-11-18): the title unfolds a worker, its content goes to its window
+        now = dt.datetime.now().astimezone().isoformat()
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "busy": {"status": "PROGRESS", "task": "t", "last_summary": "working", "window": "@2",
+                     "last_report_at": now},
+            "gone": {"status": "DONE", "task": "t", "last_summary": "bye", "window": "@9",
+                     "last_report_at": now}}}))
+        title, blocks, footer = self.cs.status_blocks(60)
+        busy, gone = ("s", "busy"), ("s", "gone")
+        opened = {busy, gone}
+        body, keys = self.cs.unfold(blocks, opened)
+        lines, _, rowmap = self.cs.dash_view(title, body, 40, 0, footer)
+        starts = self.cs.block_starts(blocks, opened)
+        click = lambda line: self.cs.click_action(
+            next(r for r, b in enumerate(rowmap) if b == line), rowmap, keys, blocks, opened)
+        self.assertEqual(click(starts[busy]), ("fold", busy))
+        self.assertEqual(click(starts[busy] + 1), ("jump", "@2"))
+        self.assertEqual(click(starts[gone]), ("fold", gone))
+        self.assertEqual(click(starts[gone] + 1), ("fold", gone))  # its window is gone
+        self.assertEqual(self.cs.click_action(0, rowmap, keys, blocks, opened), ("all", None))
+        short, _, shortmap = self.cs.dash_view(title, body, 5, 0, footer)
+        self.assertIn(self.cs.tr("↓ 还有", "↓ "), plain(short[-1]))
+        self.assertIsNone(self.cs.click_action(len(short) - 1, shortmap, keys, blocks, opened))
+        # only the workers pane goes anywhere: a queue item's content still just folds
+        self.assertIsNone(self.cs.jump_window(("q", 12, "web", "提交开 PR？")))
+
+    def test_an_unfolded_worker_says_its_content_goes_to_its_window(self):
+        (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
+            "busy": {"status": "PROGRESS", "task": "t", "last_summary": "s", "window": "@2"},
+            "gone": {"status": "DONE", "task": "t", "last_summary": "s", "window": "@9"}}}))
+        blocks = self.cs.status_blocks(60)[1]
+        body = [plain(l) for l in self.cs.unfold(blocks, {("s", "busy"), ("s", "gone")})[0]]
+        hint = self.cs.tr("→ 点这里去它的窗口", "→ click to open its window")
+        self.assertEqual(len([l for l in body if "→" in l]), 1)  # the one whose window is open
+        self.assertIn(hint, body[2])
+
 
 class SidePanes(unittest.TestCase):
     """The column from the top: to-dos, decisions, progress, scheduled tasks; today's spend on

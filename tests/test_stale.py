@@ -28,8 +28,8 @@ QUEUE = """# 决策队列
 ## 待问（按优先级）
 
 - #1 [gone] 它关掉之前问的（中）
-- #2 [live] 等 !12 合了再说（中）
-- #3 [live] !12 和 !13 一起看（中）
+- #2 [live] 等 svc !12 合了再说（中）
+- #3 [live] svc !12 和 svc !13 一起看（中）
 - #5 [live] 很久以前的问题（低）
 
 ## 待答
@@ -49,18 +49,12 @@ class Stale(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.cs = load(self.home)
         (self.home / "config.json").write_text(json.dumps({"language": "zh"}))
-        # a workspace with one repository in it, where MR !12 has been merged
+        # a workspace with two repositories in it, svc and svc-proxy: svc has MRs !12 and !3
+        # merged, svc-proxy none (its !3 is still open)
         work = self.home / "work"
-        repo = work / "svc"
-        repo.mkdir(parents=True)
-        git(repo, "init", "-q", "-b", "main")
-        git(repo, "commit", "-q", "--allow-empty", "-m", "start")
-        git(repo, "checkout", "-q", "-b", "feat")
-        git(repo, "commit", "-q", "--allow-empty", "-m", "feat")
-        git(repo, "checkout", "-q", "main")
-        git(repo, "merge", "-q", "--no-ff", "feat", "-m", "Merge 'feat' into 'main'\n\nSee merge request: !12")
-        git(repo, "remote", "add", "origin", "git@example.com:team/svc.git")
-        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        work.mkdir()
+        self.make_repo(work, "svc", merged=(12, 3))
+        self.make_repo(work, "svc-proxy")
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
             "live": {"status": "PROGRESS", "task": "t", "dir": str(work), "window": "@1"}}}))
         hist = self.home / "history" / "2026-10"
@@ -72,6 +66,22 @@ class Stale(unittest.TestCase):
         old = (dt.date.today() - dt.timedelta(days=9)).isoformat()
         (self.home / "queue-meta.json").write_text(json.dumps({"5": {"added": old}, "4": {"added": "2020-01-01"}}))
         (self.home / "notices.md").write_text("# 待办事项\n\n## 待办\n\n- #6 [gone] 去它窗口说 push\n\n## 已完成\n")
+
+    def make_repo(self, work, name, merged=()):
+        """A checkout of team/<name> under work, with an MR !N merged for each N in merged."""
+        repo = work / name
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "commit", "-q", "--allow-empty", "-m", "start")
+        for n in merged:
+            git(repo, "checkout", "-q", "-b", f"feat{n}")
+            git(repo, "commit", "-q", "--allow-empty", "-m", f"feat{n}")
+            git(repo, "checkout", "-q", "main")
+            git(repo, "merge", "-q", "--no-ff", f"feat{n}", "-m",
+                f"Merge 'feat{n}' into 'main'\n\nSee merge request: !{n}")
+        git(repo, "remote", "add", "origin", f"git@example.com:team/{name}.git")
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return repo
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -117,6 +127,29 @@ class Stale(unittest.TestCase):
         (self.home / "notices.md").write_text("# 待办事项\n\n## 待办\n\n## 已完成\n")
         self.cs.check_stale()
         self.assertNotIn("notice:6", json.loads((self.home / "stale.json").read_text()))
+
+    def test_an_mr_is_looked_up_in_the_repository_the_item_names(self):
+        # 2026-11-18: "alert-atlas-proxy MR !3" was reported merged because alert-atlas's !3 was
+        (self.home / "queue.md").write_text("""# 决策队列
+
+## 待问（按优先级）
+
+- #8 [live] 等 svc-proxy MR !3 合了再说（低）
+- #9 [live] 等 svc MR !3 合了再说（低）
+- #10 [live] 等 svc !12 和 !13 一起看（低）
+- #11 [live] 等 wallet_recharge/svc!12 合了再说（低）
+- #12 [live] 等 svc-proxy 的 MR !3 合了再说（低）
+- #13 [live] 等 elsewhere MR !3 合了再说（低）
+- #14 [live] 等 !12 合了再说（低）
+
+## 待答
+
+## 已处理
+""")
+        self.assertEqual(self.found(), {("queue", 9): ["merged:3"], ("queue", 11): ["merged:12"],
+                                        ("notice", 6): ["closed"]})
+        # #8 #12: svc-proxy's !3 is open; #10 #14: a number with no repository named (or one of
+        # them without one) can't be told apart from another repository's; #13: not a checkout here
 
     def test_stale_days_zero_turns_the_age_off(self):
         (self.home / "config.json").write_text(json.dumps({"language": "zh", "stale_days": 0}))

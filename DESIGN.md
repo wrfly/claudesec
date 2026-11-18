@@ -730,8 +730,10 @@ status 列出未到点的提醒。
     同名归档过几次的取最近一次。标签只是出处、条目本身跟 worker 死活无关的（「可选：去看一眼 X 页面」），机械上分不出，照样提一次。
   - `merged:N,…`：条目里写的 `!N` 全部已合。在标的 worker 的目录及其下一层的 git 仓库里找远端分支上的 merge commit
     「See merge request: !N」（Codebase 和 GitLab 都这么写），按仓库存储去重（共享一个仓库的 worktree 只读一次）。
-    只看上次 fetch 到的，不 fetch：拿不到的结果是漏报，不会误报成已合。!N 是各仓库各自的编号，所以提示里写出在哪个仓库合的，
-    让秘书判断是不是同一个。只合了一部分的不提。
+    只看上次 fetch 到的，不 fetch：拿不到的结果是漏报，不会误报成已合。!N 是各仓库各自的编号，所以按条目写在 `!N`
+    旁边的仓库名（`alert-atlas-proxy MR !3`、`wallet_recharge/alert-atlas-proxy!3`、`alert-atlas-proxy 的 MR !3`）
+    只在该仓库里查，提示里写出在哪个仓库合的；没写仓库名、或者写了好几个分不清的，不下已合的结论（11-18：
+    alert-atlas-proxy 的 !3 因为 alert-atlas 的 !3 已合被连报两次）。只合了一部分的不提。
   - `age:k`：放了 ≥ `stale_days`（默认 7）天，k = 天数 // stale_days，所以每多 7 天再提一次。待答从「已问」那天算，
     其余从加入那天算（`queue-meta.json`；`notice add` 现在也记）。没有日期的不按天数提。
 - 什么时候看：提醒检查器每 5 分钟一次；worker 报 DONE、`claudesec close` 时写 `stale-due`，检查器下一轮（≤15 秒）就看。

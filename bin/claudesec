@@ -5558,6 +5558,25 @@ def cmd_discuss(args):
 
 STALE_CHECK_SECS = 300
 MERGED = re.compile(r"See merge request:?\s*\S*?!(\d+)\b")
+# An MR an item names, and the repository written next to it ("alert-atlas-proxy MR !3",
+# "wallet_recharge/alert-atlas-proxy!3"). Numbers are only looked up with one: two repositories
+# may both have an !3, and checking by the number alone took one's merged !3 for the other's
+# (the user, 2026-11-18: alert-atlas-proxy !3 was reported merged because alert-atlas's was).
+MR_IN_ITEM = re.compile(r"(?<![A-Za-z0-9_!])[!！](\d+)\b")
+MR_WITH_REPO = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)*)"
+                          r"\s*(?:的\s*)?(?:(?:MR|PR)\s*)?[!！](\d+)\b", re.IGNORECASE)
+NOT_A_REPO = {"mr", "pr", "merge", "request", "see"}
+
+
+def mrs_in(text):
+    """{MR number: repository} for the MRs an item names together with a repository. A number
+    written without one, or with two, is left out: what it belongs to can't be told."""
+    seen = {}
+    for path, n in MR_WITH_REPO.findall(text):
+        repo = path.rsplit("/", 1)[-1]
+        if repo.lower() not in NOT_A_REPO:
+            seen.setdefault(int(n), set()).add(repo)
+    return {n: next(iter(repos)) for n, repos in seen.items() if len(repos) == 1}
 
 
 def worker_places():
@@ -5595,9 +5614,9 @@ def git_store(checkout):
 
 
 def merged_mrs(directory, cache):
-    """{MR number: repository} merged in the git checkouts at or just under directory, by the
-    merge commits on origin's branches ("See merge request: !N"). By what was last fetched:
-    nothing is fetched here. Several repositories may have an !N; the first found is named."""
+    """{MR number: {repositories}} merged in the git checkouts at or just under directory, by
+    the merge commits on origin's branches ("See merge request: !N"). By what was last fetched:
+    nothing is fetched here. Several repositories may have an !N; each is kept under its own."""
     if directory in cache:
         return cache[directory]
     found, root = {}, Path(directory)
@@ -5612,7 +5631,7 @@ def merged_mrs(directory, cache):
             name = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
             cache[store] = {int(m[1]): name for m in MERGED.finditer(log)}
         for n, name in cache[store].items():
-            found.setdefault(n, name)
+            found.setdefault(n, set()).add(name)
     cache[directory] = found
     return found
 
@@ -5648,11 +5667,12 @@ def stale_items():
         if closed and not added_after(meta.get(str(n), {}), closed):
             reasons.append(("closed", tr(f"标的 worker {tag} 已关闭（{closed[:10]} 归档）",
                                          f"the worker it names, {tag}, is closed (archived {closed[:10]})")))
-        mrs = sorted({int(m) for m in re.findall(r"(?<![\w!])!(\d+)\b", text)})
-        if mrs and place:
+        named = mrs_in(text)
+        mrs = sorted({int(m) for m in MR_IN_ITEM.findall(text)} | set(named))
+        if mrs and place and all(m in named for m in mrs):
             merged = merged_mrs(place, cache)
-            if all(m in merged for m in mrs):
-                repos = sorted({merged[m] for m in mrs})
+            if all(named[m] in merged.get(m, ()) for m in mrs):
+                repos = sorted({named[m] for m in mrs})
                 reasons.append((f"merged:{','.join(map(str, mrs))}",
                                 tr(f"提到的 {'、'.join(f'!{m}' for m in mrs)} 都已合入（{'、'.join(repos)}）",
                                    f"{', '.join(f'!{m}' for m in mrs)}, all it names, are merged ({', '.join(repos)})")))

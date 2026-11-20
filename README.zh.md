@@ -36,6 +36,7 @@
 | `delegate_agent` | `["ttadk", "codex", "cursor"]` | worker 的 `claudesec delegate` 没带 `--agent` 时开哪种：这台机器上可用的第一个（写一个名字也行；写 `"claude"`，或者 ttadk 配上不是 Codex 的模型，则开用命令向委托人汇报的 Claude Code worker） |
 | `delegate_model` | `null` | `claudesec delegate`，以及 `claudesec spawn --agent A`（`A` 列在 `delegate_agent` 里）没带 `--model` 时的默认模型；`null` 用所选 agent 自己的默认模型（比如配 `"delegate_agent": "claude", "delegate_model": "gpt-5.6-sol"` 让委托的小活用 Claude Code 跑网关上的其他模型；配 `"ttadk"` / `"deepseek-v4.1-flash"` 则经 ttadk 跑 Claude Code） |
 | `stale_days` | `7` | 巡检把放了这么多天的待问、待答、待办挑出来提示秘书（每再过这么多天再提一次）；`0` 不按天数查 |
+| `review_every_days` | `3` | 距上次 `claudesec review` 满这么多天后，用户当天第一次发消息时提示秘书复盘；`1` 每个上班日一次；`0` 不提示 |
 | `idle_ask_minutes` | `[5, 15, 30]` | 秘书闲置这么多分钟、还有待问 / 待答 / 待办时叫醒它去问用户；每次多等到下一个数，用完就不叫，用户一说话重新算；`[]` 关掉 |
 | `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | 没设额度的 worker 花得太多时告警：超过预算窗口上限的这个比例，或者上次汇报超过 M 分钟后又花了超过 $N |
 | `cursor_max_running` | CPU 核数的一半 | 同时在干活的本地 Cursor worker 最多几个（停在提示符上空闲的不算；不配：本机核数的一半，至少 1；配了数字就按数字；`0` 不限）；超了 `spawn --agent cursor`、`wake`、`delegate` 会拒绝并说明是谁在跑。`0` 不限 |
@@ -109,7 +110,7 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
 - 秘书开窗口时会给一行收据，不对就说不要
 - 它转错了，说「不是给 A 的，是给 B」
 - 它一次只问你一件事；没空答的它会攒着
-- 你每个上班日第一次找它时，它复盘一次（`claudesec review`）：整理它的记忆，把攒下的教训提成宪法 diff，作为一件事问你，你点头或摇头；想马上复盘就说「复盘」
+- 距上次复盘满三天后，你当天第一次找它时，它复盘一次（`claudesec review`）：整理它的记忆，把攒下的教训提成宪法 diff，作为一件事问你，你点头或摇头；想马上复盘就说「复盘」
 
 退出秘书（`/exit`，或者直接关窗口）时，claudesec 会自动收起所有 worker，不留进程；下次 `claudesec` 会把它们恢复回来，
 历史都在。重启电脑后也是跑一次 `claudesec`。想暂时不管某件事，跟秘书说「先放一边」，它会搁置起来；「接着弄 X」再唤醒。

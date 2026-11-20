@@ -144,6 +144,8 @@ DEFAULT_CONFIG = {
     "runaway_usd": 20,
     "runaway_quiet_minutes": 60,
     "stale_days": 7,                  # an open queue item or to-do this old is pointed out to the secretary
+    "review_every_days": 3,           # the user's first message of a day this long after the last review
+                                      # starts one (`claudesec review`); 1: every day the user shows up; 0: never
     "idle_ask_minutes": [5, 15, 30],  # the secretary idle this long with something for the user: woken to ask;
                                       # each next wait is the next number, until the user speaks. []: never
     "cursor_max_running": None,       # local Cursor workers at work at once; spawn / wake / delegate past it
@@ -5848,8 +5850,9 @@ def cmd_review(args):
     cfg = config()
     cmd_spawn(argparse.Namespace(name=name, dir=str(REPO), model=cfg.get("review_model"), discuss=False,
                                  agent=cfg.get("review_agent"),
-                                 for_worker=None, task=brief, intro=tr("claudesec 每日例行派给你的任务：\n\n", "claudesec's daily routine task for you:\n\n"),
+                                 for_worker=None, task=brief, intro=tr("claudesec 例行派给你的复盘任务：\n\n", "claudesec's routine review task for you:\n\n"),
                                  memory=str(memory)))
+    (HOME / REVIEW_LAST).write_text(date + "\n")  # the next one is due review_every_days from here
 
 
 # ---------- hooks ----------
@@ -6640,8 +6643,34 @@ def hook_secretary_prompt():
                                                  "additionalContext": "\n\n".join(context)}}, ensure_ascii=False))
 
 
+REVIEW_LAST = "review-last.date"
+
+
+def last_review():
+    """The date of the last `claudesec review`, or None: from review-last.date, else from the
+    backups it leaves in reviews/ (<date>-memory-before) from before that file was kept."""
+    with contextlib.suppress(OSError, ValueError):
+        return dt.date.fromisoformat((HOME / REVIEW_LAST).read_text().strip())
+    dates = []
+    with contextlib.suppress(OSError):
+        for p in (HOME / "reviews").iterdir():
+            with contextlib.suppress(ValueError):
+                dates.append(dt.date.fromisoformat(p.name[:10]))
+    return max(dates, default=None)
+
+
+def review_due(today=None):
+    """A review is due: review_every_days or more since the last one (the user, 2026-11-21:
+    「复盘三天一次, 不要一天一次」). Counted from the last review, a manual one too, not from a clock."""
+    every = config().get("review_every_days", 3)
+    if not every:
+        return False
+    last = last_review()
+    return last is None or ((today or dt.date.today()) - last).days >= every
+
+
 def first_sight_today():
-    """The day's review and sweep when this is the user's first message today, else None."""
+    """On the user's first message today: the review when one is due, and the sweep; else None."""
     today = dt.date.today().isoformat()
     seen = HOME / "user-seen.date"
     try:
@@ -6651,20 +6680,23 @@ def first_sight_today():
     if last == today:
         return None
     seen.write_text(today + "\n")
-    context = tr(f"[claudesec] 今天第一次见用户（上次 {last or '没有记录'}）：先跑 `claudesec review` 开今天的复盘 worker，"
-                 "收据一行，再回应用户这条消息。",
-                 f"[claudesec] This is the first time you see the user today (last time: {last or 'no record'}): first "
-                 "run `claudesec review` to start today's review worker, give a one-line receipt, then answer the "
-                 "user's message.")
+    context = ""
+    if review_due():
+        prev = last_review()
+        context = tr(f"[claudesec] 今天第一次见用户，距上次复盘（{prev or '没有记录'}）已满 {config().get('review_every_days', 3)} 天："
+                     "先跑 `claudesec review` 开今天的复盘 worker，收据一行，再回应用户这条消息。",
+                     f"[claudesec] First time you see the user today, and the last review ({prev or 'no record'}) "
+                     f"was {config().get('review_every_days', 3)} or more days ago: first run `claudesec review` to start "
+                     "today's review worker, give a one-line receipt, then answer the user's message.")
     found = []
     with contextlib.suppress(Exception):  # a broken queue.md mustn't hold up the user's message
         found = stale_items()
         mark_stale(found)
     if found:  # all of them, not only the new: the start of the day is when to tidy up
-        context += "\n\n" + "\n".join([tr("[巡检] 决策队列和待办事项里可能过期的条目，回应用户之前先清一遍：",
+        context += ("\n\n" if context else "") + "\n".join([tr("[巡检] 决策队列和待办事项里可能过期的条目，回应用户之前先清一遍：",
                                             "[sweep] Queue items and to-dos that may be out of date; clear them before "
                                             "answering the user:"), *stale_lines(found), tr(STALE_ADVICE, STALE_ADVICE_EN)])
-    return context
+    return context or None
 
 
 def done_heading(text):

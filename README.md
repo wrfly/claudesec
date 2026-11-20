@@ -42,6 +42,7 @@ Written with defaults on the first run; fields you leave out keep their defaults
 | `spawn_agent` / `spawn_model` | `null` / `null` | What `claudesec spawn` starts without `--agent`: `null` is Claude Code on `worker_model`. E.g. `"ttadk"` / `"deepseek-v4.1-flash"`. A `--model` of Claude's (the gateway's, or ending in `[1m]`) still runs plain Claude Code; `spawn_model` `null` uses the agent's own default |
 | `review_agent` / `review_model` | `null` / `null` | What `claudesec review` starts; `null` is as `spawn` without `--agent` |
 | `stale_days` | `7` | The sweep points out open queue items and to-dos this many days old (again every as many days); `0` turns the age check off |
+| `review_every_days` | `3` | The user's first message of a day this many days after the last `claudesec review` prompts the secretary to run one; `1`: every day the user shows up; `0`: never |
 | `idle_ask_minutes` | `[5, 15, 30]` | The secretary idle this many minutes with queue items or to-dos for the user is woken to ask one; each further nudge waits for the next number, none after the last until the user speaks; `[]` turns it off |
 | `runaway_pool_share` / `runaway_usd` / `runaway_quiet_minutes` | `0.3` / `20` / `60` | Alerts about a worker with no budget of its own: over this share of the budget window's cap, or over $N since a report more than M minutes ago |
 | `cursor_max_running` | half the CPU cores | At most this many local Cursor workers at work at once (one idling at its prompt doesn't count; unset: half this machine's cores, at least 1; a number: that; `0`: no limit); `spawn --agent cursor`, `wake` and `delegate` past it refuse and say who is busy. `0`: no limit |
@@ -135,7 +136,7 @@ What you occasionally do:
 - When the secretary starts a worker it gives a one-line receipt; say no if it's wrong.
 - If it forwarded something to the wrong worker, say "that wasn't for A, it was for B".
 - It asks one thing at a time; what you have no time for, it keeps for later.
-- The first time you talk to it on a working day, it runs a review (`claudesec review`): it tidies its memory,
+- The first time you talk to it on a day three or more days after its last review, it runs one (`claudesec review`): it tidies its memory,
   turns the lessons it collected into a constitution diff, and asks you about it as one decision, yes or no.
   Say "review" to have one right away.
 

@@ -396,7 +396,7 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 | 层 | 内容 | 机制 | 审批 |
 |---|---|---|---|
 | **经验** | 事实、偏好、别名（「用户说 perf 指性能那个 worker」） | Claude Code 自带 memory：纠错即写一条 feedback memory，下次会话自动加载 | 不需要 |
-| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.claudesec/lessons.md` 攒教训，不自己改宪法；每天一次（周期提醒到点，或用户说「复盘」）跑 `claudesec review`，开一个当天的复盘 worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
+| **宪法** | `secretary.md` 的规则 | 秘书在 `~/.claudesec/lessons.md` 攒教训，不自己改宪法；三天一次（hook 在满三天后用户第一次发消息时提示，或用户说「复盘」）跑 `claudesec review`，开一个当天的复盘 worker 归类、提 diff（同时提出删什么）；用户点头后落盘，下次启动生效。对谁都适用的约定进宪法跟着 repo 走，机器/项目专属的留在 memory | 用户看 diff |
 | **铁律** | 2.5 节四条 | 永不自改 | — |
 
 为什么宪法层要门槛和审批：
@@ -405,10 +405,13 @@ subagent 完成的任务没有第三层，所以 subagent 的返回值要秘书�
 - 没有回归测试：改坏了自己没人发现
 
 `lessons.md` 格式：日期 · 信号类型 · 当时情况一句话 · 用户纠正原话。
-每日复盘（`claudesec review`，任务书在 prompts/review.md）：
-- 触发：用户当天第一次给秘书发消息时。秘书的 UserPromptSubmit hook 把日期记在 `~/.claudesec/user-seen.date`，
-  日期变了就给这一条注入「今天第一次见用户：先跑 claudesec review」。跟着用户出现走，不跟时钟：
-  周末、请假没人发消息就不复盘，隔几天回来也只跑一次（用户定的，原先的每日 08:30 定时提醒因此撤掉）。
+复盘（`claudesec review`，任务书在 prompts/review.md）：
+- 触发：距上次复盘满 `review_every_days`（默认 3）天后，用户当天第一次给秘书发消息时。秘书的 UserPromptSubmit hook
+  把日期记在 `~/.claudesec/user-seen.date`，日期变了、而且 `~/.claudesec/review-last.date`（`claudesec review` 派出 worker 后写，
+  没有这个文件时看 reviews/ 里最新的 `<日期>-…` 备份）离今天满三天，才注入「今天第一次见用户，距上次复盘已满 3 天：先跑 claudesec review」。
+  用户 2026-11-21：「复盘三天一次, 不要一天一次.」原来是每个上班日一次。跟着用户出现走，不跟时钟：
+  没人发消息就不复盘，隔很多天回来也只跑一次（原先的每日 08:30 定时提醒因此撤掉）。手动 `claudesec review` 也算一次，从它起数。
+  当天第一条消息附上的巡检（过期条目）仍然每天都有，不跟复盘的周期走。
   跨会话消息、后台任务通知、claudesec 告警不算用户的消息。用户说「复盘」时随时跑。
 - 每天开一个新 worker（`review-MMDD`，在 claudesec 仓库目录），不 wake 长期的 `claudesec` worker：
   复盘用不到昨天的上下文，长期 worker 会把每天的复盘都背在上下文里。
@@ -495,7 +498,7 @@ claudesec delegate ME --name N [--dir D] [--agent A] [--ack 理由] <<< 任务�
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
 claudesec report NAME <<< 汇报       外部 agent worker 给秘书的汇报
 claudesec remind WHEN TARGET 内容 [--every 1d]   定时任务，到点叫醒秘书；--list [--all]、--cancel ID
-claudesec review [--print]       开当天的复盘 worker（整理秘书记忆、提提示词 diff）
+claudesec review [--print]       开当天的复盘 worker（三天一次）（整理秘书记忆、提提示词 diff）
 claudesec send NAME <<< 原话         秘书给外部 agent worker 说话（粘贴进它的窗口）
 claudesec status | log NAME [-n N] | interrupt NAME
 claudesec close NAME [--kill-leftovers | --force]   有残留（见「残留」一节）就拒绝；--kill-leftovers 停掉确定的，--force 留着只关

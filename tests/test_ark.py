@@ -92,6 +92,15 @@ class Translate(unittest.TestCase):
             "name": "get_weather", "description": "w", "parameters": {"type": "object"}}}])
         self.assertEqual(out["tool_choice"], "required")
 
+    def test_thinking_passes_through(self):
+        """ARK reasons by default; the client asks for thinking off ahead of a 64-token budget."""
+        base = {"model": "x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for kind, want in (("disabled", {"type": "disabled"}),
+                           ("adaptive", {"type": "enabled"}), ("enabled", {"type": "enabled"})):
+            self.assertEqual(self.m.translate_request({**base, "thinking": {"type": kind}}, "ep-1")["thinking"],
+                             want, kind)
+        self.assertNotIn("thinking", self.m.translate_request(base, "ep-1"))
+
     def test_tool_choice_tool_and_stop_reasons(self):
         m = self.m
         self.assertEqual(m.tool_choice({"type": "tool", "name": "Bash"}),

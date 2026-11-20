@@ -1,8 +1,9 @@
 # agents/: the agents a worker can run
 
 Claude Code is built into `bin/claudesec` (class `ClaudeCode`). Every other agent is one file here,
-an adapter: `cursor.py` (Cursor's `agent` CLI), `codex.py` (OpenAI's codex CLI on its own login),
-`ttadk.py` (ByteDance's ttadk launcher, running Codex or Claude Code by model).
+an adapter: `ark.py` (Claude Code on a BytePlus ARK endpoint, through the protocol proxy in
+`bin/claude-ark-deepseek`), `cursor.py` (Cursor's `agent` CLI), `codex.py` (OpenAI's codex CLI on its
+own login), `ttadk.py` (ByteDance's ttadk launcher, running Codex or Claude Code by model).
 
 At start claudesec execs each `agents/*.py` into its own namespace, in file-name order, skipping
 files that start with `_`. A file sees everything `bin/claudesec` defines (`Agent`, `config()`,

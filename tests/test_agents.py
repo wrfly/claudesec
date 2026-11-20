@@ -112,6 +112,17 @@ class Agents(unittest.TestCase):
         self.assertIn("ttadk codex --mode ttadk-only -m gpt-6.1-sol --skip-check -- -c", cmd)
         self.assertIn(str(d / "initial.md"), cmd.rsplit(" -- ", 1)[1])  # a pointer, not its text (test_task_off_argv)
 
+    def test_ark_runs_claude_through_the_wrapper(self):
+        cfg = self.cs.config()
+        d = self.root / "d"
+        ark = self.cs.AGENTS["ark"]
+        self.assertFalse(ark.external)  # an ordinary Claude Code worker, hooks and all
+        cmd = ark.command("w", "ep-20260520120241-qtg9z", d, cfg)
+        self.assertTrue(cmd.startswith("env ARK_MODEL=ep-20260520120241-qtg9z claude-ark-deepseek -n w "), cmd)
+        self.assertIn(str(d / "settings.json"), cmd)
+        self.assertIn(str(d / "initial.md"), cmd)  # the first message names it, not its text
+        self.assertIs(ark.runtime("ep-20260520120241-qtg9z"), ark)
+
     def test_ttadk_picks_the_runtime_by_model(self):
         ttadk = self.cs.AGENTS["ttadk"]
         self.assertEqual(ttadk.runtime("gpt-6.1-sol").runtime_name, "codex")

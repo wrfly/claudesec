@@ -489,7 +489,7 @@ worker 干活（可开 subagent，结果不外泄）
 claudesec                       切到/附着 tmux session "claudesec"（不存在则创建，秘书 resume 上次会话）
 claudesec --new                 秘书开新会话（session 已存在则原地重启秘书窗口）
 claudesec -d                    只在后台建好 session，不切换
-claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor|codex|ttadk] [--for WORKER] <<< 任务原文
+claudesec spawn NAME [--dir D] [--model M] [--discuss] [--agent cursor|codex|ttadk|ark] [--for WORKER] <<< 任务原文
                                                 不带 --dir：~/.claudesec/work/NAME（没有就建），运维、通用的活用
 claudesec delegate ME --name N [--dir D] [--agent A] [--ack 理由] <<< 任务书   worker 把小活交给外部 agent worker（config delegate_agent 里第一个可用的）
 claudesec wait N                 委托人等 N 的最终汇报（后台 Bash）
@@ -581,6 +581,23 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - `claudesec status` 末尾每个 agent 一行「Cursor worker：可用（路径）/ 已关 / 没有 agent 命令」。
 - 标记名就是 agent 名（`<!-- if codex -->`、`<!-- if ttadk -->`），可以嵌套。`<!-- if delegate -->` 是 `claudesec delegate`
   有 agent 可开（`delegate_agents()` 里有一个可用），worker 规则里「把小活交出去」那段和秘书的外部 agent 段落用它。
+
+### 新 token 源：ARK 端点上的 Claude Code（`--agent ark`，2026-11-20）
+
+用户给了 ARK 国际站（`ark-ap-southeast.byteintl.net`）的 curl，问能不能接成新的 token 源。实测：`/api/v3/responses`、
+`/api/v3/chat/completions` 都通，function calling 和 SSE 流式（tool_calls 增量、末块带 usage）可用；`/api/v3/messages`
+返回 200 但 body 为空，没有 Anthropic 兼容入口。这把 key 的账号只能写端点 ID（`ep-…`），直接写模型名 404
+`ModelIDAccessDisabled`。端点背后是 `deepseek-v4-1-flash`，窗口 1M、输出上限 393216。
+
+- `bin/claude-ark-deepseek`：只用标准库的一个启动器 —— 本地起一个翻译代理（Anthropic Messages → Chat Completions），
+  再 exec `claude`，把 `ANTHROPIC_BASE_URL` 指过去，别名模型、`CLAUDE_CODE_MAX_CONTEXT_TOKENS`（端点报的 1M）一并设好。
+  流式按 `message_start` / `content_block_start|delta|stop` / `message_delta` / `message_stop` 转回，`tool_calls` 的
+  arguments 增量转成 `input_json_delta`，`prompt_tokens_details.cached_tokens` 记成 `cache_read_input_tokens`。
+- `agents/ark.py`：对 claudesec 来说它是普通 Claude Code worker（`external=False`），只换 launcher
+  （`env ARK_MODEL=<ep> claude-ark-deepseek`），hook、token 统计、resume 全继承 `ClaudeCode`。模型 ID 不是 `claude-*`，
+  所以提示词走 `worker-external.md`、汇报用 `claudesec report`，跟 `ttadk claude` 的非 Claude 模型一样。
+- 配置：模型 `ark_worker_model`（端点 ID），key 在 `~/.config/claude-ark-deepseek.json`（600）或 `ARK_API_KEY`，
+  不进 git、不进日志；`spawn --agent ark --model ep-…` 不带模型时用它。
 
 ### worker 把小活委托给外部 agent 或其他模型（`claudesec delegate` / `wait`）
 

@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""claude-ark-deepseek: run Claude Code on a BytePlus/Volcengine ARK endpoint.
+
+ARK's data plane speaks OpenAI's protocols (Responses, Chat Completions); Claude Code speaks
+Anthropic's Messages protocol. So this starts a small local proxy that translates Messages ->
+Chat Completions and streams the answer back as Anthropic SSE, then runs `claude` with
+ANTHROPIC_BASE_URL pointing at it. Everything after the first unknown-to-us argument is passed
+to claude unchanged.
+
+    ARK_API_KEY=... ARK_MODEL=ep-... claude-ark-deepseek -p "hello"
+    claude-ark-deepseek              # an ordinary Claude Code session on ARK
+
+Configuration: environment first, then ~/.config/claude-ark-deepseek.json
+    {"api_key": "...", "model": "ep-...", "base_url": "https://ark-ap-southeast.byteintl.net/api/v3"}
+  ARK_API_KEY     the ARK API key (never printed, never logged)
+  ARK_MODEL       the endpoint ID (ep-...); ARK disallows plain model IDs for this account
+  ARK_BASE_URL    default https://ark-ap-southeast.byteintl.net/api/v3
+  ARK_DEBUG=1     log each translated request to stderr (no bodies, no headers)
+
+Only the Python standard library is used, so it runs wherever python3 does.
+"""
+import http.server
+import json
+import os
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE_URL = "https://ark-ap-southeast.byteintl.net/api/v3"
+CONFIG_PATH = os.path.expanduser("~/.config/claude-ark-deepseek.json")
+PLACEHOLDER_TOKEN = "claude-ark-deepseek"  # what claude sees; the real key stays in this process
+DEFAULT_TIMEOUT = 600
+
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        sys.exit(f"claude-ark-deepseek: cannot read {CONFIG_PATH}: {e}")
+    api_key = os.environ.get("ARK_API_KEY") or cfg.get("api_key") or ""
+    model = os.environ.get("ARK_MODEL") or cfg.get("model") or ""
+    base_url = (os.environ.get("ARK_BASE_URL") or cfg.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    if not api_key:
+        sys.exit("claude-ark-deepseek: no ARK_API_KEY (set it, or put \"api_key\" in " + CONFIG_PATH + ")")
+    if not model:
+        sys.exit("claude-ark-deepseek: no ARK_MODEL (the endpoint ID, ep-...; set it or put \"model\" in "
+                 + CONFIG_PATH + ")")
+    try:
+        context = int(os.environ.get("ARK_CONTEXT_TOKENS") or cfg.get("context_tokens") or 1_000_000)
+    except (TypeError, ValueError):
+        sys.exit("claude-ark-deepseek: ARK_CONTEXT_TOKENS must be a token count, e.g. 1000000")
+    return {"api_key": api_key, "model": model, "base_url": base_url,
+            "debug": os.environ.get("ARK_DEBUG", "") not in ("", "0"),
+            "context": context,
+            "timeout": float(os.environ.get("ARK_TIMEOUT", DEFAULT_TIMEOUT))}
+
+
+# ---------- Anthropic request -> OpenAI Chat Completions ----------
+
+def text_of(content):
+    """Anthropic content (a string or a list of blocks) -> plain text, images dropped."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for b in content or []:
+        if isinstance(b, str):
+            out.append(b)
+        elif b.get("type") == "text":
+            out.append(b.get("text", ""))
+        elif b.get("type") == "image":
+            out.append("[image]")
+    return "\n".join(out)
+
+
+def data_url(block):
+    src = block.get("source") or {}
+    if src.get("type") == "base64":
+        return "data:%s;base64,%s" % (src.get("media_type", "image/png"), src.get("data", ""))
+    return src.get("url") or ""
+
+
+def tool_choice(choice):
+    kind = (choice or {}).get("type")
+    if kind == "any":
+        return "required"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    if kind == "none":
+        return "none"
+    return "auto"
+
+
+def translate_request(body, model):
+    messages = []
+    system = body.get("system")
+    if system:
+        text = text_of(system).strip()
+        if text:
+            messages.append({"role": "system", "content": text})
+    for m in body.get("messages") or []:
+        role, content = m.get("role"), m.get("content")
+        if role == "user":
+            results, parts = [], []
+            for b in content if isinstance(content, list) else [{"type": "text", "text": content or ""}]:
+                kind = b.get("type")
+                if kind == "tool_result":
+                    results.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""),
+                                    "content": text_of(b.get("content"))})
+                elif kind == "image":
+                    parts.append({"type": "image_url", "image_url": {"url": data_url(b)}})
+                else:  # text, and anything newer we don't model
+                    text = b.get("text") if isinstance(b, dict) else b
+                    if text:
+                        parts.append({"type": "text", "text": text})
+            # Tool results must come right after the assistant turn that asked for them.
+            messages.extend(results)
+            if any(p["type"] != "text" for p in parts):
+                messages.append({"role": "user", "content": parts})
+            elif parts:
+                messages.append({"role": "user", "content": "".join(p["text"] for p in parts)})
+        else:  # assistant
+            texts, calls = [], []
+            for b in content if isinstance(content, list) else [{"type": "text", "text": content or ""}]:
+                kind = b.get("type")
+                if kind == "text":
+                    texts.append(b.get("text", ""))
+                elif kind == "tool_use":
+                    calls.append({"id": b.get("id", ""), "type": "function",
+                                  "function": {"name": b.get("name", ""),
+                                               "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False)}})
+                # thinking / redacted_thinking / server tool blocks: dropped
+            msg = {"role": "assistant"}
+            text = "".join(texts)
+            if text:
+                msg["content"] = text
+            if calls:
+                msg["tool_calls"] = calls
+            if "content" not in msg and "tool_calls" not in msg:
+                msg["content"] = ""
+            messages.append(msg)
+
+    out = {"model": model, "messages": messages,
+           "max_tokens": body.get("max_tokens") or 8192}
+    for src, dst in (("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")):
+        if body.get(src) not in (None, [], ""):
+            out[dst] = body[src]
+    tools = []
+    for t in body.get("tools") or []:
+        if t.get("name"):
+            tools.append({"type": "function", "function": {
+                "name": t["name"], "description": t.get("description") or "",
+                "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}})
+    if tools:
+        out["tools"] = tools
+        out["tool_choice"] = tool_choice(body.get("tool_choice"))
+    return out
+
+
+def stop_reason(finish):
+    return {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
+            "content_filter": "end_turn"}.get(finish, "end_turn")
+
+
+def usage_of(usage, fallback_in=0, fallback_out=0):
+    usage = usage or {}
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    prompt = usage.get("prompt_tokens", fallback_in)
+    return {"input_tokens": max(prompt - cached, 0), "output_tokens": usage.get("completion_tokens", fallback_out),
+            "cache_read_input_tokens": cached, "cache_creation_input_tokens": 0}
+
+
+def message_of(msg, model, usage=None):
+    """A non-streamed Chat Completions message -> an Anthropic message."""
+    blocks = []
+    if msg.get("content"):
+        blocks.append({"type": "text", "text": msg["content"]})
+    for call in msg.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except ValueError:
+            args = {"__raw": fn.get("arguments")}
+        blocks.append({"type": "tool_use", "id": call.get("id") or "call_%d" % len(blocks),
+                       "name": fn.get("name") or "", "input": args})
+    return {"id": "msg_ark_" + str(os.getpid()), "type": "message", "role": "assistant",
+            "model": model, "content": blocks,
+            "stop_reason": "tool_use" if any(b["type"] == "tool_use" for b in blocks)
+            else stop_reason(msg.get("finish_reason")),
+            "stop_sequence": None, "usage": usage_of(usage)}
+
+
+# ---------- the proxy ----------
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"  # streaming responses end at connection close
+    server_version = "claude-ark-deepseek"
+
+    def log_message(self, fmt, *args):  # keep stderr for our own debug lines
+        if self.server.cfg["debug"]:
+            sys.stderr.write("[ark] %s\n" % (fmt % args))
+
+    def do_GET(self):
+        self.send_response(200, "ok")
+        self.end_headers()
+
+    def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self.fail(400, "invalid_request_error", "body is not JSON")
+        if path.endswith("/messages/count_tokens"):
+            return self.count_tokens(body)
+        if not path.endswith("/messages"):
+            return self.fail(404, "not_found_error", "no such path: " + path)
+        try:
+            payload = translate_request(body, self.server.cfg["model"])
+        except Exception as e:  # never let a malformed block kill the session
+            return self.fail(400, "invalid_request_error", "cannot translate request: %r" % (e,))
+        if self.server.cfg["debug"]:
+            sys.stderr.write("[ark] -> %s model=%s messages=%d tools=%d stream=%s\n"
+                             % ("chat/completions", payload["model"], len(payload["messages"]),
+                                len(payload.get("tools") or []), bool(body.get("stream"))))
+        try:
+            if body.get("stream"):
+                return self.stream(payload)
+            self.whole(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # claude went away mid-answer
+
+    def count_tokens(self, body):
+        text = json.dumps(body.get("messages") or []) + json.dumps(body.get("system") or "")
+        self.json(200, {"input_tokens": max(1, len(text) // 4)})
+
+    # --- upstream
+    def upstream(self, payload):
+        url = self.server.cfg["base_url"] + "/chat/completions"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": "Bearer " + self.server.cfg["api_key"]})
+        return urllib.request.urlopen(req, timeout=self.server.cfg["timeout"])
+
+    def whole(self, payload):
+        try:
+            with self.upstream(payload) as r:
+                data = json.load(r)
+        except urllib.error.HTTPError as e:
+            return self.fail(e.code, "api_error", e.read().decode("utf-8", "replace")[:2000])
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            return self.fail(502, "api_error", "ARK unreachable: %s" % (e,))
+        choice = (data.get("choices") or [{}])[0]
+        msg = dict(choice.get("message") or {})
+        msg["finish_reason"] = choice.get("finish_reason")
+        self.json(200, message_of(msg, payload["model"], data.get("usage")))
+
+    def stream(self, payload):
+        payload = dict(payload, stream=True, stream_options={"include_usage": True})
+        try:
+            r = self.upstream(payload)
+        except urllib.error.HTTPError as e:
+            return self.fail(e.code, "api_error", e.read().decode("utf-8", "replace")[:2000])
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            return self.fail(502, "api_error", "ARK unreachable: %s" % (e,))
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        model = payload["model"]
+
+        def send(event, data):
+            self.wfile.write(("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))).encode())
+            self.wfile.flush()
+
+        send("message_start", {"type": "message_start", "message": {
+            "id": "msg_ark_%d" % os.getpid(), "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        block = None       # index of the open content block, or None
+        text_open = False  # is that block a text block?
+        tools = {}         # openai tool_calls index -> anthropic block index
+        finish, usage, out_chars = None, None, 0
+        try:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+                    piece = delta.get("content")
+                    if piece:
+                        if block is None or not text_open:
+                            if block is not None:
+                                send("content_block_stop", {"type": "content_block_stop", "index": block})
+                            block, text_open = 0 if block is None else block + 1, True
+                            send("content_block_start", {"type": "content_block_start", "index": block,
+                                                         "content_block": {"type": "text", "text": ""}})
+                        out_chars += len(piece)
+                        send("content_block_delta", {"type": "content_block_delta", "index": block,
+                                                     "delta": {"type": "text_delta", "text": piece}})
+                    for call in delta.get("tool_calls") or []:
+                        i = call.get("index", 0)
+                        if i not in tools:
+                            if block is not None:
+                                send("content_block_stop", {"type": "content_block_stop", "index": block})
+                            block, text_open = (0 if block is None else block + 1), False
+                            tools[i] = block
+                            send("content_block_start", {"type": "content_block_start", "index": block,
+                                                         "content_block": {"type": "tool_use",
+                                                                           "id": call.get("id") or "call_%d" % i,
+                                                                           "name": (call.get("function") or {}).get("name") or "",
+                                                                           "input": {}}})
+                        args = (call.get("function") or {}).get("arguments") or ""
+                        if args:
+                            send("content_block_delta", {"type": "content_block_delta", "index": tools[i],
+                                                         "delta": {"type": "input_json_delta", "partial_json": args}})
+        finally:
+            try:
+                r.close()
+            except OSError:
+                pass
+        if block is not None:
+            send("content_block_stop", {"type": "content_block_stop", "index": block})
+        send("message_delta", {"type": "message_delta",
+                               "delta": {"stop_reason": "tool_use" if tools else stop_reason(finish),
+                                         "stop_sequence": None},
+                               "usage": usage_of(usage, fallback_out=max(1, out_chars // 4))})
+        send("message_stop", {"type": "message_stop"})
+
+    # --- replies
+    def json(self, code, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def fail(self, code, kind, message):
+        self.json(code, {"type": "error", "error": {"type": kind, "message": message}})
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def start_proxy(cfg):
+    srv = Server(("127.0.0.1", 0), Handler)
+    srv.cfg = cfg
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def child_env(cfg, port):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL")}
+    model = cfg["model"]
+    env.update({
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % port,
+        "ANTHROPIC_AUTH_TOKEN": PLACEHOLDER_TOKEN,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_CUSTOM_HEADERS": "X-Source: claude-ark-deepseek",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        # The endpoint ID is not a model Claude Code knows, so say how big the window is
+        # (`GET {base}/models` reports it) instead of letting Claude Code assume 1M for every ID.
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(cfg["context"]),
+        "API_TIMEOUT_MS": str(int(cfg["timeout"] * 1000)),
+    })
+    for alias in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        env["ANTHROPIC_DEFAULT_%s_MODEL" % alias] = model
+        env["ANTHROPIC_DEFAULT_%s_MODEL_NAME" % alias] = model
+    return env
+
+
+def main(argv):
+    cfg = load_config()
+    srv = start_proxy(cfg)
+    port = srv.server_address[1]
+    if cfg["debug"]:
+        sys.stderr.write("[ark] proxy on 127.0.0.1:%d, model %s, base %s\n" % (port, cfg["model"], cfg["base_url"]))
+    claude = "claude"
+    try:
+        rc = subprocess.call([claude, *argv], env=child_env(cfg, port))
+    except FileNotFoundError:
+        srv.shutdown()
+        sys.exit("claude-ark-deepseek: no `claude` on PATH")
+    except KeyboardInterrupt:
+        rc = 130
+    finally:
+        srv.shutdown()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

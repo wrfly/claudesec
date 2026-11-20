@@ -18,6 +18,10 @@ Configuration: environment first, then ~/.config/claude-ark-deepseek.json
   ARK_DEBUG=1     log each translated request to stderr (no bodies, no headers)
 
 Only the Python standard library is used, so it runs wherever python3 does.
+
+Auto mode: it starts with CLAUDE_CODE_AUTO_MODE_SERVER=0, so the safety check is Claude Code's
+own classifier request (answered by the endpoint's model) rather than the server-side review, which
+needs the upstream to understand the `safeguards` field and answer with verdicts.
 """
 import http.server
 import json
@@ -385,6 +389,14 @@ def child_env(cfg, port):
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_CUSTOM_HEADERS": "X-Source: claude-ark-deepseek",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        # Auto mode's server-side review rides on the session's own requests (`safeguards` plus a
+        # beta) and needs the server to answer with verdicts; a proxy that translates to another
+        # provider can't carry it, and Claude Code then shows "Auto mode can't check actions in
+        # this session" and stops. With this off, Claude Code uses its own classifier requests,
+        # which go to the session model: on ARK that is the endpoint's DeepSeek. ttadk workers get
+        # the same by running with CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (the user's call,
+        # 2026-11-20: run them like ttadk's).
+        "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
         # The endpoint ID is not a model Claude Code knows, so say how big the window is
         # (`GET {base}/models` reports it) instead of letting Claude Code assume 1M for every ID.
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(cfg["context"]),

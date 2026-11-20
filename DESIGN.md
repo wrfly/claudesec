@@ -599,6 +599,16 @@ claude 退出、id 不一致、60 秒没回写都算失败：worker 从 registry
 - 配置：模型 `ark_worker_model`（端点 ID），key 在 `~/.config/claude-ark-deepseek.json`（600）或 `ARK_API_KEY`，
   不进 git、不进日志；`spawn --agent ark --model ep-…` 不带模型时用它。
 
+auto 模式（2026-11-20 的第二个改动，用户拍板选 A）：Claude Code 的 auto 模式有两种检查。服务端检查是在请求里塞一个
+`safeguards` 字段（外加 `dangerous-tool-use-2026-09-03` beta），要上游在同一个流里回判定；翻译代理不认这个字段，丢掉之后
+Claude Code 就弹「Auto mode can't check actions in this session」，worker 卡住。实测把同一份配置指到 llmbox（ttadk 的网关）
+也弹同样的框，所以不是 ARK 代理独有的问题。另一条路是 Claude Code 自带的分类器请求（system 是 “security monitor”，无 tools，
+`max_tokens` 64/2112/10240，答案是一段 `<severity>N` 文本，默认模型 Sonnet 5、拿不到就退回 session 模型）。所以
+`claude-ark-deepseek` 给 claude 设 `CLAUDE_CODE_AUTO_MODE_SERVER=0`：不再向服务端要检查，判定交给端点上的模型（DeepSeek）。
+ttadk worker 本来就没这问题，因为它的 env 里有 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=true`（更宽，会连别的 beta 一起关）。
+实测：交互式会话带这个开关，`rm -rf` 这类动作由 6 次分类器请求判过、命令执行，全程没有那个对话框；抓包确认请求里不再有
+`safeguards`。留下的风险只有一个：DeepSeek 当裁判的误放率没测评过。
+
 ### worker 把小活委托给外部 agent 或其他模型（`claudesec delegate` / `wait`）
 
 下面按 Cursor 写的，别的外部 agent 和 `"claude"` 同样适用：delegate 没带 `--agent` 时开 config `delegate_agent`（默认

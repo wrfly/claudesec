@@ -104,6 +104,24 @@ class Translate(unittest.TestCase):
                           "cache_read_input_tokens": 60, "cache_creation_input_tokens": 0})
 
 
+class ChildEnv(unittest.TestCase):
+    """What claude sees: the proxy, one model all aliases, and auto mode checked locally."""
+
+    def test_env(self):
+        m = load()
+        cfg = {"api_key": "k", "model": "ep-1", "base_url": "https://x/api/v3",
+               "debug": False, "context": 1234, "timeout": 7}
+        env = m.child_env(cfg, 9999)
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9999")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "ep-1")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "ep-1")
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1234")
+        # The server-side review can't cross the translation, so auto mode uses Claude Code's own
+        # classifier request — which this proxy answers with the endpoint's model.
+        self.assertEqual(env["CLAUDE_CODE_AUTO_MODE_SERVER"], "0")
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+
 class Proxy(unittest.TestCase):
     """The whole HTTP side: claude's request in, Anthropic SSE out."""
 

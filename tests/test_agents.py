@@ -122,8 +122,11 @@ class Agents(unittest.TestCase):
         self.assertIn(str(d / "settings.json"), cmd)
         self.assertIn(str(d / "initial.md"), cmd)  # the first message names it, not its text
         self.assertIs(ark.runtime("ep-20260520120241-qtg9z"), ark)
-        # No model picked anywhere: the wrapper's config file names the endpoint.
+        # No model picked anywhere: the wrapper's config file names the endpoint ...
         self.assertTrue(ark.command("w", "default", d, cfg).startswith("env claude-ark-deepseek -n w "))
+        # ... but a worker needs a real endpoint, since "default" would read as a Claude model.
+        with self.assertRaises(SystemExit):
+            ark.runtime("default")
 
     def test_ttadk_picks_the_runtime_by_model(self):
         ttadk = self.cs.AGENTS["ttadk"]

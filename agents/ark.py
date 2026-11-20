@@ -19,6 +19,14 @@ class Ark(ClaudeCode):
         return tr(f"{shutil.which('claude-ark-deepseek')}，端点里配的模型",
                   f"{shutil.which('claude-ark-deepseek')}, the model its config names")
 
+    def runtime(self, model, recorded=None):
+        """Refuse a worker with no model at all: ARK only takes an endpoint ID, and the placeholder
+        "default" would be recorded as if it were a Claude model (wrong prompt, SendMessage and all)."""
+        if recorded or model not in (None, "", "default"):
+            return self
+        sys.exit("spawn --agent ark needs its endpoint: --model ep-... "
+                 "(or \"ark_worker_model\" in config.json)")
+
     def launcher(self, model):
         # The wrapper reads the endpoint ID from ARK_MODEL, the key from its config file or the env.
         # "default" (no model picked anywhere): let the wrapper's own config name the endpoint.

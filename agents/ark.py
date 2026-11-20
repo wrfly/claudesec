@@ -21,7 +21,9 @@ class Ark(ClaudeCode):
 
     def launcher(self, model):
         # The wrapper reads the endpoint ID from ARK_MODEL, the key from its config file or the env.
-        return ["env", "ARK_MODEL=" + model, "claude-ark-deepseek"]
+        # "default" (no model picked anywhere): let the wrapper's own config name the endpoint.
+        assign = [] if model in (None, "", "default") else ["ARK_MODEL=" + model]
+        return ["env", *assign, "claude-ark-deepseek"]
 
     def preflight(self):
         """Refuse before a window opens when the wrapper has no key to send."""

@@ -48,6 +48,7 @@ class Stale(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.cs = load(self.home)
+        self.cs.ensure_reminder_checker = lambda: None  # health is covered separately; no real run here
         (self.home / "config.json").write_text(json.dumps({"language": "zh"}))
         # a workspace with two repositories in it, svc and svc-proxy: svc has MRs !12 and !3
         # merged, svc-proxy none (its !3 is still open)

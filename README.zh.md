@@ -132,6 +132,10 @@ repo 里的是对谁都适用的部分：`prompts/secretary.md`（秘书宪法�
 
 ## 改 claudesec 本身
 
+后台检查状态用 `claudesec watchdog`；若检查进程停了，`claudesec watchdog --repair` 只恢复定时/巡检进程，
+不重启秘书或 worker。秘书每次会话开始、每次新消息也会自检并恢复，异常或心跳过期会直接提示秘书。
+磁盘满等写入失败会重试，未完成投递的提醒保存在 outbox；磁盘恢复后补送故障/恢复通知。
+
 `install.sh` 把 `~/.local/bin/claudesec` 软链到这份 checkout 的 `bin/claudesec`，秘书、每个 worker 的 hook、面板跑的都是这个文件此刻的内容：
 改到一半、rebase 停在冲突上，它们会一起挂掉。改代码、rebase、合并都在单独的 worktree 里做（`git worktree add ../claudesec-dev`），
 在那边跑完测试（`python3 -m unittest discover -s tests`），全部做完确认能用后，再一次性快进更新这份 checkout（`git merge --ff-only`）。

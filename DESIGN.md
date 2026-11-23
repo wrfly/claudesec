@@ -751,9 +751,20 @@ README 注入删库；7 个该放——ls、改配置、跑测试、git status�
 - 周期：`--every 30m|12h|1d|7d`。到点后 due 往后推到下一个未来的时间点，错过的几次只补发一次，
   「迟到多久」按最近错过的那次算。
 - 检查：`claudesec run` 起 `lifecycle reminders`，每 15 秒一次，只要它那个 run 还是 run.pid 里的那个就一直跑；
-  秘书重启后新的检查进程等旧的交出锁再接手。到点的先标 fired 再投递，所以最多投一次。
+  秘书重启后新的检查进程等旧的交出锁再接手。到点的状态和待投递原文一起提交到 `reminders.json` 的 outbox，
+  投递成功才清 outbox；创建告警或提交结果失败，下轮重试。每次 occurrence（id + due）用固定告警文件名，
+  重试时检查 alerts/ 和 delivered/，不会因结果没写成功就重复告警。
   秘书没在跑（包括整机重启）时不检查：提醒还在文件里，下次启动时补发，并注明迟到多久。没有用 launchd：
   投递的去处是秘书或 worker，它们都要 claudesec 在跑才有意义。
+- 容错（2026-11-23）：11-22 02:54 起磁盘写满，检查进程在写 `reminders.json.tmp` 时异常退出，秘书和 worker
+  还在跑，直到次日下午才发现。现在提醒、卡住巡检、闲置提醒等分别捕获异常，下轮重试；低频巡检失败也下轮重试，
+  不等下一个完整周期。日志写失败不会杀进程。故障与恢复通知先留内存，磁盘恢复后再送给秘书。
+  `reminders-checker.json` 每轮记 pid、run_pid、心跳和当前失败项；秘书 SessionStart 和每次 UserPromptSubmit
+  检查真实 singleton 锁与心跳，发现进程不在只拉起 `lifecycle reminders`，不重启秘书、不 wake/shelve worker；
+  没有活的 run 或锁仍占着但心跳过期时明确提示秘书，不冒险杀进程。启动锁串行化并等新进程拿到检查锁，避免并发 hook 重复拉起。
+  `claudesec watchdog` 查看状态，`claudesec watchdog --repair` 手动运行相同的安全自检/恢复。
+  告警 watch hook 的 pid、收据写失败同样保留锁并重试；收据原子写好后才移动告警，部分移动失败时保留整批重试。
+  全盘不可写时不能保证立刻留下持久告警；运行中进程保留内存故障，下一轮秘书 hook 另有独立健康检查。
 - 投递：一律写告警叫醒秘书（「[定时任务 rN]」开头），由秘书路由，不直接找 worker。用户定的：「肯定是先找你呀，
   你维护的脚本，你是我的秘书」。也因为秘书能 SendMessage 给在跑的 Claude Code worker，claudesec 自己不能；
   转不转、告不告诉用户（「别打扰我」）也是秘书的判断。曾做过直投 worker 的 --direct（搁置的 wake、Cursor 用 send），

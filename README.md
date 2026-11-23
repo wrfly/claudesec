@@ -172,6 +172,12 @@ To bring the history along, copy `~/.claudesec/history/`. The session ids in its
 
 ## Working on claudesec itself
 
+`claudesec watchdog` shows the background checker; `claudesec watchdog --repair` restores only
+the reminder/checker process, without restarting the secretary or workers. The secretary also
+checks and repairs it at session start and each new message, with a warning for failures or a stale
+heartbeat. Storage failures are retried; undelivered reminders remain in a durable outbox, and
+failure/recovery notices are sent when storage is writable again.
+
 `install.sh` links `~/.local/bin/claudesec` to this checkout's `bin/claudesec`, so the secretary, every
 worker's hooks and the dashboard run whatever that file holds at the moment: a half-done edit or a rebase
 stopped on a conflict breaks all of them at once. Make changes, rebases and merges in a separate

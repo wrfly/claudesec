@@ -22,6 +22,7 @@ class ProgressKept(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.cs = load(self.home)
+        self.cs.ensure_reminder_checker = lambda: None  # health is covered separately; no real run here
         (self.home / "config.json").write_text(json.dumps({"language": "en"}))
         (self.home / "registry.json").write_text(json.dumps({"focus": None, "workers": {
             "w": {"status": "STARTING", "dir": "/tmp", "task": "t", "session": "s", "window": "@1"},

@@ -60,6 +60,7 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
   claudesec archive SLUG --subagent --task T --summary S [--tags ..] [--dir D] < body.md
   claudesec lesson TYPE SITUATION CORRECTION
   claudesec hook EVENT [NAME]            internal; called by Claude Code hooks
+  claudesec watchdog [--repair]          check the background checker; --repair starts only it, not any session
 """
 import argparse
 import contextlib
@@ -1903,14 +1904,28 @@ def secretary_resume_id(name):
 QUICK_EXIT = 30  # seconds: a secretary claude that fails sooner is shown, not closed with its window
 
 
-def detach(job):
+def detach(job, run_pid=None):
     """Run `claudesec lifecycle JOB` on its own, outliving this window; output goes to a log."""
-    log = open(HOME / "lifecycle.log", "a")
-    p = subprocess.Popen([str(SELF), "lifecycle", job, str(os.getpid())], env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    # Even the log may be unavailable during ENOSPC. The checker keeps its failures in memory
+    # and reports them once storage recovers; failing to open its log mustn't prevent a restart.
+    with contextlib.ExitStack() as stack:
+        try:
+            log = stack.enter_context(open(HOME / "lifecycle.log", "a"))
+        except OSError:
+            log = subprocess.DEVNULL
+        p = subprocess.Popen([str(SELF), "lifecycle", job, str(run_pid if run_pid is not None else os.getpid())],
+                             env={**os.environ, "CLAUDESEC_HOME": str(HOME)},
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     # Reap it when it's done, or wake-all lingers as a zombie for as long as the secretary runs.
     # If this process exits first (shelve-all), the job is reparented and reaped by init.
     threading.Thread(target=p.wait, daemon=True).start()
+    return p
+
+
+def lifecycle_note(text):
+    """Diagnostic output is best effort: a full log filesystem must not kill its checker."""
+    with contextlib.suppress(OSError, ValueError):
+        print(text, flush=True)
 
 
 def secretary_alive():
@@ -1931,14 +1946,14 @@ def quietly(fn, **kw):
 
 
 def cmd_lifecycle(args):
-    print(f"=== {now()} {args.job} (claudesec run {args.run_pid})", flush=True)
+    lifecycle_note(f"=== {now()} {args.job} (claudesec run {args.run_pid})")
     if args.job == "shelve-all":
         shelve_all(args.run_pid)
     elif args.job == "reminders":
         check_reminders(args.run_pid)
     else:
         wake_all(args.run_pid)
-    print(f"=== {now()} {args.job} done", flush=True)
+    lifecycle_note(f"=== {now()} {args.job} done")
 
 
 @contextlib.contextmanager
@@ -5138,8 +5153,12 @@ def reminders():
         drop = {id(r) for r in done[:-REMINDERS_KEPT]} if len(done) > REMINDERS_KEPT else set()
         data["items"] = [r for r in data["items"] if id(r) not in drop]
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-        tmp.replace(path)
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            tmp.replace(path)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
 def read_reminders():
@@ -5273,6 +5292,7 @@ def cmd_remind(args):
             if r is None:
                 sys.exit(f"no pending reminder {args.cancel}; see `claudesec remind --list`")
             r.update(status="cancelled", done_at=now())
+            data["outbox"] = [x for x in data.get("outbox", []) if x["id"] != args.cancel]
         print(f"cancelled {r['id']}: {r['text']}")
         return
     if args.list or not args.words:
@@ -5326,45 +5346,53 @@ def deliver_reminder(r):
     late = (dt.datetime.now().astimezone() - due).total_seconds()
     late_note = tr(f"，迟到 {int(late // 60)} 分钟（那时秘书没在跑）", f", {int(late // 60)} minutes late (the "
                    "secretary wasn't running then)") if late > 3 * REMINDER_CHECK_SECS + 60 else ""
+    key = "reminder-" + hashlib.sha256(f"{r['id']}|{r['due']}".encode()).hexdigest()[:32]
     raise_alert(tr(f"[定时任务 {r['id']}] 原定 {show_time(r['due'])}{late_note}，给 {r['target']}：{r['text']}",
-                   f"[reminder {r['id']}] due {show_time(r['due'])}{late_note}, for {r['target']}: {r['text']}"))
+                   f"[reminder {r['id']}] due {show_time(r['due'])}{late_note}, for {r['target']}: {r['text']}"), key=key)
     if r["target"] in read_registry()[1]:
-        append_log(r["target"], "reminder", r["text"])
+        with contextlib.suppress(OSError):  # the alert is durable already; this extra log is not delivery
+            append_log(r["target"], "reminder", r["text"])
     return "secretary alerted"
 
 
 def fire_due_reminders():
-    """Each due reminder is marked fired before it is handed on: at most once, even if two
-    checkers overlap or delivery dies halfway. A repeating one moves on to its next time
-    instead; occurrences missed while no secretary ran fire once, not once each."""
+    """Claim due occurrences and their durable outbox together. Failed deliveries are retried,
+    using a stable alert filename so a failed result write cannot deliver the same alert twice."""
     cutoff = dt.datetime.now().astimezone()
     with reminders() as data:
-        due = []
+        outbox = data.setdefault("outbox", [])
         for r in data["items"]:
             when = dt.datetime.fromisoformat(r["due"])
             if r["status"] != "pending" or when > cutoff:
                 continue
-            due.append(dict(r))
+            occurrence = dict(r)
             if r.get("every"):
                 step = dt.timedelta(seconds=r["every"])
                 while when + step <= cutoff:
                     when += step
-                due[-1]["due"] = when.isoformat(timespec="seconds")  # the latest one missed, for "how late"
+                occurrence["due"] = when.isoformat(timespec="seconds")
                 r.update(due=(when + step).isoformat(timespec="seconds"), last_fired=now())
             else:
                 r.update(status="fired", done_at=now())
+            outbox.append(occurrence)
+        due = list(outbox)
+    failures = []
     for r in due:
         try:
             how = deliver_reminder(r)
-        except Exception as e:  # keep checking the others; tell the secretary this one went wrong
-            how = f"failed: {e}"
-            raise_alert(tr(f"[定时任务 {r['id']}] 投递出错（{e}），原文给 {r['target']}：{r['text']}",
-                           f"[reminder {r['id']}] couldn't be delivered ({e}); for {r['target']}: {r['text']}"))
-        with reminders() as data:
-            for x in data["items"]:
-                if x["id"] == r["id"]:
-                    x["result"] = f"{now()} {how}" if x.get("every") else how
-        print(f"{now()} {r['id']} → {r['target']}: {how}", flush=True)
+            with reminders() as data:
+                data["outbox"] = [x for x in data.get("outbox", [])
+                                  if (x["id"], x["due"]) != (r["id"], r["due"])]
+                for x in data["items"]:
+                    if x["id"] == r["id"]:
+                        x["result"] = f"{now()} {how}" if x.get("every") else how
+            lifecycle_note(f"{now()} {r['id']} → {r['target']}: {how}")
+        except Exception as e:
+            # Keep trying the others. The checker reports the failure and retries the outbox
+            # next round, including when alert creation or the result commit hit ENOSPC.
+            failures.append(f"{r['id']}: {type(e).__name__}: {e}")
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 RUNAWAY_CHECK_SECS = 300
@@ -5427,40 +5455,163 @@ def check_runaway(now_t=None):
     return raised
 
 
+CHECKER_STATE = "reminders-checker.json"
+CHECKER_STALE_SECS = 5 * REMINDER_CHECK_SECS
+
+
+class WatchdogHealth:
+    """Failures survive in memory while even alerts/ and the heartbeat cannot be written."""
+
+    def __init__(self):
+        self.errors = {}
+        self.pending = {}
+
+    def check(self, name, fn):
+        try:
+            fn()
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"[:800]
+            if name not in self.errors:
+                self.errors[name] = {"since": now(), "error": error}
+                self.pending[name] = (f"[claudesec watchdog] {name} failed at {now()}: {error}. "
+                                      f"The checker is still running and retries every {REMINDER_CHECK_SECS}s.")
+                lifecycle_note(self.pending[name])
+            else:
+                self.errors[name]["error"] = error
+            return False
+        if name in self.errors:
+            failure = self.errors.pop(name)
+            recovery = f"[claudesec watchdog] {name} recovered at {now()} (failed since {failure['since']})."
+            self.pending[name] = (self.pending.get(name, "") + "\n" + recovery).strip()
+            lifecycle_note(recovery)
+        return True
+
+    def publish(self, run_pid):
+        def heartbeat():
+            path = HOME / CHECKER_STATE
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            try:
+                tmp.write_text(json.dumps({"pid": os.getpid(), "run_pid": run_pid,
+                                          "updated_at": now(), "errors": self.errors}, ensure_ascii=False) + "\n")
+                tmp.replace(path)
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+        self.check("heartbeat", heartbeat)
+        # No exception here can tear down the loop. An alert lost to a full disk stays queued
+        # until it can be sent, including a failure that recovered before storage did.
+        for name, text in list(self.pending.items()):
+            try:
+                raise_alert(text)
+            except Exception:
+                continue
+            if self.pending.get(name) == text:
+                self.pending.pop(name)
+
+
+def reminder_checker_running():
+    """The lock, not a stale/reused pid, says whether a checker is actually running."""
+    path = HOME / "reminders-checker.lock"
+    if not path.exists():
+        return False
+    with open(path, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def ensure_reminder_checker():
+    """A session start / new turn repairs only the checker, never wakes or shelves workers.
+    Returns a note for the secretary on a failure or repair, and None when healthy."""
+    try:
+        run = current_run()
+        if run is None:
+            return "[claudesec watchdog] No live claudesec run: background checks are stopped; inspect before restarting."
+        with open(HOME / "reminders-supervisor.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None  # another hook is already checking / starting it
+            if not reminder_checker_running():
+                p = detach("reminders", run_pid=run)
+                # Serialize concurrent hooks through startup, so two cannot both see the gap
+                # between Popen and the new checker acquiring its singleton lock.
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and p.poll() is None:
+                    if reminder_checker_running():
+                        return (f"[claudesec watchdog] Background checker was stopped; restarted only it "
+                                f"(pid {p.pid}, run {run}). Secretary and workers were left running.")
+                    time.sleep(0.05)
+                return "[claudesec watchdog] Background checker restart did not acquire its lock; inspect lifecycle.log."
+            try:
+                state = json.loads((HOME / CHECKER_STATE).read_text())
+            except (OSError, ValueError):
+                return "[claudesec watchdog] Checker is running but its heartbeat is unavailable; inspect lifecycle.log."
+            if state.get("errors"):
+                return "[claudesec watchdog] Checker is retrying failed checks: " + json.dumps(state["errors"], ensure_ascii=False)
+            updated = dt.datetime.fromisoformat(state["updated_at"])
+            if (dt.datetime.now().astimezone() - updated).total_seconds() > CHECKER_STALE_SECS:
+                return "[claudesec watchdog] Checker holds its lock but its heartbeat is stale; inspect lifecycle.log (it was not killed)."
+            if state.get("run_pid") != run:
+                return "[claudesec watchdog] Previous checker is handing its lock over to the current run."
+    except Exception as e:
+        return f"[claudesec watchdog] Health check / repair failed: {type(e).__name__}: {e}"
+    return None
+
+
+def cmd_watchdog(args):
+    if args.repair:
+        print(ensure_reminder_checker() or "[claudesec watchdog] Background checker is healthy.")
+        return
+    running = reminder_checker_running()
+    print(f"run: {current_run()}; checker: {'running' if running else 'STOPPED'}; "
+          f"alert watcher: {'armed' if watcher_armed() else 'not armed (may be between turns)'}")
+    path = HOME / CHECKER_STATE
+    if path.exists():
+        print(path.read_text().strip())
+
+
 def check_reminders(run_pid):
     """Runs alongside the secretary, for as long as its `claudesec run` is the current one.
     The lock hands over from an older checker whose secretary is gone. Runaway spending is
     looked at here too, less often."""
     last_runaway = last_stale = last_leftovers = 0.0
-    code = code_stamp()
+    code, health = code_stamp(), WatchdogHealth()
+    if run_pid is None:
+        lifecycle_note("No run pid supplied; background checker was not started.")
+        return
     with open(HOME / "reminders-checker.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         while current_run() == run_pid:
-            code = restart_if_updated(code, run_pid)
-            fire_due_reminders()
-            with contextlib.suppress(Exception):  # a transcript or pane that can't be read
+            def reload():
+                nonlocal code
+                code = restart_if_updated(code, run_pid)
+            if not health.pending:
+                health.check("reload", reload)  # first report any in-memory fault before exec discards it
+            health.check("reminders", fire_due_reminders)
+            def watch():
                 did = check_watch()
                 if did:
-                    print(f"{now()} secretary: " + {"escaped": "turn hung, pressed Esc",
-                                                    "typed": "alerts waiting with no watcher, typed a line to re-arm it"}[did],
-                          flush=True)
-            with contextlib.suppress(Exception):  # nor a window that vanished mid-look
-                check_stuck()
+                    lifecycle_note(f"{now()} secretary: " + {"escaped": "turn hung, pressed Esc",
+                                                            "typed": "alerts waiting with no watcher, typed a line to re-arm it"}[did])
+            health.check("alert watcher", watch)
+            health.check("stuck dialogs", check_stuck)
             if time.monotonic() - last_runaway >= RUNAWAY_CHECK_SECS:
-                last_runaway = time.monotonic()
-                with contextlib.suppress(Exception):  # a bad transcript line mustn't stop the reminders
-                    check_runaway()
+                if health.check("runaway spending", check_runaway):
+                    last_runaway = time.monotonic()
             if time.monotonic() - last_stale >= STALE_CHECK_SECS or (HOME / "stale-due").exists():
-                last_stale = time.monotonic()
-                (HOME / "stale-due").unlink(missing_ok=True)
-                with contextlib.suppress(Exception):  # nor a broken queue.md or git checkout
+                def stale():
                     check_stale()
+                    (HOME / "stale-due").unlink(missing_ok=True)
+                if health.check("stale items", stale):
+                    last_stale = time.monotonic()
             if time.monotonic() - last_leftovers >= LEFTOVER_CHECK_SECS:
-                last_leftovers = time.monotonic()
-                with contextlib.suppress(Exception):  # nor a docker that hangs or a /proc that changes
-                    check_leftovers()
-            with contextlib.suppress(Exception):
-                check_idle()
+                if health.check("leftovers", check_leftovers):
+                    last_leftovers = time.monotonic()
+            health.check("idle reminders", check_idle)
+            health.publish(run_pid)
             time.sleep(REMINDER_CHECK_SECS)
 
 
@@ -5481,8 +5632,7 @@ def restart_if_updated(stamp, run_pid):
         compile(SELF.read_text(), str(SELF), "exec")
     except (OSError, SyntaxError, ValueError):
         return new  # half-written or broken: keep running the old code, and don't try it every round
-    print(f"=== {now()} claudesec changed: the reminder checker restarts on the new code", flush=True)
-    sys.stdout.flush()
+    lifecycle_note(f"=== {now()} claudesec changed: the reminder checker restarts on the new code")
     os.execv(sys.executable, [sys.executable, str(SELF), "lifecycle", "reminders", str(run_pid)])
 
 
@@ -6524,11 +6674,17 @@ def hook_worker_stop(name):
 
 def hook_secretary_session_start():
     data = hook_input()
+    watchdog_note = ensure_reminder_checker()
     if data.get("session_id"):
-        (HOME / "secretary.session").write_text(data["session_id"] + "\n")
+        try:
+            (HOME / "secretary.session").write_text(data["session_id"] + "\n")
+        except OSError as e:
+            watchdog_note = (watchdog_note or "") + f"\n[claudesec watchdog] Could not record secretary session: {e}"
     focus, workers = read_registry()
     out = [tr(f"[claudesec] 状态目录 {HOME}；你的宪法文件 {PROMPTS / 'secretary.md'}",
               f"[claudesec] State directory {HOME}; your constitution {PROMPTS / 'secretary.md'}")]
+    if watchdog_note:
+        out.append(watchdog_note)
     import io
     buf, old = io.StringIO(), sys.stdout
     sys.stdout = buf
@@ -6624,6 +6780,9 @@ def hook_secretary_prompt():
     not several, after a break."""
     data = hook_input()
     context = []
+    watchdog_note = ensure_reminder_checker()
+    if watchdog_note:
+        context.append(watchdog_note)
     with contextlib.suppress(Exception):  # a broken inbox mustn't hold up the message
         progress = take_progress()
         if progress:
@@ -6633,11 +6792,14 @@ def hook_secretary_prompt():
                                           "know how they're doing: don't pass it on to the user, don't answer the workers, "
                                           "don't say anything about it; it's for when the user asks."), *progress]))
     if not str(data.get("prompt", "")).lstrip().startswith(NOT_USER):
-        (HOME / USER_TURN).write_text(now())  # the user is at the keyboard: a choice box may be shown
-        (HOME / IDLE_NUDGES).unlink(missing_ok=True)  # they answered, or are here: the waits start over
-        daily = first_sight_today()
-        if daily:
-            context.insert(0, daily)
+        try:
+            (HOME / USER_TURN).write_text(now())  # the user is at the keyboard: a choice box may be shown
+            (HOME / IDLE_NUDGES).unlink(missing_ok=True)  # they answered, or are here: the waits start over
+            daily = first_sight_today()
+            if daily:
+                context.insert(0, daily)
+        except OSError as e:
+            context.append(f"[claudesec watchdog] Could not record user activity: {e}")
     if context:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                                  "additionalContext": "\n\n".join(context)}}, ensure_ascii=False))
@@ -7022,12 +7184,23 @@ def describe_request(tool, inp):
     return f"{tool}: {what}".replace("\n", " ")[:300]
 
 
-def raise_alert(text):
+def raise_alert(text, key=None):
     d = HOME / "alerts"
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f".{time.time_ns()}"
-    tmp.write_text(text + "\n")
-    tmp.rename(d / f"{time.time_ns()}.txt")
+    filename = f"{key}.txt" if key else f"{time.time_ns()}.txt"
+    with contextlib.ExitStack() as handles:
+        if key:
+            lock = handles.enter_context(open(d / "delivery.lock", "a"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (d / filename).exists() or (d / "delivered" / filename).exists():
+                return  # an outbox retry after delivery but before its result was committed
+        tmp = d / f".{time.time_ns()}"
+        try:
+            tmp.write_text(text + "\n")
+            tmp.rename(d / filename)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
 def hook_worker_permission(name):
@@ -7177,61 +7350,91 @@ def hook_secretary_watch_failed():
     """StopFailure: the secretary's turn died on an API error. Whatever alerts it was woken for
     go back to alerts/, and a watcher is armed that waits a while before waking it again, so a
     billing or capacity error doesn't turn into a tight loop of failing turns."""
-    inflight, done = HOME / "alerts" / "inflight.json", HOME / "alerts" / "delivered"
-    with contextlib.suppress(OSError, ValueError):
-        for name in json.loads(inflight.read_text()):
-            with contextlib.suppress(OSError):
-                (done / name).rename(HOME / "alerts" / name)
-    inflight.unlink(missing_ok=True)
     hook_secretary_watch(delay=WATCH_RETRY)
 
 
 def hook_secretary_watch(delay=0):
     """Armed in the background at session start and every turn end; one instance at a time.
-    Exits 2 with the pending alerts, which wakes the secretary (asyncRewake)."""
+    Exits 2 with the pending alerts, which wakes the secretary (asyncRewake). Storage failures
+    keep it armed and retry, including a failure to write watch.pid or inflight.json."""
     data = hook_input()
-    lock = open(HOME / "watch.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return  # already armed
-    (HOME / WATCH_PID).write_text(str(os.getpid()))  # for check_watch: is one armed?
     owner = next((s["pid"] for s in claude_sessions() if s.get("sessionId") == data.get("session_id")),
                  os.getppid())
+    with contextlib.ExitStack() as handles:
+        watch_secretary_alerts(data, owner, delay, handles)
+
+
+def watch_secretary_alerts(data, owner, delay, handles):
+    """Keep the singleton lock open through retries and close it on every return / exit."""
     alerts, done = HOME / "alerts", HOME / "alerts" / "delivered"
-    done.mkdir(parents=True, exist_ok=True)
     inflight = alerts / "inflight.json"
-    if data.get("hook_event_name") == "Stop":
-        inflight.unlink(missing_ok=True)  # the turn they woke ended normally: handled
     deadline = time.monotonic() + WATCH_TIMEOUT - WATCH_MARGIN
     quiet_until = time.monotonic() + delay
+    lock, ready, batch, fault = None, False, None, None
     while True:
-        if time.monotonic() < quiet_until:  # after a failed turn: give the API time to recover
+        try:
             try:
                 os.kill(owner, 0)
             except OSError:
                 return
-            time.sleep(1)
-            continue
-        if time.monotonic() > deadline:
-            # Claude Code ends an async hook at its timeout, and nothing would arm another until
-            # the secretary's next turn. Wake it with nothing to do; its turn end re-arms this.
-            print(tr(WATCH_REARM, WATCH_REARM_EN), file=sys.stderr)
-            sys.exit(2)
-        files = sorted(alerts.glob("*.txt"))
-        if files:
-            msgs = [f.read_text().strip() for f in files]
-            for f in files:
-                f.rename(done / f.name)
-            # Kept until the turn they wake ends normally; a failed one puts them back.
-            names = json.loads(inflight.read_text()) if inflight.exists() else []
-            inflight.write_text(json.dumps(names + [f.name for f in files]))
-            print(tr("[claudesec 告警]\n", "[claudesec alert]\n") + "\n".join(msgs), file=sys.stderr)
-            sys.exit(2)
-        try:
-            os.kill(owner, 0)
-        except OSError:
-            return  # the secretary is gone
+            if time.monotonic() > deadline:
+                print(tr(WATCH_REARM, WATCH_REARM_EN), file=sys.stderr)
+                sys.exit(2)
+            if lock is None:
+                candidate = handles.enter_context(open(HOME / "watch.lock", "a"))
+                try:
+                    fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    candidate.close()
+                    return  # already armed
+                except OSError:
+                    candidate.close()
+                    raise
+                lock = candidate
+            if not ready:
+                (HOME / WATCH_PID).write_text(str(os.getpid()))
+                done.mkdir(parents=True, exist_ok=True)
+                if data.get("hook_event_name") == "Stop":
+                    inflight.unlink(missing_ok=True)
+                elif data.get("hook_event_name") == "StopFailure" and inflight.exists():
+                    # A partially failed requeue is retried too; never delete its receipt
+                    # while an ENOSPC rename still leaves alerts in delivered/.
+                    for name in json.loads(inflight.read_text()):
+                        source = done / name
+                        if source.exists():
+                            source.rename(alerts / name)
+                    inflight.unlink(missing_ok=True)
+                ready = True
+            if time.monotonic() < quiet_until:
+                time.sleep(1)  # after a failed turn: give the API time to recover
+                continue
+            batch = batch or sorted(alerts.glob("*.txt"))
+            if batch:
+                # Retain the batch across a partial rename failure. Its moved files can be
+                # read from delivered/ on retry; don't forget them or deliver only the rest.
+                msgs = [(f if f.exists() else done / f.name).read_text().strip() for f in batch]
+                names = json.loads(inflight.read_text()) if inflight.exists() else []
+                tmp = inflight.with_suffix(f".{os.getpid()}.tmp")
+                try:
+                    tmp.write_text(json.dumps(list(dict.fromkeys(names + [f.name for f in batch]))))
+                    tmp.replace(inflight)  # durable receipt BEFORE any alert is moved away
+                finally:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink(missing_ok=True)
+                for f in batch:
+                    if f.exists():
+                        f.rename(done / f.name)
+                if fault:
+                    msgs.insert(0, f"[claudesec watchdog] Alert watcher recovered after storage failure: {fault}")
+                print(tr("[claudesec 告警]\n", "[claudesec alert]\n") + "\n".join(msgs), file=sys.stderr)
+                sys.exit(2)
+            if fault:
+                raise_alert(f"[claudesec watchdog] Alert watcher recovered after storage failure: {fault}")
+                fault = None
+        except (OSError, ValueError) as e:
+            if fault is None:
+                fault = f"{type(e).__name__}: {e}"
+                lifecycle_note(f"[claudesec watchdog] Alert watcher is retrying: {fault}")
         time.sleep(1)
 
 
@@ -7440,6 +7643,7 @@ def main():
     s = sub.add_parser("remind"); s.add_argument("words", nargs="*")
     s.add_argument("--list", action="store_true"); s.add_argument("--all", action="store_true")
     s.add_argument("--cancel"); s.add_argument("--every", metavar="PERIOD"); s.set_defaults(fn=cmd_remind)
+    s = sub.add_parser("watchdog"); s.add_argument("--repair", action="store_true"); s.set_defaults(fn=cmd_watchdog)
     s = sub.add_parser("show"); s.add_argument("number"); s.set_defaults(fn=cmd_show)
     sub.add_parser("stale").set_defaults(fn=cmd_stale)
     s = sub.add_parser("dnd"); s.add_argument("state", nargs="?", choices=["on", "off"]); s.set_defaults(fn=cmd_dnd)

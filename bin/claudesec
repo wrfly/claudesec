@@ -32,7 +32,8 @@ Commands (the secretary calls these; you mostly only run `claudesec`):
                                     progress, scheduled tasks (on by default)
   claudesec review [--print]             spawn today's review worker: tidy the secretary's memory, propose prompt diffs
   claudesec send NAME < message.txt      the secretary's message to an external agent's worker
-  claudesec model NAME MODEL [--force]   switch a worker's model: restart it on MODEL, conversation kept
+  claudesec model NAME MODEL [--force]   switch a worker's model: restart it on MODEL, conversation kept;
+                                    MODEL `ark` moves a Claude Code worker to ark_worker_model
   claudesec delegate ME --name N [--dir D] [--agent A] [--ack WHY] < task.txt   a worker hands a small job
                                     to an external agent (config delegate_agent: the first available)
   claudesec wait N                       the delegator waits for N's final report (background Bash)
@@ -2601,12 +2602,12 @@ def agent_of(w):
 
 def agent_for_model(w, model):
     """The adapter worker w's conversation runs on, moved to model. A Claude Code conversation runs
-    on plain Claude Code or through `ttadk claude`, whichever the model needs (both read the same
-    transcripts), so a switch between a Claude model and a ttadk-only one changes that too
+    on plain Claude Code, through `ttadk claude`, or through the ARK wrapper, whichever the model
+    needs (all read the same transcripts), so a switch between them changes the adapter too
     (2026-11-12: `claudesec model release claude-opus-5-5` from deepseek kept ttadk, which refused the
     model, E_INVALID_MODEL). A Codex or Cursor conversation stays with its agent."""
     agent = agent_of(w)
-    if not model or agent.name not in ("claude", "ttadk"):
+    if not model or agent.name not in ("claude", "ttadk", "ark"):
         return agent
     if agent.runtime_name == "codex":
         if claude_model(model):
@@ -2618,6 +2619,21 @@ def agent_for_model(w, model):
     if "ttadk" not in AGENTS:
         sys.exit(f"--model {model}: Claude Code runs that model only through ttadk, which isn't here")
     return AGENTS["ttadk"].runtime(model, "claude")
+
+
+def model_destination(w, model):
+    """(adapter, recorded model) for a model switch. `ark` names the ARK adapter rather than an
+    endpoint, so operators can move an existing Claude Code worker without looking up its ep-* ID."""
+    if model != "ark":
+        return agent_for_model(w, model), model
+    agent = agent_of(w)
+    if agent.external:
+        sys.exit(f"--model ark: this worker's conversation belongs to {agent.label}, not Claude Code; "
+                 "ARK can't resume it")
+    endpoint = config().get("ark_worker_model")
+    if not endpoint:
+        sys.exit('--model ark: set "ark_worker_model" to an ARK endpoint ID (ep-...) in config.json first')
+    return AGENTS["ark"], endpoint
 
 
 def agent_named(name):
@@ -4168,7 +4184,7 @@ def cmd_wake(args):
     if w["status"] != "SHELVED":
         sys.exit(f"{name} is not shelved (status {w['status']})")
     sid, cwd = w["session"], w["dir"]
-    agent = agent_for_model(w, args.model)
+    agent, selected_model = model_destination(w, args.model)
     if not conversation_exists(w):
         sys.exit(f"{name}: conversation {sid} is gone; it can't be resumed")
     left = w.get("moved_from")  # set by redir: the directory it was in before the move
@@ -4205,7 +4221,7 @@ def cmd_wake(args):
                                                "Do it and report by the rules:")
     initial = tr(WAKE_PROMPT, WAKE_PROMPT_EN) + (f"\n{intro}\n\n{instruction}\n" if instruction else
                                                  "\n" + tr(WAKE_REPORT, WAKE_REPORT_EN))
-    model = args.model or w.get("model") or agent.default_model(cfg) or "default"
+    model = selected_model or w.get("model") or agent.default_model(cfg) or "default"
     effort = getattr(args, "effort", None)
     if effort and agent.external:
         sys.exit(f"--effort: only for Claude Code workers ({name} runs {agent.label})")

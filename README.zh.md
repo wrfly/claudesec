@@ -98,7 +98,8 @@ kitty 不支持 modifyOtherKeys，要穿过 tmux 只能在 `kitty.conf` 里加�
     claudesec leftovers [W] [--kill]   # worker 留下还在跑的进程 / 容器（headless 浏览器、nohup、docker）；--kill 只杀确定是它的
     claudesec queue list --older 7   # 等了一周以上的未定条目
     claudesec queue doctor     # 检查 queue.md（行号前缀、重复分区、编号重复）；--fix 修
-    claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Cursor、Codex worker 换模型就用它
+    claudesec model W M        # 把 worker W 换成模型 M（重开，对话保留）；Claude Code worker 的 M 写 ark，
+                               # 就把原 session 原地挪到 ark_worker_model；Cursor、Codex worker 换模型也用它
     claudesec plugin           # 插件：加载了的（挂载点、命令）、没加载上的、repo 里有但还没链接的
 
 队列面板上每条有个编号，直接回秘书「12 A」「15 不用了」就是在答那一条。

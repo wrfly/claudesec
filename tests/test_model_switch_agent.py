@@ -1,7 +1,7 @@
-"""`claudesec model` / `wake --model` move a Claude Code conversation between plain Claude Code and
-`ttadk claude` by the model (2026-11-12: workers on ttadk + deepseek switched to claude-opus-5-5 kept
-ttadk, which refused the model); a failed wake closes its window; --effort reaches `claude --effort`;
-a wake with nothing on a socket stdin doesn't wait on it.
+"""`claudesec model` / `wake --model` move a Claude Code conversation between plain Claude Code,
+`ttadk claude`, and ARK by the model (2026-11-12: workers on ttadk + deepseek switched to
+claude-opus-5-5 kept ttadk, which refused the model); a failed wake closes its window; --effort
+reaches `claude --effort`; a wake with nothing on a socket stdin doesn't wait on it.
 
     python3 -m unittest discover -s tests
 """
@@ -71,6 +71,31 @@ class ModelSwitch(unittest.TestCase):
         w = self.wake(model="deepseek-v4.1-flash")
         self.assertIn("ttadk", self.cmds[-1])
         self.assertEqual((w["agent"], w["runtime"]), ("ttadk", "claude"))
+
+    def test_ttadk_claude_to_ark_uses_configured_endpoint_and_same_session(self):
+        endpoint = "ep-20260520120241-qtg9z"
+        (self.home / "config.json").write_text(json.dumps({"language": "en", "ark_worker_model": endpoint}))
+        self.worker(model="deepseek-v4.1-flash", agent="ttadk", runtime="claude")
+        w = self.wake(model="ark")
+        self.assertTrue(self.cmds[-1].startswith(f"env ARK_MODEL={endpoint} claude-ark-deepseek "), self.cmds[-1])
+        self.assertIn("--resume sid", self.cmds[-1])
+        self.assertNotIn("ttadk", self.cmds[-1])
+        self.assertEqual((w["agent"], w.get("runtime"), w["model"]), ("ark", None, endpoint))
+
+    def test_ark_to_opus_runs_plain_claude_code(self):
+        self.worker(model="ep-old", agent="ark")
+        w = self.wake(model="claude-opus-5-5")
+        self.assertNotIn("claude-ark-deepseek", self.cmds[-1])
+        self.assertIn("--model claude-opus-5-5", self.cmds[-1])
+        self.assertEqual((w["agent"], w.get("runtime")), ("claude", None))
+
+    def test_codex_conversation_cannot_move_to_ark(self):
+        (self.home / "config.json").write_text(json.dumps(
+            {"language": "en", "ark_worker_model": "ep-20260520120241-qtg9z"}))
+        self.worker(model="gpt-6.1-sol", agent="ttadk", runtime="codex")
+        with self.assertRaises(SystemExit) as e:
+            self.wake(model="ark")
+        self.assertIn("not Claude Code", str(e.exception.code))
 
     def test_a_codex_conversation_isnt_moved_to_claude(self):
         self.worker(model="gpt-6.1-sol", agent="ttadk", runtime="codex")

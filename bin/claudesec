@@ -146,6 +146,7 @@ DEFAULT_CONFIG = {
     "runaway_usd": 20,
     "runaway_quiet_minutes": 60,
     "stale_days": 7,                  # an open queue item or to-do this old is pointed out to the secretary
+    "queue_max_number": 999,          # queue and to-do numbers wrap back to 1 past this (skipping open ones); 0: no wrap
     "review_every_days": 3,           # the user's first message of a day this long after the last review
                                       # starts one (`claudesec review`); 1: every day the user shows up; 0: never
     "idle_ask_minutes": [5, 15, 30],  # the secretary idle this long with something for the user: woken to ask;
@@ -750,9 +751,12 @@ def priority_color(note):
     return PRIORITY.get(word[0].lower() if word else "", "")
 
 
-# A queue.md item: "- #12 [web] question（中）". The number is the item's for good (the user
-# answers by it); older files numbered items "1." or "0d." with no "#".
+# A queue.md item: "- #12 [web] question（中）". The number stays with the item while open; once
+# closed, a wrapped sequence may reuse #12 and rewrite the old closed line to "- #12@2026-10-20 …"
+# so bare #12 belongs only to the current item. Older files numbered items "1." or "0d." with no "#".
 QUEUE_ITEM = re.compile(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+(?:#(\d+)\s+)?(\S.*)")
+RETIRED_ITEM = re.compile(r"\s*(?:[0-9A-Za-z]{1,4}\.|[-*])\s+#(\d+)@(\S+)(?:\s+(\S.*))?$")
+DONE_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\s+(.*))?$")
 
 
 # queue.md's sections, a backlog -> todo -> doing -> done flow: 搁置 the user put off (not asked
@@ -863,13 +867,38 @@ def queue_meta():
     return {}
 
 
+def forget_number_state(num):
+    """When #num is handed to a new item, drop any stale-sweep or idle-nudge memory left over from
+    an earlier item that used #num."""
+    stale_path = HOME / "stale.json"
+    if stale_path.exists():
+        with contextlib.suppress(OSError, ValueError):
+            told = json.loads(stale_path.read_text())
+            dropped = sum(told.pop(k, None) is not None for k in (f"queue:{num}", f"notice:{num}"))
+            if dropped:
+                tmp = HOME / f".stale.{os.getpid()}.tmp"
+                tmp.write_text(json.dumps(told, indent=1) + "\n")
+                os.replace(tmp, stale_path)
+    idle_path = HOME / IDLE_NUDGES
+    if idle_path.exists():
+        with contextlib.suppress(OSError, ValueError):
+            state = json.loads(idle_path.read_text())
+            items = state.get("items")
+            if isinstance(items, list) and num in items:
+                state["items"] = [x for x in items if x != num]
+                tmp = HOME / f".{IDLE_NUDGES}.{os.getpid()}.tmp"
+                tmp.write_text(json.dumps(state))
+                os.replace(tmp, idle_path)
+
+
 def note_added(num):
     meta = queue_meta()
     now = dt.datetime.now().astimezone()
-    meta.setdefault(str(num), {}).update(added=now.date().isoformat(), at=now.isoformat(timespec="seconds"))
+    meta[str(num)] = {"added": now.date().isoformat(), "at": now.isoformat(timespec="seconds")}
     tmp = HOME / f".queue-meta.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(meta, indent=1) + "\n")
     os.replace(tmp, HOME / "queue-meta.json")
+    forget_number_state(num)
 
 
 def item_age(num, section, note, meta=None):
@@ -1352,7 +1381,8 @@ QUEUE_INTRO = """# 决策队列
 秘书维护。worker 的 NEED_DECISION、要用户定的 TODO 先进这里，按重要程度排序，一次只问用户一件。
 像 backlog → todo → doing → done：「搁置」用户说以后再说的，不主动问；「待问」接下来一件件问的；
 「待答」问过了、等用户回答；「已处理」定了的，新的在上。「记录」是用户只让记下的想法，不是要问的问题。
-每条一行 `- #编号 [worker] 问题（高|中|低）`。编号用 `claudesec queue add` 拿，跟着条目走，不改、不复用；
+每条一行 `- #编号 [worker] 问题（高|中|低）`。编号用 `claudesec queue add` 拿，跟着条目走，不改；满上限
+（默认 999）后从 1 轮转跳过未处理的号，复用已处理的号时旧条目改为 `#编号@日期`；
 在块之间挪用 `claudesec queue move 编号 backlog|todo|doing|done`。用户看着面板用编号回答。
 """
 QUEUE_INTRO_EN = """# Decision queue
@@ -1363,8 +1393,9 @@ Like backlog -> todo -> doing -> done: Backlog, what the user put off (not asked
 asked next, one by one; Waiting, asked and waiting for the answer; Done, decided, newest first.
 Ideas holds what the user only asked to note down: not questions.
 One line an item: `- #number [worker] question (high|medium|low)`. Numbers come from
-`claudesec queue add` and stay with the item; `claudesec queue move N backlog|todo|doing|done`
-moves one. The user answers by number from the panel.
+`claudesec queue add` and stay with the item; past the cap (default 999) they wrap back to 1,
+skipping open items and rewriting reused Done entries to `#number@YYYY-MM-DD`;
+`claudesec queue move N backlog|todo|doing|done` moves one. The user answers by number from the panel.
 """
 
 
@@ -1444,19 +1475,114 @@ def secretary_prompt():
     return path
 
 
-def take_queue_number(text):
-    """The next queue item number: past every one in queue.md and every one handed out before,
-    so a number cleared out of 已处理 isn't handed out again. Notices draw from the same numbers,
-    so "46" means one thing whichever pane it is in."""
+def queue_max_number():
+    """Wrap cap for queue and to-do numbers (default 999 -> 1..999). 0 disables wrapping."""
+    val = config().get("queue_max_number", 999)
+    if val is None:
+        return 999
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return 999
+    return n if n > 0 else 0
+
+
+def retire_closed_lines(lines, num, section_of, done_key="done", fallback_date=None):
+    """Rewrite closed entries carrying bare `#num` to `#num@YYYY-MM-DD` (or `#num@old`) so a
+    reused `#num` belongs only to the new item. Returns whether any line changed."""
+    target = str(num)
+    section, changed = None, False
+    for i, line in enumerate(lines):
+        clean = LINE_NUMBER.sub("", line)
+        if clean.startswith("## "):
+            section = section_of(clean)
+            continue
+        if section != done_key:
+            continue
+        m = QUEUE_ITEM.match(clean)
+        if not (m and m[1] == target):
+            continue
+        body = m[2].strip()
+        tag = re.match(r"(\[[^\]]+\]\s*)", body)
+        prefix, rest = (tag[1], body[tag.end():]) if tag else ("", body)
+        dm = DONE_DATE.match(rest)
+        if dm:
+            stamp, rest = dm[1], (dm[2] or "").strip()
+        else:
+            stamp = fallback_date or "old"
+        lines[i] = f"- #{target}@{stamp} {prefix}{rest}".rstrip()
+        changed = True
+    return changed
+
+
+def retire_closed_in_file(path, num, section_of, done_key="done", fallback_date=None):
+    if not path.exists():
+        return False
+    lines = path.read_text().splitlines()
+    if not retire_closed_lines(lines, num, section_of, done_key=done_key, fallback_date=fallback_date):
+        return False
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+    return True
+
+
+def claim_reused_number(num, queue_lines=None, notice_lines_in=None):
+    """Retire any closed `#num` entries in queue.md and notices.md to `#num@YYYY-MM-DD`, then
+    record fresh metadata and drop stale/idle state left over from any earlier item `#num`."""
+    fallback = queue_meta().get(str(num), {}).get("added")
+    if queue_lines is not None:
+        retire_closed_lines(queue_lines, num, queue_section, fallback_date=fallback)
+    else:
+        retire_closed_in_file(HOME / "queue.md", num, queue_section, fallback_date=fallback)
+    if notice_lines_in is not None:
+        retire_closed_lines(notice_lines_in, num, notice_section, fallback_date=fallback)
+    else:
+        retire_closed_in_file(HOME / "notices.md", num, notice_section, fallback_date=fallback)
+    note_added(num)
+
+
+def take_queue_number(text=""):
+    """The next queue/to-do number. Advances from `queue.last` and wraps 1..queue_max_number
+    (default 999), skipping every open item in queue.md (ideas/backlog/todo/doing) and notices.md
+    (open) so closed numbers can be reused without colliding with live ones. Notices draw from the
+    same sequence, so "46" means one thing whichever pane it is in."""
+    HOME.mkdir(parents=True, exist_ok=True)
     last = HOME / "queue.last"
-    for other in (HOME / "queue.md", HOME / "notices.md"):
-        with contextlib.suppress(OSError):
-            text += "\n" + other.read_text()
-    seen = [int(m[1]) for m in (QUEUE_ITEM.match(LINE_NUMBER.sub("", l)) for l in text.splitlines()) if m and m[1]]
+    q_text = text if text else queue_text()
+    n_text = (HOME / "notices.md").read_text() if (HOME / "notices.md").exists() else ""
+    in_use = {num for _, num, *_ in queue_items(q_text) if num}
+    in_use |= {num for num, _, _ in open_notices() if num}
+    last_num = None
     with contextlib.suppress(OSError, ValueError):
-        seen.append(int(last.read_text()))
-    n = max(seen, default=0) + 1
-    last.write_text(f"{n}\n")
+        last_num = int(last.read_text().strip())
+    cap = queue_max_number()
+    if cap <= 0:
+        all_seen = [int(m[1]) for m in (QUEUE_ITEM.match(LINE_NUMBER.sub("", l))
+                                        for l in (q_text + "\n" + n_text).splitlines()) if m and m[1]]
+        if last_num is not None:
+            all_seen.append(last_num)
+        n = max(all_seen, default=0) + 1
+    else:
+        if last_num is None:
+            all_seen = [int(m[1]) for m in (QUEUE_ITEM.match(LINE_NUMBER.sub("", l))
+                                            for l in (q_text + "\n" + n_text).splitlines()) if m and m[1]]
+            last_num = max(all_seen, default=0)
+        start = last_num + 1 if 0 <= last_num < cap else 1
+        n = None
+        for offset in range(cap):
+            cand = ((start - 1 + offset) % cap) + 1
+            if cand not in in_use:
+                n = cand
+                break
+        if n is None:
+            n = max(in_use | {cap}) + 1
+            print(tr(f"警告：1–{cap} 编号已全部被未处理条目占满，临时使用 #{n}",
+                     f"warning: all numbers 1–{cap} are in use by open items, temporarily using #{n}"),
+                  file=sys.stderr)
+    tmp = last.with_name(f".queue.last.{os.getpid()}.tmp")
+    tmp.write_text(f"{n}\n")
+    os.replace(tmp, last)
     return n
 
 
@@ -1545,23 +1671,27 @@ def cmd_queue(args):
             sys.exit("queue add: one of --asked, --later, --idea")
         key = "doing" if args.asked else "backlog" if args.later else "ideas" if getattr(args, "idea", False) else "todo"
         n = take_queue_number("\n".join(lines))
+        claim_reused_number(n, queue_lines=lines)
         queue_append(lines, key, f"- #{n} {with_asked_date(text) if key == 'doing' else text}")
-        note_added(n)
         print(f"#{n}")
     elif args.action == "move":
         key = {**{k: k for k in QUEUE_SECTIONS}, **{w: k for k, ws in QUEUE_SECTIONS.items() for w in ws}}.get(args.to)
         num = args.number.lstrip("#")
-        found = [i for i, line in enumerate(lines)
-                 if (m := QUEUE_ITEM.match(line)) and m[1] == num and not line.startswith("## ")]
-        if not found:
-            notice = any((m := QUEUE_ITEM.match(line)) and m[1] == num for line in
-                         ((HOME / "notices.md").read_text().splitlines() if (HOME / "notices.md").exists() else []))
+        open_found, done_found, sec = [], [], None
+        for i, line in enumerate(lines):
+            if line.startswith("## "):
+                sec = queue_section(line)
+                continue
+            if (m := QUEUE_ITEM.match(line)) and m[1] == num:
+                (done_found if sec == "done" else open_found).append(i)
+        open_notice = num.isdigit() and any(n == int(num) for n, _, _ in open_notices())
+        if not open_found and (open_notice or not done_found):
             sys.exit(tr(f"queue move：{path} 里没有 #{num}。", f"queue move: no item #{num} in {path}. ")
                      + (tr(f"#{num} 是待办事项：`claudesec notice done {num}`。", f"#{num} is a to-do: `claudesec notice done {num}`.")
-                        if notice else tr("`claudesec queue list` 列出未定的条目；文件可能坏了的话 `claudesec queue doctor`。",
-                                          "`claudesec queue list` lists the open items; if the file may be damaged, "
-                                          "`claudesec queue doctor`.")))
-        i = found[0]
+                        if open_notice else tr("`claudesec queue list` 列出未定的条目；文件可能坏了的话 `claudesec queue doctor`。",
+                                               "`claudesec queue list` lists the open items; if the file may be damaged, "
+                                               "`claudesec queue doctor`.")))
+        i = (open_found or done_found)[0]
         frm = next(queue_section(lines[j]) for j in range(i, -1, -1) if lines[j].startswith("## "))
         text = QUEUE_ITEM.match(lines[i])[2].strip()
         if key == "doing":
@@ -1578,6 +1708,8 @@ def cmd_queue(args):
         del lines[i]
         if i < len(lines) and not lines[i].strip() and i > 0 and not lines[i - 1].strip():
             del lines[i]  # the blank line that separated it in 已处理
+        if key == "done" and frm != "done":
+            retire_closed_lines(lines, num, queue_section)
         queue_append(lines, key, f"- #{num} {text}")
         print(f"#{num} {section_name(frm)} → {section_name(key)}")
     else:
@@ -1589,8 +1721,8 @@ def cmd_queue(args):
             m = QUEUE_ITEM.match(line)
             if section and m and not m[1]:
                 n = take_queue_number(chr(10).join(lines))
+                claim_reused_number(n, queue_lines=lines)
                 lines[i] = f"- #{n} {m[2].strip()}"
-                note_added(n)
                 done.append(lines[i])
         print("\n".join(done) or tr("未定的条目都有编号了", "every open item has a number"))
     tmp = path.with_name(".queue.md.tmp")
@@ -1639,6 +1771,7 @@ def open_notices():
     path = HOME / "notices.md"
     out, section = [], None
     for line in (path.read_text() if path.exists() else "").splitlines():
+        line = LINE_NUMBER.sub("", line)
         if line.startswith("## "):
             section = notice_section(line)
             continue
@@ -1663,7 +1796,7 @@ def cmd_notice(args):
     if args.action == "add":
         text = " ".join(args.words).strip() or sys.exit("notice add: what should the user do?")
         n = take_queue_number("")
-        note_added(n)  # its age, for the sweep
+        claim_reused_number(n, notice_lines_in=lines)
         item = f"- #{n} " + (f"[{args.source}] " if args.source else "") + text
         at = next(i for i, l in enumerate(lines) if l.startswith("## ") and notice_section(l) == "open")
         end = next((i for i in range(at + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
@@ -1673,12 +1806,22 @@ def cmd_notice(args):
         print(f"#{n}")
     else:  # done
         num = args.number.lstrip("#")
-        found = [i for i, l in enumerate(lines) if (m := QUEUE_ITEM.match(l)) and m[1] == num
-                 and not l.startswith("## ")]
-        if not found:
+        open_found, done_found, sec = [], [], None
+        for i, l in enumerate(lines):
+            clean = LINE_NUMBER.sub("", l)
+            if clean.startswith("## "):
+                sec = notice_section(clean)
+                continue
+            if (m := QUEUE_ITEM.match(clean)) and m[1] == num:
+                (open_found if sec == "open" else done_found).append(i)
+        if not open_found:
+            if done_found:
+                sys.exit(tr(f"notice done：#{num} 已经在「已完成」里了",
+                            f"notice done: #{num} is already in Done"))
             sys.exit(f"notice done: no notice #{num} in {HOME / 'notices.md'}")
-        body = QUEUE_ITEM.match(lines[found[0]])[2].strip()
-        del lines[found[0]]
+        body = QUEUE_ITEM.match(LINE_NUMBER.sub("", lines[open_found[0]]))[2].strip()
+        del lines[open_found[0]]
+        retire_closed_lines(lines, num, notice_section)
         tag = re.match(r"\[[^\]]+\]\s*", body)
         at_tag = tag.end() if tag else 0
         body = f"{body[:at_tag]}{dt.date.today().isoformat()} {body[at_tag:]}"
@@ -1694,23 +1837,65 @@ def cmd_notice(args):
 
 def cmd_show(args):
     """The whole of item #N, from queue.md or notices.md, with the section it is in: the
-    panes show one line of each, and the user asks for the rest by its number."""
-    num = args.number.lstrip("#")
-    for path, section_of, names in ((HOME / "queue.md", queue_section, QUEUE_SECTIONS),
-                                    (HOME / "notices.md", notice_section, NOTICE_SECTIONS)):
+    panes show one line of each, and the user asks for the rest by its number. Open items take
+    precedence over closed ones when a number has wrapped; retired entries use `N@YYYY-MM-DD`."""
+    raw = args.number.lstrip("#")
+    sources = (
+        (HOME / "queue.md", queue_section, QUEUE_SECTIONS, tr("决策队列", "decision queue"), True),
+        (HOME / "notices.md", notice_section, NOTICE_SECTIONS, tr("待办事项", "to-dos"), False),
+    )
+    if "@" in raw:
+        hits = []
+        for path, section_of, names, kind, is_queue in sources:
+            if not path.exists():
+                continue
+            lines = repair_queue(path.read_text().splitlines())[0] if is_queue else path.read_text().splitlines()
+            section = None
+            for line in lines:
+                line = LINE_NUMBER.sub("", line)
+                if line.startswith("## "):
+                    section = section_of(line)
+                    continue
+                rm = RETIRED_ITEM.match(line)
+                if rm and f"{rm[1]}@{rm[2]}" == raw:
+                    where = names.get(section, ("?", "?"))[0 if lang() == "zh" else 1]
+                    hits.append(f"#{raw}（{kind} · {where}）\n{(rm[3] or '').strip()}")
+        if hits:
+            print("\n\n".join(hits))
+            return
+        sys.exit(tr(f"没有 #{raw}：queue.md 和 notices.md 里都找不到", f"no #{raw} in queue.md or notices.md"))
+
+    open_hits, done_hits, retired_hits = [], [], []
+    for path, section_of, names, kind, is_queue in sources:
+        if not path.exists():
+            continue
+        lines = repair_queue(path.read_text().splitlines())[0] if is_queue else path.read_text().splitlines()
         section = None
-        for line in (path.read_text() if path.exists() else "").splitlines():
+        for line in lines:
             line = LINE_NUMBER.sub("", line)
             if line.startswith("## "):
                 section = section_of(line)
                 continue
             m = QUEUE_ITEM.match(line)
-            if m and m[1] == num:
+            if m and m[1] == raw:
                 where = names.get(section, ("?", "?"))[0 if lang() == "zh" else 1]
-                kind = tr("决策队列", "decision queue") if path.name == "queue.md" else tr("待办事项", "to-dos")
-                print(f"#{num}（{kind} · {where}）\n{m[2].strip()}")
-                return
-    sys.exit(tr(f"没有 #{num}：queue.md 和 notices.md 里都找不到", f"no #{num} in queue.md or notices.md"))
+                entry = f"#{raw}（{kind} · {where}）\n{m[2].strip()}"
+                (done_hits if section == "done" else open_hits).append(entry)
+                continue
+            rm = RETIRED_ITEM.match(line)
+            if rm and rm[1] == raw:
+                where = names.get(section, ("?", "?"))[0 if lang() == "zh" else 1]
+                retired_hits.append(f"#{rm[1]}@{rm[2]}（{kind} · {where}）\n{(rm[3] or '').strip()}")
+    if open_hits:
+        print(open_hits[0])
+        return
+    if done_hits:
+        print(done_hits[0])
+        return
+    if retired_hits:
+        print("\n\n".join(retired_hits))
+        return
+    sys.exit(tr(f"没有 #{raw}：queue.md 和 notices.md 里都找不到", f"no #{raw} in queue.md or notices.md"))
 
 
 def notices_blocks(cols):
@@ -6940,15 +7125,16 @@ def asked_numbers(questions):
 
 
 def queue_item_section(num):
-    """The section queue.md has item #num in, or None."""
-    path = HOME / "queue.md"
-    key = None
-    for line in (path.read_text().splitlines() if path.exists() else []):
+    """The section queue.md has item #num in (open sections before done), or None."""
+    key, found_done = None, False
+    for line in queue_text().splitlines():
         if line.startswith("## "):
             key = queue_section(line)
         elif (m := QUEUE_ITEM.match(line)) and m[1] == num:
-            return key
-    return None
+            if key != "done":
+                return key
+            found_done = True
+    return "done" if found_done else None
 
 
 def queue_move_quietly(num, to, note=None):

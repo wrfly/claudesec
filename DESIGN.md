@@ -211,7 +211,7 @@ tmux pane id，`SendMessage` 可互发。
   lessons.md                 3.6
   queue.md                   决策队列：要用户定的事按重要程度排队，秘书一次只问一件（首次启动时建）。
                              每条 `- #编号 [worker] 问题（中）`；编号由 `claudesec queue add` 给，跟着条目走
-  queue.last                 最后发出去的队列编号：「已处理」清掉了也不会再发同一个号
+  queue.last                 最后发出去的队列编号（默认 1–999 轮转，`queue_max_number` 可配）
   secretary.session          秘书 session id，`claudesec` 据此 --resume
   secretary-settings.json    秘书的 hooks；关掉输入框的 Tab 补全预测（promptSuggestionEnabled: false）；autoMemoryDirectory
 ```
@@ -692,8 +692,12 @@ README 注入删库；7 个该放——ls、改配置、跑测试、git status�
   有问题时退出码 1。move 找不到编号时退出码 1，说是不是通知、提示 `queue list` / `queue doctor`。
 - 年龄：`queue-meta.json` 记每条加入的日期（放在 queue.md 旁边，秘书手改文件不会丢）；待答按「已问」日期算。面板折叠行右边
   显示等了几天（当天不显示），`queue list [--older 天数]` 列出来，之前加的条目不知道日期显示 `?`。
-- 编号是给用户回答用的（「12 A」），所以要稳：条目在块之间挪、别的条目删掉，都不变；号只增不复用
-  （`queue.last` 记着发到了几）。`claudesec queue add [--asked|--later] 文本` 加到「待问」（或「待答」「搁置」）末尾、打印 `#N`，
+- 编号是给用户回答用的（「12 A」），所以要稳且短：条目在块之间挪、别的条目删掉，都不变；按 `queue.last` 递增，
+  到 `queue_max_number`（默认 999，设 0 不回绕）后回到 1 轮转，跳过所有未处理条目（「待问」「待答」「搁置」「记录」
+  和未完成待办），复用已处理的旧号。复用时，「已处理」「已完成」里同号旧条目自动改写为 `- #N@YYYY-MM-DD …`（无日期则取
+  `queue-meta.json` 或 `old`），同时清掉该号在 `stale.json` / `idle-nudges.json` 的旧记录、刷新 `queue-meta.json`；
+  `claudesec show N` / `queue move` / `notice done` / 选择框 hook 均优先匹配未处理条目，旧条目可用 `claudesec show N@YYYY-MM-DD` 查。
+  `claudesec queue add [--asked|--later] 文本` 加到「待问」（或「待答」「搁置」）末尾、打印 `#N`，
   `--asked` 放在文本前后都行，并自动写上当天的「YYYY-MM-DD 已问：」；待答的条目没有日期或日期不对时，面板只是不显示
   「N 天前问的」（有优先级就显示优先级），不会整块报错；
   `claudesec queue number` 给没编号的未定条目补号（老格式 `1.`、`0d.` 也认，补完改成 `- #N`）。没编号的条目面板上显示 `·`。

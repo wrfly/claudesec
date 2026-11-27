@@ -281,8 +281,11 @@ def unfinished_progress(name):
 
 
 def report_type(r):
-    """A parsed report's TYPE word: DONE, PROGRESS, ...; UNTYPED when it has none."""
-    return r.get("TYPE", "").split()[0] if r.get("TYPE") else "UNTYPED"
+    """A parsed report's TYPE word: DONE, PROGRESS, ...; UNTYPED when it has none. Only the leading
+    word counts: hosted2 wrote "TYPE: DONE. <the whole report>" on one line for weeks (11-27), and
+    "DONE." taken as the type was no final report, so every turn of it was stopped for one."""
+    m = re.match(r"[A-Za-z_]+", r.get("TYPE") or "")
+    return m[0].upper() if m else "UNTYPED"
 
 
 def width(s):
@@ -4983,8 +4986,8 @@ def cmd_archive(args):
         for header, body in entries:
             if header.endswith("worker→secretary"):
                 r = parse_report(body)
-                if r.get("TYPE") in ("DONE", "FAILED"):
-                    final = r
+                if report_type(r) in ("DONE", "FAILED"):
+                    final = {**r, "TYPE": report_type(r)}
         user_decisions = [f"- {h.split()[0]} {b.strip()}" for h, b in entries
                           if h.endswith("secretary→worker") and is_user_decision(b)]
         path = history_file(date, args.name, w.get("archived"))
@@ -6213,6 +6216,50 @@ def hook_worker_session_start(name):
     with registry() as reg:
         if name in reg["workers"]:
             reg["workers"][name]["session"] = data.get("session_id")
+    if data.get("source") == "compact" and name in read_registry()[1]:
+        print(after_compact(name))
+        w = read_registry()[1][name]
+        if not w.get("delegated_by") and w.get("mode") != "discuss" and secretary_alive():
+            raise_alert(tr(f"worker {name} 刚压缩了上下文。claudesec 已把任务书、最近的往来和它委托出去的活补给它；"
+                           f"压缩摘要可能是空的（11-28 hosted2 就是），它下一轮若答非所问或不知道在做什么，先 peek，再给它接上。",
+                           f"worker {name} just had its context compacted. claudesec gave it its task, the latest messages "
+                           f"and what it delegated; the summary may be empty (hosted2's was, 11-28). If its next turn "
+                           f"seems lost, peek and fill it in."))
+
+
+def after_compact(name):
+    """Context for a worker just compacted: the summary may have lost everything (hosted2, 11-28: a
+    968k-token conversation came back as "(No earlier conversation.)"), and what it needs to pick
+    up is all on disk: its task, its last exchanges with the secretary, what it delegated."""
+    d = worker_dir(name)
+    out = [tr(f"[claudesec] 你（worker {name}）的上下文刚被压缩。摘要可能不全甚至是空的；下面是磁盘上的记录，以它为准。",
+              f"[claudesec] Your context (worker {name}) was just compacted. The summary may be incomplete or even "
+              "empty; below is what is on disk, and it is authoritative."),
+           tr(f"- 你的任务书：{d / 'task.md'}；规则：{d / 'prompt.md'}；完整往来：`{hook_cmd()} log {name}`",
+              f"- Your task: {d / 'task.md'}; your rules: {d / 'prompt.md'}; all the messages: `{hook_cmd()} log {name}`")]
+    workers = read_registry()[1]
+    mine = [(n, m) for n, m in delegations_by(name) if n in workers or time.time() - (m.get("since") or 0) < 86400][:6]
+    if mine:
+        out += ["", tr("你委托出去的（最新在前）：", "What you delegated (newest first):")]
+    for n, mark in mine:
+        w = workers.get(n)
+        state = w["status"] if w else tr("已结束并关闭", "finished and closed")
+        got = final_report(n, mark.get("log_start", 0))
+        line = tr(f"- {n}（{mark.get('label', '')}，{state}）", f"- {n} ({mark.get('label', '')}, {state})")
+        if got:
+            out += [line + tr(f"，{got[0][5:16]} 的最终汇报：", f"; its final report of {got[0][5:16]}:"),
+                    "  " + got[2].strip()[:1000].replace("\n", "\n  ")]
+        elif w:
+            out += [line + tr(f"，还没交最终汇报；结果到了用 `{hook_cmd()} wait {n}` 取（后台跑）",
+                              f"; no final report yet; get it with `{hook_cmd()} wait {n}` (in the background)")]
+        else:
+            out += [line + tr(f"，没有最终汇报；它说过的见 `{hook_cmd()} log {n}`",
+                              f"; no final report; what it said is in `{hook_cmd()} log {n}`")]
+    talk = [(h, b) for h, b in read_log(name) if h.endswith(("worker→secretary", "secretary→worker"))][-4:]
+    if talk:
+        out += ["", tr("最近的往来（最新在后）：", "The latest messages (newest last):")]
+        out += [f"=== {h}\n{b.strip()[:500]}" for h, b in talk]
+    return "\n".join(out)[:9500]
 
 
 def hook_worker_send(name):
@@ -6472,7 +6519,49 @@ def archived_delegation(name):
     return {**meta, "path": path}
 
 
+def delegations_by(boss):
+    """What boss delegated: [(name, mark)] from each workers/<name>/delegation.json, newest first.
+    The directory outlives the worker's close and archive, so finished ones are here too."""
+    found = []
+    for f in (HOME / "workers").glob("*/delegation.json"):
+        with contextlib.suppress(OSError, ValueError):
+            mark = json.loads(f.read_text())
+            if mark.get("by") == boss:
+                found.append((f.parent.name, mark))
+    return sorted(found, key=lambda nm: -(nm[1].get("since") or 0))
+
+
+def final_report(name, start=0):
+    """(header time, TYPE, body) of the last final report in name's log from entry start, or None."""
+    for header, body in reversed(read_log(name)[start:]):
+        if header.endswith(" worker→secretary") and report_type(parse_report(body)) in TERMINAL:
+            return header[:25], report_type(parse_report(body)), body
+    return None
+
+
+def refused_mark(name):
+    return HOME / "workers" / name / "delegation-refused.json"
+
+
 def cmd_delegate(args):
+    """A refusal (any NOT DELEGATED exit) is marked, so a `wait` run after it anyway says why there
+    is nothing to wait for instead of "no delegation" or, for a name used before, the old result."""
+    name = resolve(args.name)
+    try:
+        delegate(args)
+    except SystemExit as e:
+        if isinstance(e.code, str) and NAME_RE.match(name):
+            with contextlib.suppress(OSError):
+                refused_mark(name).parent.mkdir(parents=True, exist_ok=True)
+                refused_mark(name).write_text(json.dumps({"by": resolve(args.boss), "at": time.time(),
+                                                          "why": e.code}, ensure_ascii=False))
+            raise SystemExit(e.code + tr(f"\n（什么都没派出去：不要 `wait {name}`，没有可等的。）",
+                                         f"\n(Nothing was started: don't `wait {name}`, there is nothing to wait for.)"))
+        raise
+    refused_mark(name).unlink(missing_ok=True)
+
+
+def delegate(args):
     if getattr(args, "budget", None) is not None:
         sys.exit("NOT DELEGATED: --budget is for Claude Code workers; a delegated worker is an external agent, "
                  "whose spending claudesec can't see. Delegate without it, or do the work with a budgeted spawn.")
@@ -6613,6 +6702,15 @@ def cmd_wait(args):
         mark = json.loads((d / "delegation.json").read_text())
         since, start = mark["since"], mark["log_start"]
     except (OSError, ValueError, KeyError):
+        mark, since = None, 0
+    with contextlib.suppress(OSError, ValueError):
+        refused = json.loads(refused_mark(name).read_text())
+        if refused.get("at", 0) > since:
+            at = dt.datetime.fromtimestamp(refused["at"]).strftime("%H:%M")
+            sys.exit(tr(f"{name} 没有派出去：{at} 的 delegate 被拒了，没有可等的。拒绝原因：\n{refused.get('why', '')}",
+                        f"{name} was not delegated: the delegate at {at} was refused, so there is nothing to wait for. "
+                        f"Why:\n{refused.get('why', '')}"))
+    if mark is None:
         sys.exit(f"{name} has no delegation to wait for")
 
     def after(f):
@@ -6622,9 +6720,10 @@ def cmd_wait(args):
     while True:
         for header, body in read_log(name)[start:]:
             if header.endswith(" worker→secretary"):
-                typ = (parse_report(body).get("TYPE") or "").split()[:1]
-                if typ and typ[0] in TERMINAL:
+                if report_type(parse_report(body)) in TERMINAL:
                     kind = mark.get("label") or agent_of({"agent": mark.get("agent", "cursor")}).label
+                    with contextlib.suppress(OSError):  # handed over: see delivered_unread
+                        (d / "delegation.json").write_text(json.dumps({**mark, "delivered_at": time.time()}))
                     print(tr(f"{kind} worker {name} 的汇报（你委托的，{header[11:16]}）：\n{body}",
                              f"Report from {kind} worker {name} (delegated by you, {header[11:16]}):\n{body}"))
                     return
@@ -7455,12 +7554,34 @@ def hook_worker_permission_alert(name):
                        f"worker {name} is stuck on a confirmation dialog, waiting for the user in window {name}: {m['detail']}"))
 
 
+def api_error_text(data):
+    """What a StopFailure hook says went wrong. Its error is only a category ("rate_limit", and
+    "unknown" for a proxy's 402 on 11-27, which was all the log kept); the message Claude Code
+    showed is in error_details or, failing that, last_assistant_message ("API Error: 402 …")."""
+    kind = str(data.get("error") or "").strip()
+    detail = str(data.get("error_details") or data.get("last_assistant_message") or "").strip()
+    err = f"{kind}: {detail}" if kind and detail and kind not in detail else (detail or kind or "unknown error")
+    return err.replace("\n", " ")[:300]
+
+
+def delivered_unread(boss):
+    """Results `wait` handed to boss since its last turn that ended normally (its Stop hook writes
+    last-stop.json): a turn that then died on an API error never read them (hs-t21a-oldentry, 11-27)."""
+    seen = worker_dir(boss) / "last-stop.json"
+    since = seen.stat().st_mtime if seen.exists() else 0
+    out = []
+    for n, mark in delegations_by(boss):
+        if (mark.get("delivered_at") or 0) > since:
+            got = final_report(n, mark.get("log_start", 0))
+            out.append(f"{n} {got[1]} {got[0][11:16]}" if got else n)
+    return out
+
+
 def hook_worker_stop_failure(name):
     """The turn died on an API error (a proxy's 524, an overload). The worker now idles at its
     prompt and will never report, so wake the secretary, who tells it to carry on."""
     data = hook_input()
-    err = " ".join(str(data.get(k) or "") for k in ("error", "error_details")).strip() or "unknown error"
-    err = err.replace("\n", " ")[:300]
+    err = api_error_text(data)
     with registry() as reg:
         w = reg["workers"].get(name)
         if w is None:
@@ -7475,9 +7596,18 @@ def hook_worker_stop_failure(name):
             w["alerted_for"] = f"API_ERROR|{w['last_report_at']}"
     (worker_dir(name) / "ended-error").write_text(now())
     append_log(name, "api-error", err)
+    unread = delivered_unread(name)
+    if unread:
+        append_log(name, "api-error", tr("这一轮里刚交回、它可能没读到的委托结果：", "delegation results handed over in that turn, "
+                                         "maybe unread: ") + ", ".join(unread))
     if not watching and not w.get("delegated_by"):
+        more = tr(f"\n这一轮里刚交回给它的委托结果它多半没读到：{'；'.join(unread)}。叫它接着做时告诉它先看 "
+                  f"`claudesec log <名字>` 里的最终汇报。",
+                  f"\nDelegation results handed to it in that turn, most likely unread: {'; '.join(unread)}. When you "
+                  f"tell it to carry on, have it read the final report in `claudesec log <name>` first.") if unread else ""
         raise_alert(tr(f"worker {name} 这一轮因 API 错误中断，停在提示符上，不会自己汇报：{err}",
-                       f"worker {name}'s turn broke off on an API error; it sits at its prompt and won't report on its own: {err}"))
+                       f"worker {name}'s turn broke off on an API error; it sits at its prompt and won't report on its own: {err}")
+                    + more)
 
 
 def permission_answered(name):

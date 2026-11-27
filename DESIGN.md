@@ -1081,6 +1081,23 @@ interrupt → busy 清掉；shelve → wake 恢复同一个会话并汇报。不
 - 秘书 `/compact` 后靠注入的状态接上在跑的 worker
 - 秘书的判断质量：分类、路由、升级门槛、推送克制——这部分只能靠 3.6 的进化机制迭代
 
+### 委托链路的四处补丁（2026-11-28，hosted2 一夜的问题）
+
+- 汇报类型只取 TYPE 开头的词：`TYPE: DONE. 正文…` 原先被当成类型 "DONE."、不算最终汇报，hosted2 每轮都被 Stop hook 拦一次；
+  wait、归档同用 report_type()。
+- Claude Code worker 压缩上下文后（SessionStart source=compact），hook 注入任务书和规则路径、24 小时内或仍在跑的委托
+  （状态、最终汇报原文，前 1000 字）、最近 4 条往来；并告诉秘书（委托出去的和讨论模式的不告诉）。起因：hosted2 96.8 万 token
+  的对话压缩后摘要只剩「(No earlier conversation.)」，交回的结果和报告路径都不知道了。摘要为什么是空的不在 claudesec 里。
+- `wait` 交出结果时在 delegation.json 记 delivered_at。委托方这一轮若死于 API 错误（StopFailure），而结果是它上一次正常
+  结束之后（last-stop.json 的修改时间）才交出的，给秘书的告警里点名这几件，让秘书叫它先看 log。错误文字取 error_details，
+  没有就取 last_assistant_message：StopFailure 的 error 只是分类，代理的 402 就只有 "unknown"。
+- delegate 被拒（任何 NOT DELEGATED 退出）写 workers/<名字>/delegation-refused.json，提示里加「什么都没派出去，不要 wait」；
+  之后对这个名字跑 wait，直接说明几点被拒、为什么。比上一次委托新的拒绝会盖过旧结果，不会把同名旧委托的 DONE 当成这次的。
+  并发满时仍然拒绝，不排队。
+
+已验证：单测 tests/test_delegate_chain.py；对真实状态目录只读跑了 after_compact('hosted2')（7.5k 字，6 件委托）。
+hook 每次现跑 claudesec，在跑的 worker 不用重启；提示词没改。
+
 ## 额度（budget，2026-10-26）
 
 方案见 history/2026-10/2026-10-26-budget.md。记账：usage.json 按「本地小时|模型|速度」分桶，记输入、缓存写 5m、缓存写 1h、
